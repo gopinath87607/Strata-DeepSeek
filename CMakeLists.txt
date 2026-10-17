@@ -277,6 +277,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_geometry_test tests/core/gguf_geometry_test.cpp)
   target_link_libraries(gguf_geometry_test PRIVATE strata_artifact)
   add_test(NAME gguf_geometry_test COMMAND gguf_geometry_test)
+  # the DeepSeek-V4.1-Flash family half: its type table, geometry, expert blob containers and inventory (synthetic)
+  add_executable(deepseek4_test tests/core/deepseek4_test.cpp)
+  target_link_libraries(deepseek4_test PRIVATE strata_artifact)
+  add_test(NAME deepseek4_test COMMAND deepseek4_test)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)

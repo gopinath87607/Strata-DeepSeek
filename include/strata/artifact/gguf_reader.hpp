@@ -805,6 +805,10 @@ inline std::string check_architecture(const GgufFile& f) {
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
     if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    // DeepSeek-V4.1-Flash is recognised by the loader (a family-scoped one, include/strata/artifact/deepseek4.hpp),
+    // but its metadata is not qwen4exp's and no build has an engine path for it.  Refuse it here, by name, so
+    // geometry_from_gguf never reads its keys as Flash-Next's.
+    if (family == ModelFamily::Deepseek4) return model_family_not_supported(family);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);

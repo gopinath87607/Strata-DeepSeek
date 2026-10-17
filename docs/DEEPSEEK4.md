@@ -1,8 +1,12 @@
 # DeepSeek-V4.1-Flash on Strata
 
-Status: fork `deepseek4`, cut from upstream main `477ac13c`. Nothing under
-`src/` or `include/` has been changed yet. This file is the state carrier for
-the port.
+Status: fork `deepseek4`, cut from upstream main `477ac13c`. P0 is done. P1's
+loader half has landed — the family, its type table, geometry, blob-container
+checks and the tensor inventory are in `include/strata/artifact/deepseek4.hpp`
+with a synthetic test suite — and was checked against the real file's 64 MiB
+header: 1,000 tensors, 0 errors. P1's tokenizer and chat template, and the
+blob-payload gate, are still open (the latter waits for the full GGUF). This
+file is the state carrier for the port.
 
 Goal: serve the published DeepSeek-V4.1-Flash-1017 VQ artifact on one normal
 PC — NVIDIA or AMD cards plus system RAM — with Strata's layer split, expert
@@ -69,7 +73,34 @@ Geometry, all from the metadata:
 
 `fp8_32x32` is measured, not assumed: 1,025 bytes per 1,024 values (a 32x32
 E4M3 block and one ue8m0 scale). Every one of the 27 tensors is exactly that
-size in the file, with no remainder.
+size in the file, with no remainder. Its 32x32 tiles span the whole matrix, so
+dim 0 must be a multiple of 32 but not of 1,024; rows such as 1,280 and 2,304
+are therefore valid.
+
+### What the loader enforces
+
+The family table is separate from the shared one, because type 42 is Q2_0
+(64 values / 18 bytes) to the Qwen models and a DQVL container (1 byte / 1
+byte) here. The shared table is not changed, so the default path stays
+byte-identical (a test asserts both readings). For `deepseek4`, type 42 is `vqblob` (1/1), 44 is
+`fp8_32x32` (1,024/1,025), 40/41 are go1b/go2b (256/34, 256/68), 43 is
+fp4x32 (32/17), and 26/27 are I32/I64 (1/4, 1/8). A type-44 tensor's payload
+is sized over the whole matrix, not per row.
+
+The inventory is generated from the metadata rather than listed: 22 tensors in
+every block and tower (the blob included), compressor `kv`+norm on
+`kv_source_layers`, compressor gate additionally only where the compress ratio
+is 2, indexer `proj`+`attn_q_b` on `index_source_layers`, indexer `wk`+`k_norm`
+only on the intersection of the two source lists, engram `k`/`q`/`wkv` on
+layers 1 and 14, 7 globals, and 6 MTP globals. That yields exactly the 1,000
+names the file carries; any other name, type or shape is reported by name.
+
+The blob check reads every slot of every container: offsets must be nonzero,
+outside the slot table and unique; each payload is bounded by the next slot's
+offset; the shared v3 codebook must sit between the slot table and the first
+payload; and each payload's header, gains and index stream (including the
+3-byte window at the last index) must fit. A container whose declared length
+ends inside a payload is refused, not reported as partial.
 
 ### Where the bytes are
 
@@ -201,7 +232,7 @@ Each phase has a gate that is a comparison, not an inspection.
 | phase | work | gate |
 | --- | --- | --- |
 | P0 (done) | artifact opened; types, geometry and both hard formats read; VQ decoder written and checked | fixtures bit-exact; real layer-0 slot arithmetic closes; expert 0 decodes finite |
-| P1 | family loader in Strata: `deepseek4` metadata, tensor types 42/44, inventory, tokenizer and chat template | the loader reports the 1,000-tensor inventory and every rejected tensor by name; malformed blobs are refused with a named error |
+| P1 (loader half landed) | family loader in Strata: `deepseek4` metadata, tensor types 42/44, inventory, tokenizer and chat template | the loader reports the 1,000-tensor inventory and every rejected tensor by name; malformed blobs are refused with a named error. Met for metadata, types, inventory and blob containers on the real header; the 43 blob payloads await the full file, and the tokenizer and chat template are not written yet |
 | P2 | VQ decode on CUDA, then HIP: row-dot kernels that read the bit stream directly | GPU output bit-identical to the CPU decoder on the fixtures and on real expert 0 |
 | P3 | trunk forward: MLA q/kv LoRAs, compressors, sparse indexer, sinks, sliding window, hyper-connections, RoPE both bases, MoE 384/top-6 + shared, fused VQ MoE | temperature-0 token ids and logits match the reference engine per position |
 | P4 | Engram: hash, O_DIRECT row reader, q/k/wkv projections, io_uring overlap if prefill needs it | hash rows match the reference implementation on its fixture, then on rows captured from the same checkpoint; output matches with engram on and off |
@@ -210,8 +241,8 @@ Each phase has a gate that is a comparison, not an inspection.
 | P7 | Strata integration: layer split, compressed expert cache, prompt chunk, loan and ring | four-GPU run returns the same tokens as one GPU; then a measured performance ledger |
 | P8 | AMD HIP and Windows builds | P3's gate passes on the same hardware |
 
-P1 and P2 need no downloads. P3 needs the 113.6 GB GGUF; P4 needs the two
-engram shards.
+P1's synthetic suite and P2's fixtures need no downloads. P1's blob gate and
+P3 need the 113.6 GB GGUF; P4 needs the two engram shards.
 
 ## 7. Open questions
 
@@ -251,6 +282,11 @@ research material, not part of the build.
 tools/dsv4/vq_decode.hpp        header-only decoder, v2 and v3
 tools/dsv4/vq_decode_test.cpp   89 checks: synthetic + engine fixtures
 tools/dsv4/vq_blob_info.cpp     geometry and decode stats for a real blob
+
+include/strata/artifact/deepseek4.hpp   family-scoped type table, geometry, blob check, inventory
+tools/dsv4/gguf_inspect.cpp             checks a real GGUF's header, inventory and blob containers
+tests/core/deepseek4_test.cpp           50 checks: family, types, geometry, blobs, inventory
+tests/core/gguf_fixture.hpp             changed: a tensor can declare its own payload length
 ```
 
 Build and run:
@@ -260,10 +296,18 @@ g++ -O2 -std=c++17 tools/dsv4/vq_decode_test.cpp -o /tmp/dsv4_vq_test
 /tmp/dsv4_vq_test reference/ds4-raw
 g++ -O2 -std=c++17 tools/dsv4/vq_blob_info.cpp -o /tmp/dsv4_vq_info
 /tmp/dsv4_vq_info reference/layer0-blob-head.bin 0
+g++ -O2 -std=c++17 -Iinclude -Itests/core tests/core/deepseek4_test.cpp -o /tmp/deepseek4_test
+/tmp/deepseek4_test
+g++ -O2 -std=c++17 -Iinclude tools/dsv4/gguf_inspect.cpp -o /tmp/dsv4_gguf_inspect
+/tmp/dsv4_gguf_inspect reference/head.bin --partial
 ```
 
-Expected: `89 checks, 0 failures`, two fixture lines with 0 mismatches, and
-three 2304x5120 / 5120x2304 matrices with all values finite.
+Expected: `89 checks, 0 failures`, two fixture lines with 0 mismatches, three
+2304x5120 / 5120x2304 matrices with all values finite, `PASS: 50 checks, 0
+failures`, and for a header prefix or the full file, `OK` with the inventory
+histogram (`F32 x531 Q4_K x330 I32 x1 I64 x3 BF16 x65 vqblob x43 fp8_32x32
+x27`). Without `--partial`, every payload must also be inside the file. The
+test is also a CMake target, `deepseek4_test`, under `STRATA_BUILD_TESTS`.
 
 ## 9. Downloads for the next phases
 

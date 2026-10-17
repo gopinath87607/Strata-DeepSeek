@@ -52,6 +52,8 @@ struct Tensor {
     std::vector<uint64_t> shape;   ///< GGUF order: dim 0 varies fastest
     uint32_t type = 0;
     uint8_t seed = 1;              ///< payload byte i is (seed * 131 + i * 7 + i / 4093) & 0xff
+    uint64_t bytes = 0;            ///< payload length; 0 = the shared table's tensor_payload_bytes (a family with
+                                   ///< its own type table, such as deepseek4, sets this)
 };
 
 inline uint8_t pattern(uint8_t seed, uint64_t i) { return (uint8_t) ((seed * 131u + i * 7u + i / 4093u) & 0xffu); }
@@ -103,7 +105,7 @@ inline Written write(const std::filesystem::path& path, const std::vector<Kv>& k
         strata::TensorInfo info;
         info.shape = t.shape;
         info.type = t.type;
-        const uint64_t n = strata::tensor_payload_bytes(info);
+        const uint64_t n = t.bytes != 0 ? t.bytes : strata::tensor_payload_bytes(info);
         if (n == 0) throw std::runtime_error("fixture: " + t.name + " has no whole-block byte count");
         puts(t.name);
         put32((uint32_t) t.shape.size());
