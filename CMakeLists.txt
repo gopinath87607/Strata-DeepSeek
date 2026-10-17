@@ -412,6 +412,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/deepseek4_vq.cu
+                          src/kernels/cuda/deepseek4_engram.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
@@ -453,6 +454,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME deepseek4_vq_cuda_test
              COMMAND deepseek4_vq_cuda_test ${CMAKE_CURRENT_SOURCE_DIR}/reference)
     set_tests_properties(deepseek4_vq_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
+    # DeepSeek-V4.1-Flash engram (docs/DEEPSEEK4.md, P4): the rows kernel bitwise against the host oracle and
+    # the reference fixture, the gate against the reference f64 emulation's bound, and the wkv against a
+    # float64 dot - synthetic always, the real shards when a second argument names their directory. No model,
+    # no timing.
+    add_executable(deepseek4_engram_cuda_test tests/core/deepseek4_engram_cuda_test.cpp)
+    target_include_directories(deepseek4_engram_cuda_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(deepseek4_engram_cuda_test PRIVATE strata_kernels CUDA::cudart)
+    add_test(NAME deepseek4_engram_cuda_test
+             COMMAND deepseek4_engram_cuda_test ${CMAKE_CURRENT_SOURCE_DIR}/reference)
+    set_tests_properties(deepseek4_engram_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(qsa_topk_active_parity src/kernels/qsa_topk_active_parity.cpp)
     target_include_directories(qsa_topk_active_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_topk_active_parity PRIVATE strata_kernels CUDA::cudart)

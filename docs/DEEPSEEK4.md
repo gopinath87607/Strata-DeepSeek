@@ -210,8 +210,7 @@ other download. The format is the easy one: an 8-byte little-endian header
 length, a JSON map of name → dtype, shape and byte offsets, then raw planes —
 no pickle. A row is a pread at `data_start + row*264`. The 264-byte row and
 the 6,336-byte per-token block are not `O_DIRECT`-aligned, so the reader needs
-aligned window reads or the reference's fallback. No hash lookup has been run
-yet.
+aligned window reads or the reference's fallback.
 
 The hash is fully specified by the four GGUF tables: compressed id through
 `token_map` (I32, 129,280), four multipliers per engram layer, rolling XOR, then
@@ -220,7 +219,26 @@ flat layer-major order, not by their GGUF dimensions; reading by dimension
 produces different rows silently. `reference/ds4-raw/src_engram.rs` is the
 reference implementation with those caveats in its comments.
 
-This port has not downloaded the shards and has not run a single hash lookup.
+Both shards are on `/mnt/nvme`, and both halves of P4 are written and gated.
+The host half (hash tables, mask, O_DIRECT row reader, gate emulation) runs
+135 checks with 0 failures: the hash matches the reference's
+`gen_engram_ref.c` output on its 24-row fixture; the golden prompt positions
+captured from this checkpoint decode to the same rows through O_DIRECT,
+buffered reads and `FILE*`; and the reference's three gate cases are bit-exact
+against its f64 emulation. The device half (rows, gate and wkv in
+`src/kernels/cuda/deepseek4_engram.cu`) runs 109 checks with 0 failures: the
+rows kernel is bit-identical to the host decode on the fixture and on 192
+golden rows per layer read from the real shards; the gate matches the
+emulation within the bound (the dense case differs on 2 of 40,960 values, both
+within 2 bf16 ulps; absorb and zero are bit-exact); and the real
+`[25600, 6144]` wkv agrees with a float64 dot to 1.16e-7 of its scale, for one
+token and for two. The measured absolute wkv offsets are 101,377,710,936
+(weights) and 101,534,997,336 (scales) in shard 47, and 101,380,486,640 and
+101,537,773,040 in shard 48; each scale plane ends exactly at its shard's end.
+
+Still open for P4: wiring the three pieces into a forward pass (that needs
+P3), the io_uring overlap if prefill wants it, and the on/off output gate,
+which needs the GGUF.
 
 ## 5. Fit on the test machine
 
@@ -256,7 +274,7 @@ Each phase has a gate that is a comparison, not an inspection.
 | P1 (loader, tokenizer and template landed) | family loader in Strata: `deepseek4` metadata, tensor types 42/44, inventory, tokenizer and chat template | the loader reports the 1,000-tensor inventory and every rejected tensor by name; malformed blobs are refused with a named error; the tokenizer's ids match the reference oracle; the template's bytes match the reference renderer. Met for metadata, types, inventory and blob containers on the real header, for `encode` and rendered-chat ids on the tokenizer corpus, and for the V4.1 DSML template on the official and differential vectors; the 43 blob payloads await the full file |
 | P2 (CUDA done; HIP waits for AMD hardware) | VQ decode on CUDA, then HIP: row-dot kernels that read the bit stream directly | GPU output bit-identical to the CPU decoder on the fixtures and on real expert 0. Met on CUDA: 0 mismatching bytes on both v2 fixtures (also against the engine's own dumps) and on all 35.4M decoded values of the real layer-0 expert 0, whose three matrices are v3 13-bit; the row dot agrees with a float64 reference to 9.1e-9 of the term scale. The same source is HIP-translated by the gfx906 build, but no ROCm device exists here to run it |
 | P3 | trunk forward: MLA q/kv LoRAs, compressors, sparse indexer, sinks, sliding window, hyper-connections, RoPE both bases, MoE 384/top-6 + shared, fused VQ MoE | temperature-0 token ids and logits match the reference engine per position |
-| P4 | Engram: hash, O_DIRECT row reader, q/k/wkv projections, io_uring overlap if prefill needs it | hash rows match the reference implementation on its fixture, then on rows captured from the same checkpoint; output matches with engram on and off |
+| P4 (hash, reader, projections and their GPU gates done; wiring and the on/off gate await P3) | Engram: hash, O_DIRECT row reader, q/k/wkv projections, io_uring overlap if prefill needs it | hash rows match the reference implementation on its fixture, then on rows captured from the same checkpoint; output matches with engram on and off. Met for the hash and the row decode: 0 differing rows or values on the reference's hash fixture and on the captured golden positions through all four read paths, and 0 bit-diffs on the GPU row decode of the real shards. The gate and wkv meet their float64 bounds on the fixtures and the real weights. The on/off output gate needs the forward pass |
 | P5 | three DSpark towers and verify/rollback | greedy output byte-identical with drafting on and off; cache frontier exact |
 | P6 | serving: OpenAI and Anthropic surfaces, sampling defaults, thinking toggle | one served request per contract |
 | P7 | Strata integration: layer split, compressed expert cache, prompt chunk, loan and ring | four-GPU run returns the same tokens as one GPU; then a measured performance ledger |
@@ -320,6 +338,13 @@ tools/dsv4/test_dsml_render.py          14 tests: the reference's own golden vec
 include/strata/kernels/deepseek4_vq.hpp  host/device payload parser and the two GPU entries
 src/kernels/cuda/deepseek4_vq.cu         P2: whole-matrix VQ decode and the packed-stream row dot
 tests/core/deepseek4_vq_cuda_test.cpp    the P2 gate: GPU decode vs the CPU decoder, bitwise; row dot vs f64
+
+include/strata/artifact/deepseek4_engram.hpp       P4 host half: hash, O_DIRECT row reader, gate emulation
+include/strata/artifact/deepseek4_engram_bits.hpp  the fp8/bf16 conversions, host and device, shared by both
+include/strata/kernels/deepseek4_engram.hpp        P4 device entries: rows, gate, bf16 copy, wkv
+src/kernels/cuda/deepseek4_engram.cu               P4 device half
+tests/core/deepseek4_engram_test.cpp               135 checks: hash vs the reference, reader paths, gate, real shards
+tests/core/deepseek4_engram_cuda_test.cpp          109 checks: GPU rows bitwise, gate bound, wkv vs f64, real shards
 ```
 
 Build and run:
@@ -341,6 +366,12 @@ python3 -m unittest tools.dsv4.test_dsml_render serve.test_chat_template_deepsee
   -gencode arch=compute_86,code=sm_86 -gencode arch=compute_120,code=sm_120 \
   tests/core/deepseek4_vq_cuda_test.cpp src/kernels/cuda/deepseek4_vq.cu -o /tmp/dsv4_vq_cuda_test
 CUDA_VISIBLE_DEVICES=1 /tmp/dsv4_vq_cuda_test reference
+cmake -S . -B /tmp/dsv4-build -DSTRATA_BUILD_TESTS=ON
+cmake --build /tmp/dsv4-build --target deepseek4_engram_test
+/tmp/dsv4-build/deepseek4_engram_test reference /mnt/nvme
+/usr/local/cuda-13.2/bin/nvcc -O2 -std=c++20 -Iinclude \
+  tests/core/deepseek4_engram_cuda_test.cpp src/kernels/cuda/deepseek4_engram.cu -o /tmp/dsv4_engram_cuda_test
+/tmp/dsv4_engram_cuda_test reference /mnt/nvme
 ```
 
 Expected: `89 checks, 0 failures`, two fixture lines with 0 mismatches, three
@@ -357,7 +388,15 @@ oracle differential skipped without `DS4_TOK_ORACLE`. The template suite runs
 one line per matrix, all with `0 mismatches`, the row dot's worst error (about
 `1e-8` of the term scale on the real payloads), and `PASS: 101 checks, 0
 failures`; without `reference/` it prints SKIP and exits 77 (ctest treats that
-as skipped).
+as skipped). The engram host test prints, with the shard directory, `PASS: 135
+checks, 0 failures` (without it, `PASS: 134 checks`; the two real-shard lines
+and the last check are skipped). The engram GPU test prints `PASS: 109 checks,
+0 failures` with the shard directory and `PASS: 67 checks` without it: the rows
+line reports `0 bit-diffs`, the dense gate case `2 differ, 0 over bound`, and
+each real wkv line its `max rel` (about `1.2e-7`) and `0 over 1e-3*scale`.
+Both engram tests are CMake targets under `STRATA_BUILD_TESTS`; the host test
+runs its synthetic shard section even with no fixtures, and the GPU test exits
+77 when no CUDA device is present.
 
 ### The tokenizer, measured
 
