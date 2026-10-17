@@ -9,9 +9,11 @@ header: 1,000 tensors, 0 errors. P1's tokenizer has landed too: the
 `pre` dispatch are in `tools/strata_tokenizer.py`, and the
 `encode`/rendered-chat ids agree with the reference tokenizer oracle on every
 corpus string tried except one literal whose engine entry postdates this
-checkout's C source (see §8). P1's chat template and the blob-payload gate are
-still open (the latter waits for the full GGUF). This file is the state
-carrier for the port.
+checkout's C source (see §8). P1's chat template has landed as the reference's
+V4.1 DSML head, byte-pinned against its renderer and the official
+`encoding.py` vectors; the pack writer installs it. The blob-payload gate is
+still open (it waits for the full GGUF). This file is the state carrier for the
+port.
 
 Goal: serve the published DeepSeek-V4.1-Flash-1017 VQ artifact on one normal
 PC — NVIDIA or AMD cards plus system RAM — with Strata's layer split, expert
@@ -197,6 +199,17 @@ falls back to a plain read plus `FADV_RANDOM` on filesystems that refuse it, and
 notes that 264-byte random reads through the page cache evict the model mapping
 and make temperature-0 runs non-reproducible.
 
+Both shards are on `/mnt/nvme` and their safetensors headers were read on
+2026-10-17; they match this table tensor for tensor. Each shard holds, after
+the embed planes, `q_weight` and `k_weight` BF16 `[4, 5120]` and `wkv` F8_E4M3
+`[25600, 6144]` with E8M0 scales `[800, 192]`, so P4's projections need no
+other download. The format is the easy one: an 8-byte little-endian header
+length, a JSON map of name → dtype, shape and byte offsets, then raw planes —
+no pickle. A row is a pread at `data_start + row*264`. The 264-byte row and
+the 6,336-byte per-token block are not `O_DIRECT`-aligned, so the reader needs
+aligned window reads or the reference's fallback. No hash lookup has been run
+yet.
+
 The hash is fully specified by the four GGUF tables: compressed id through
 `token_map` (I32, 129,280), four multipliers per engram layer, rolling XOR, then
 per-head `rolling % prime + offset`. The tables must be read in the engine's
@@ -237,7 +250,7 @@ Each phase has a gate that is a comparison, not an inspection.
 | phase | work | gate |
 | --- | --- | --- |
 | P0 (done) | artifact opened; types, geometry and both hard formats read; VQ decoder written and checked | fixtures bit-exact; real layer-0 slot arithmetic closes; expert 0 decodes finite |
-| P1 (loader and tokenizer landed) | family loader in Strata: `deepseek4` metadata, tensor types 42/44, inventory, tokenizer and chat template | the loader reports the 1,000-tensor inventory and every rejected tensor by name; malformed blobs are refused with a named error; the tokenizer's ids match the reference oracle. Met for metadata, types, inventory and blob containers on the real header, and for `encode` and rendered-chat ids on the tokenizer corpus; the 43 blob payloads await the full file, and the chat template is not written yet |
+| P1 (loader, tokenizer and template landed) | family loader in Strata: `deepseek4` metadata, tensor types 42/44, inventory, tokenizer and chat template | the loader reports the 1,000-tensor inventory and every rejected tensor by name; malformed blobs are refused with a named error; the tokenizer's ids match the reference oracle; the template's bytes match the reference renderer. Met for metadata, types, inventory and blob containers on the real header, for `encode` and rendered-chat ids on the tokenizer corpus, and for the V4.1 DSML template on the official and differential vectors; the 43 blob payloads await the full file |
 | P2 | VQ decode on CUDA, then HIP: row-dot kernels that read the bit stream directly | GPU output bit-identical to the CPU decoder on the fixtures and on real expert 0 |
 | P3 | trunk forward: MLA q/kv LoRAs, compressors, sparse indexer, sinks, sliding window, hyper-connections, RoPE both bases, MoE 384/top-6 + shared, fused VQ MoE | temperature-0 token ids and logits match the reference engine per position |
 | P4 | Engram: hash, O_DIRECT row reader, q/k/wkv projections, io_uring overlap if prefill needs it | hash rows match the reference implementation on its fixture, then on rows captured from the same checkpoint; output matches with engram on and off |
@@ -294,8 +307,13 @@ tools/dsv4/make_tokenizer_gguf.py       writes a metadata-only GGUF from the fil
 tests/core/deepseek4_test.cpp           50 checks: family, types, geometry, blobs, inventory
 tests/core/gguf_fixture.hpp             changed: a tensor can declare its own payload length
 tools/strata_tokenizer.py               changed: `pre` dispatch, the joyai-llm byte scan,
-                                        the family control table, special-token decode
-tools/test_tokenizer_joyai.py           17 tests: split rules, dispatch, goldens, oracle differential
+                                        the family control table, special-token decode,
+                                        the DSML template in the pack
+tools/test_tokenizer_joyai.py           18 tests: split rules, dispatch, goldens, oracle differential
+serve/chat_template_deepseek4.jinja     the V4.1 DSML chat head (shipped into the pack)
+serve/test_chat_template_deepseek4.py   16 tests: official goldens, renderer differential, request wiring
+tools/dsv4/dsml_render.py               the reference V4.1 render as a Python function (the template's oracle)
+tools/dsv4/test_dsml_render.py          14 tests: the reference's own golden vectors
 ```
 
 Build and run:
@@ -312,6 +330,7 @@ g++ -O2 -std=c++17 -Iinclude tools/dsv4/gguf_inspect.cpp -o /tmp/dsv4_gguf_inspe
 python3 tools/dsv4/make_tokenizer_gguf.py reference/head.bin reference/ds4-tokenizer.gguf
 python3 tools/strata_tokenizer.py --gguf reference/ds4-tokenizer.gguf --out /tmp/ds4-pack --check
 DS4_TOK_ORACLE=/tmp/ds4_tok_oracle python3 -m unittest tools.test_tokenizer_joyai -v
+python3 -m unittest tools.dsv4.test_dsml_render serve.test_chat_template_deepseek4 -v
 ```
 
 Expected: `89 checks, 0 failures`, two fixture lines with 0 mismatches, three
@@ -321,9 +340,10 @@ histogram (`F32 x531 Q4_K x330 I32 x1 I64 x3 BF16 x65 vqblob x43 fp8_32x32
 x27`). Without `--partial`, every payload must also be inside the file. The
 test is also a CMake target, `deepseek4_test`, under `STRATA_BUILD_TESTS`.
 The tokenizer extraction prints `vocab 129280, merges 127741, pre joyai-llm`
-and `round trip: 16 strings, 0 failed`; the unit suite runs 17 tests, with the
-four `Real` ones skipped when `reference/ds4-tokenizer.gguf` is absent and the
-oracle differential skipped without `DS4_TOK_ORACLE`.
+and `round trip: 16 strings, 0 failed`; the unit suite runs 18 tests, with the
+five `Real` ones skipped when `reference/ds4-tokenizer.gguf` is absent and the
+oracle differential skipped without `DS4_TOK_ORACLE`. The template suite runs
+16 tests and the renderer suite 14; both need no artifact.
 
 ### The tokenizer, measured
 
@@ -349,6 +369,54 @@ this checkout's C oracle: its `special_token_at` table predates the engine's
 V4.1 row, which the reference port's plan records as a found-and-fixed gap
 (`docs/deepseek41-port-plan.md` §6.17 item 4). The Rust port and the V4.1
 renderer both have it, so this port keeps it.
+
+### The chat template, measured
+
+The artifact carries no `tokenizer.chat_template`. The format is the reference
+server's V4.1 DSML head (`render_dsml_chat_choice_ex`, `DsmlHead::V41 {
+system_token: true }`), which is the official `encoding.py`: its own golden
+test records that case 1 is byte-identical to `test_output_1.txt`. The head is
+
+```
+<｜begin▁of▁sentence｜>
+[<｜System｜> if a system body or a tools prompt is present]
+[effort line: "Reasoning Effort: 75 ..." (high) or 100 (max)]
+system messages joined by a blank line, then the tools prompt
+<｜User｜>first user block, a blank line for an adjacent user-side block
+<｜Assistant｜><think>reasoning</think>content + DSML calls + <｜end▁of▁sentence｜>
+...
+tail: <｜Assistant｜> then <think> or </think>
+```
+
+Every DSML tag in this generation opens with a space (`<｜DSML｜ calls>`,
+`<｜DSML｜ invoke`, `<｜DSML｜ parameter>`), string parameters are raw, other
+parameters are `json.dumps`-shaped, and a closing parameter tag inside a value
+is the one thing escaped (its `<` becomes `&lt;`; inside a non-string value,
+`<`). Thinking follows the engine's request defaults: **off** unless the
+request asks, effort HIGH when it does. A user-only chat with no effort writes
+no `<｜System｜>`; a tools prompt alone does.
+
+Two renderings pin it. `tools/dsv4/dsml_render.py` ports the reference
+renderer and its 14 tests transcribe the reference's own golden vectors
+(`crates/ds4-server/tests/render.rs`): the four official head conversations
+and the two spaced-tools conversations, including parallel calls, a
+zero-parameter call, `a<b & c`, a nested object, a `\u` escape in a schema and
+two merged tool results. `serve/chat_template_deepseek4.jinja` is the shipped
+Jinja template; its 16 tests compare it to that renderer over 18 conversations
+× 4 tool sets × 4 think modes × 2 `add_generation_prompt` values (576 renders,
+0 differing bytes), then repeat the official vectors through the server's own
+`openai_to_messages`/`effort_kwargs` path. `python3
+tools/strata_tokenizer.py --gguf ... --out <pack>` writes the template into
+the pack as `chat_template.jinja`, which `serve/server.py` already prefers
+over its own.
+
+Two boundaries, recorded rather than hidden. Strata's shared effort table maps
+every client's `max`/`maximum` to `xhigh`, so the 100 line is unreachable from
+a request until that table grows a family hook; the template itself accepts
+`max` and the renderer's 100-line vector covers it. And `ChatTemplate.render`
+drops completed empty assistant turns (#843, a server-wide policy the
+reference does not have); the differential disables that filter to compare the
+template itself, and `EmptyAssistantTurns` pins the filter as served.
 
 ## 9. Downloads for the next phases
 

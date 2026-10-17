@@ -672,6 +672,11 @@ def extract(gguf_path, out_dir) -> dict:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     from gguf_reader import GGUFFile
     tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
+    if not tpl and tk.pre == "joyai-llm":
+        # DeepSeek-V4.1-Flash's artifact carries no template; its format is the reference server's V4.1 DSML
+        # head, shipped here and pinned against the reference renderer (serve/test_chat_template_deepseek4.py).
+        tpl = (pathlib.Path(__file__).resolve().parents[1] / "serve" / "chat_template_deepseek4.jinja"
+               ).read_text(encoding="utf-8")
     if tpl:
         (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
     return cfg

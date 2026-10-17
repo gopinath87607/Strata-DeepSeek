@@ -148,6 +148,19 @@ class Real(unittest.TestCase):
         self.assertEqual(self.tok.decode([128803]), "<｜User｜>")
         self.assertEqual(self.tok.decode([0]), "<｜begin▁of▁sentence｜>")
 
+    def test_extract_writes_the_dsml_template_into_the_pack(self):
+        # The artifact has no tokenizer.chat_template; the pack's template is the shipped DSML head, which the
+        # server picks up as tpath/chat_template.jinja (serve/server.py).
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            ST.extract(GGUF, tmp)
+            pack = Path(tmp) / "tokenizer"
+            tpl = pack / "chat_template.jinja"
+            self.assertTrue(tpl.is_file())
+            self.assertEqual(tpl.read_text(encoding="utf-8"),
+                             (ROOT / "serve" / "chat_template_deepseek4.jinja").read_text(encoding="utf-8"))
+            self.assertTrue((pack / "vocab.json").is_file())
+
     @unittest.skipUnless(ORACLE, "set $DS4_TOK_ORACLE to the reference tokenizer oracle")
     def test_against_the_reference_oracle(self):
         cases = [t for t, _ in GOLDEN_ENCODE] + [t for t, _ in GOLDEN_RENDER] + [
