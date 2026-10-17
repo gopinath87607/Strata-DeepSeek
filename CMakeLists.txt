@@ -281,6 +281,16 @@ if(STRATA_BUILD_TESTS)
   add_executable(deepseek4_test tests/core/deepseek4_test.cpp)
   target_link_libraries(deepseek4_test PRIVATE strata_artifact)
   add_test(NAME deepseek4_test COMMAND deepseek4_test)
+  # the DeepSeek-V4.1-Flash engram host half: hash, O_DIRECT shard reader, row dequant, gate emulation.  The
+  # reference fixtures run when reference/ is present; the real sidecar shards only when the test is given
+  # their directory as a second argument (ctest passes reference/ and the shard section stays out).
+  add_executable(deepseek4_engram_test tests/core/deepseek4_engram_test.cpp)
+  target_link_libraries(deepseek4_engram_test PRIVATE strata_artifact)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(deepseek4_engram_test PRIVATE -ffp-contract=off)  # the gate compare is bit-exact
+  endif()
+  add_test(NAME deepseek4_engram_test COMMAND deepseek4_engram_test ${CMAKE_CURRENT_SOURCE_DIR}/reference)
+  set_tests_properties(deepseek4_engram_test PROPERTIES SKIP_RETURN_CODE 77)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
