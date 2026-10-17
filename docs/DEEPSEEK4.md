@@ -11,9 +11,12 @@ header: 1,000 tensors, 0 errors. P1's tokenizer has landed too: the
 corpus string tried except one literal whose engine entry postdates this
 checkout's C source (see §8). P1's chat template has landed as the reference's
 V4.1 DSML head, byte-pinned against its renderer and the official
-`encoding.py` vectors; the pack writer installs it. The blob-payload gate is
-still open (it waits for the full GGUF). This file is the state carrier for the
-port.
+`encoding.py` vectors; the pack writer installs it. P2's CUDA half has landed:
+the GPU decode is bit-identical to the CPU decoder on the engine's v2 fixtures
+and on all 35.4M values of real expert 0, and the row dot reads the packed bit
+stream directly; HIP is wired but has no device here to run on. The
+blob-payload gate is still open (it waits for the full GGUF). This file is the
+state carrier for the port.
 
 Goal: serve the published DeepSeek-V4.1-Flash-1017 VQ artifact on one normal
 PC — NVIDIA or AMD cards plus system RAM — with Strata's layer split, expert
@@ -251,7 +254,7 @@ Each phase has a gate that is a comparison, not an inspection.
 | --- | --- | --- |
 | P0 (done) | artifact opened; types, geometry and both hard formats read; VQ decoder written and checked | fixtures bit-exact; real layer-0 slot arithmetic closes; expert 0 decodes finite |
 | P1 (loader, tokenizer and template landed) | family loader in Strata: `deepseek4` metadata, tensor types 42/44, inventory, tokenizer and chat template | the loader reports the 1,000-tensor inventory and every rejected tensor by name; malformed blobs are refused with a named error; the tokenizer's ids match the reference oracle; the template's bytes match the reference renderer. Met for metadata, types, inventory and blob containers on the real header, for `encode` and rendered-chat ids on the tokenizer corpus, and for the V4.1 DSML template on the official and differential vectors; the 43 blob payloads await the full file |
-| P2 | VQ decode on CUDA, then HIP: row-dot kernels that read the bit stream directly | GPU output bit-identical to the CPU decoder on the fixtures and on real expert 0 |
+| P2 (CUDA done; HIP waits for AMD hardware) | VQ decode on CUDA, then HIP: row-dot kernels that read the bit stream directly | GPU output bit-identical to the CPU decoder on the fixtures and on real expert 0. Met on CUDA: 0 mismatching bytes on both v2 fixtures (also against the engine's own dumps) and on all 35.4M decoded values of the real layer-0 expert 0, whose three matrices are v3 13-bit; the row dot agrees with a float64 reference to 9.1e-9 of the term scale. The same source is HIP-translated by the gfx906 build, but no ROCm device exists here to run it |
 | P3 | trunk forward: MLA q/kv LoRAs, compressors, sparse indexer, sinks, sliding window, hyper-connections, RoPE both bases, MoE 384/top-6 + shared, fused VQ MoE | temperature-0 token ids and logits match the reference engine per position |
 | P4 | Engram: hash, O_DIRECT row reader, q/k/wkv projections, io_uring overlap if prefill needs it | hash rows match the reference implementation on its fixture, then on rows captured from the same checkpoint; output matches with engram on and off |
 | P5 | three DSpark towers and verify/rollback | greedy output byte-identical with drafting on and off; cache frontier exact |
@@ -314,6 +317,9 @@ serve/chat_template_deepseek4.jinja     the V4.1 DSML chat head (shipped into th
 serve/test_chat_template_deepseek4.py   16 tests: official goldens, renderer differential, request wiring
 tools/dsv4/dsml_render.py               the reference V4.1 render as a Python function (the template's oracle)
 tools/dsv4/test_dsml_render.py          14 tests: the reference's own golden vectors
+include/strata/kernels/deepseek4_vq.hpp  host/device payload parser and the two GPU entries
+src/kernels/cuda/deepseek4_vq.cu         P2: whole-matrix VQ decode and the packed-stream row dot
+tests/core/deepseek4_vq_cuda_test.cpp    the P2 gate: GPU decode vs the CPU decoder, bitwise; row dot vs f64
 ```
 
 Build and run:
@@ -331,6 +337,10 @@ python3 tools/dsv4/make_tokenizer_gguf.py reference/head.bin reference/ds4-token
 python3 tools/strata_tokenizer.py --gguf reference/ds4-tokenizer.gguf --out /tmp/ds4-pack --check
 DS4_TOK_ORACLE=/tmp/ds4_tok_oracle python3 -m unittest tools.test_tokenizer_joyai -v
 python3 -m unittest tools.dsv4.test_dsml_render serve.test_chat_template_deepseek4 -v
+/usr/local/cuda-13.2/bin/nvcc -O2 -std=c++17 -Iinclude -Itools/dsv4 \
+  -gencode arch=compute_86,code=sm_86 -gencode arch=compute_120,code=sm_120 \
+  tests/core/deepseek4_vq_cuda_test.cpp src/kernels/cuda/deepseek4_vq.cu -o /tmp/dsv4_vq_cuda_test
+CUDA_VISIBLE_DEVICES=1 /tmp/dsv4_vq_cuda_test reference
 ```
 
 Expected: `89 checks, 0 failures`, two fixture lines with 0 mismatches, three
@@ -343,7 +353,11 @@ The tokenizer extraction prints `vocab 129280, merges 127741, pre joyai-llm`
 and `round trip: 16 strings, 0 failed`; the unit suite runs 18 tests, with the
 five `Real` ones skipped when `reference/ds4-tokenizer.gguf` is absent and the
 oracle differential skipped without `DS4_TOK_ORACLE`. The template suite runs
-16 tests and the renderer suite 14; both need no artifact.
+16 tests and the renderer suite 14; both need no artifact. The GPU test prints
+one line per matrix, all with `0 mismatches`, the row dot's worst error (about
+`1e-8` of the term scale on the real payloads), and `PASS: 101 checks, 0
+failures`; without `reference/` it prints SKIP and exits 77 (ctest treats that
+as skipped).
 
 ### The tokenizer, measured
 
@@ -417,6 +431,47 @@ a request until that table grows a family hook; the template itself accepts
 drops completed empty assistant turns (#843, a server-wide policy the
 reference does not have); the differential disables that filter to compare the
 template itself, and `EmptyAssistantTurns` pins the filter as served.
+
+### The VQ decode on the GPU, measured
+
+P2's gate is byte equality, and it is met. Measured on an RTX 3060 (sm_86)
+with the CUDA 13.2 toolkit, `tests/core/deepseek4_vq_cuda_test.cpp`:
+
+| input | decoded values | mismatches |
+| --- | --- | --- |
+| `v2_nc256` fixture (8-bit) | 1,024 | 0 (also 0 against the engine's `ref.f32`) |
+| `v2_nc4096` fixture (12-bit) | 1,024 | 0 (also 0 against the engine's `ref.f32`) |
+| real layer-0 expert 0, w1 2304x5120 | 11,796,480 | 0 |
+| real layer-0 expert 0, w3 2304x5120 | 11,796,480 | 0 |
+| real layer-0 expert 0, w2 5120x2304 | 11,796,480 | 0 |
+
+The real payloads are v3, `nc` 8192, 13-bit: the 12-bit main stream plus the
+1-bit plane, the path the reference's own comment records as having run 42%
+PPL high when the plane advanced per block instead of per 32-index group. The
+decode is bit-identical because it is the CPU decoder's arithmetic, not a
+hardware shortcut: the same three-byte window, the same integer f16 and E4M3
+conversions (0x7f/0xff become positive quiet NaN in both), and one final
+multiply by the gain.
+
+The row dot reads the packed stream directly and never materialises a matrix.
+One warp per row, lane j takes index groups `j, j+32, ...` (the reference's
+single-token mapping), each group is eight values times the same eight bf16
+activation values, the gain is applied last and the reduction is the reference's
+five-step xor tree. Against a float64 dot of the decoded values and the same
+bf16 activation, the worst error is 6.0e-9 (w1), 6.8e-9 (w3) and 9.1e-9 (w2)
+of `1 + sum|term|` - the fixtures' 16-row dots are exact. That comparison is a
+tolerance on purpose: a bit claim for the dot belongs to P3, against the
+reference engine, where the accumulation order and FMA contraction can be
+compared like for like.
+
+The E4M3 conversion is integer/float arithmetic rather than
+`cvt.rn.f16x2.e4m3x2`. The instruction is exact - E4M3 is a subset of f16 - but
+it needs sm_89+, and this fork builds for sm_86 and HIP too; the engine's
+measured cost of the scalar table (26% per decode step, 20% prefill) is a
+reason to add the instruction behind an arch guard when P7 has a number, not a
+reason for two different conversions now. HIP is wired (the gfx906 build
+translates every `src/*.cu`, and the compat shim supplies the runtime calls),
+but there is no ROCm device on this machine, so the HIP run stays open.
 
 ## 9. Downloads for the next phases
 
