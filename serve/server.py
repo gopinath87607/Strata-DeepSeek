@@ -6872,7 +6872,13 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        # The pack's own pre-tokenizer, not an assumption: `qwen35` is the default only because every pack
+        # written before the field existed is a Qwen one.  A DeepSeek pack declares `joyai-llm`.
+        pre = "qwen35"
+        tj = tpath / "tokenizer.json"
+        if tj.exists():
+            pre = json.loads(tj.read_text(encoding="utf-8")).get("pre", pre)
+        tok = ST.Tokenizer(tokens, merges, types, pre)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:

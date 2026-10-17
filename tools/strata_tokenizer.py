@@ -65,6 +65,190 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# The `joyai-llm` pre-tokenizer, used by the DeepSeek-V4 family.  It is implemented as the reference
+# engine's BYTE SCAN (`ds4.c` `bpe_tokenize_text_joyai`, ported 1:1 in `ds4-core/src/tok.rs`), not as a
+# regex.  The model's tokenizer.json describes it as the llama.cpp pattern triplet
+# (`src/llama-vocab.cpp` L321-329, `LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM`), and neither of the two regex readings
+# of that description reproduces the engine:
+#
+#   * as one alternation, it disagrees with the engine on runs of spaces before CJK ("     漢字"): the
+#     engine leaves the last space to travel with the CJK letters;
+#   * applied sequentially (llama.cpp's `unicode_regex_split`), it disagrees with the engine on the same
+#     case in the other direction, because pattern 2 has already cut the CJK out.
+#
+# The engine also treats EVERY non-ASCII byte as a letter for the generic letter branch, an approximation
+# it documents; emoji followed by accented text tokenizes differently under a `\p{L}` regex.  Measured on
+# the real vocabulary: the scan below agrees with the reference C oracle on every one of 459 corpus strings
+# (both encode and rendered-chat modes) except the `<｜System｜>` literal, which the C source in this
+# checkout predates (see JOYAI_LLM_CONTROL_TOKENS).
+def _utf8_len(c: int) -> int:
+    if c < 0x80:
+        return 1
+    if (c & 0xE0) == 0xC0:
+        return 2
+    if (c & 0xF0) == 0xE0:
+        return 3
+    if (c & 0xF8) == 0xF0:
+        return 4
+    return 1
+
+
+def _utf8_next(b: bytes, pos: int) -> int:
+    return min(pos + _utf8_len(b[pos]), len(b))
+
+
+def _utf8_cp(b: bytes, pos: int) -> tuple[int, int]:
+    c0 = b[pos]
+    n = _utf8_len(c0)
+    if pos + n > len(b):
+        return c0, pos + 1
+    if n == 1:
+        return c0, pos + 1
+    if n == 2:
+        return ((c0 & 0x1F) << 6) | (b[pos + 1] & 0x3F), pos + 2
+    if n == 3:
+        return (((c0 & 0x0F) << 12) | ((b[pos + 1] & 0x3F) << 6) | (b[pos + 2] & 0x3F)), pos + 3
+    return (((c0 & 0x07) << 18) | ((b[pos + 1] & 0x3F) << 12) | ((b[pos + 2] & 0x3F) << 6)
+            | (b[pos + 3] & 0x3F)), pos + 4
+
+
+def _ascii_alpha(c: int) -> bool:
+    return 0x41 <= c <= 0x5A or 0x61 <= c <= 0x7A
+
+
+def _ascii_digit(c: int) -> bool:
+    return 0x30 <= c <= 0x39
+
+
+def _ascii_space(c: int) -> bool:
+    return c in (0x20, 0x09, 0x0A, 0x0D, 0x0B, 0x0C)
+
+
+def _ascii_newline(c: int) -> bool:
+    return c in (0x0A, 0x0D)
+
+
+def _joyai_punct(c: int) -> bool:
+    return 0x21 <= c <= 0x2F or 0x3A <= c <= 0x40 or 0x5B <= c <= 0x60 or 0x7B <= c <= 0x7E
+
+
+def _joyai_cjk_at(b: bytes, pos: int) -> bool:
+    if b[pos] < 0x80:
+        return False
+    cp, _ = _utf8_cp(b, pos)
+    return 0x4E00 <= cp <= 0x9FA5 or 0x3040 <= cp <= 0x309F or 0x30A0 <= cp <= 0x30FF
+
+
+def _joyai_letter_at(b: bytes, pos: int) -> bool:
+    c = b[pos]
+    return _ascii_alpha(c) if c < 0x80 else True     # the engine's documented approximation
+
+
+def _joyai_letters(b: bytes, pos: int) -> int:
+    while pos < len(b) and _joyai_letter_at(b, pos):
+        pos = _utf8_next(b, pos)
+    return pos
+
+
+def joyai_split(text: str) -> list[str]:
+    """The reference engine's pre-tokenizer pieces, byte for byte.
+
+    Every branch is a straight port of `bpe_tokenize_text_joyai`; the order matters (digits before CJK
+    before punctuation before letters) and the emitted span always advances by at least one code point.
+    """
+    b = text.encode("utf-8")
+    n = len(b)
+    out: list[str] = []
+    pos = 0
+    while pos < n:
+        start = pos
+        c = b[pos]
+        if _ascii_digit(c):
+            k = 0
+            while pos < n and _ascii_digit(b[pos]) and k < 3:
+                pos += 1
+                k += 1
+        elif _joyai_cjk_at(b, pos):
+            while True:
+                pos = _utf8_next(b, pos)
+                if not (pos < n and _joyai_cjk_at(b, pos)):
+                    break
+        elif _joyai_punct(c) and pos + 1 < n and _ascii_alpha(b[pos + 1]):
+            pos += 1
+            while pos < n and _ascii_alpha(b[pos]):
+                pos += 1
+        elif _joyai_letter_at(b, pos):
+            pos = _joyai_letters(b, pos)
+        elif not _ascii_newline(c) and not _joyai_punct(c) and pos + 1 < n and _joyai_letter_at(b, pos + 1):
+            pos += 1
+            pos = _joyai_letters(b, pos)
+        elif c == 0x20 and pos + 1 < n and _joyai_punct(b[pos + 1]):
+            pos += 1
+            while pos < n and _joyai_punct(b[pos]):
+                pos += 1
+            while pos < n and _ascii_newline(b[pos]):
+                pos += 1
+        elif _joyai_punct(c):
+            while pos < n and _joyai_punct(b[pos]):
+                pos += 1
+            while pos < n and _ascii_newline(b[pos]):
+                pos += 1
+        elif _ascii_space(c):
+            p = pos
+            last_newline_end = 0
+            while p < n and _ascii_space(b[p]):
+                sc = b[p]
+                p += 1
+                if _ascii_newline(sc):
+                    last_newline_end = p
+            if last_newline_end:
+                pos = last_newline_end
+            elif p < n and p > pos + 1 and (_joyai_letter_at(b, p) or _joyai_punct(b[p])):
+                pos = p - 1          # the last space goes with the letters/punctuation that follow
+            else:
+                pos = p
+        else:
+            pos = _utf8_next(b, pos)
+        if pos == start:
+            pos = _utf8_next(b, pos)
+        out.append(b[start:pos].decode("utf-8"))
+    return out
+
+# The literals the DeepSeek-V4 tokenizer treats as special.  The GGUF carries NO `token_type` array, so
+# these have to come from the family's own tokenizer (`ds4-core/src/tok.rs`, `ModelFamily::DeepSeek4` and
+# `special_token_at`).  All are marked type 3 (CONTROL), which Strata matches only with parse_special - the
+# reference has exactly those two modes (`encode` = plain BPE, `encode_rendered_chat` = specials by literal).
+# The reference also maps a few literals this vocabulary does not own (`<|endoftext|>` -> eos); they only
+# matter to templates that spell them, which the DSML renderer does not.
+JOYAI_LLM_CONTROL_TOKENS = (
+    "<｜begin▁of▁sentence｜>",   # 0
+    "<｜end▁of▁sentence｜>",     # 1
+    "<｜System｜>",             # 128799
+    "<｜User｜>",               # 128803
+    "<｜Assistant｜>",          # 128804
+    "<think>",                 # 128821
+    "</think>",                # 128822
+    "｜DSML｜",                # 128825
+    "<｜deepseek_image｜>",     # 129264
+)
+
+
+def family_control_types(pre: str, tokens: list[str]) -> list[int] | None:
+    """Token types for a family whose GGUF carries no `tokenizer.ggml.token_type`.
+
+    Returns None when the family needs no synthesised table, leaving Qwen packs on their metadata path.
+    Type 1 is NORMAL and 3 is CONTROL (docs/gguf.md), so every non-special token stays an ordinary one.
+    """
+    if pre != "joyai-llm":
+        return None
+    types = [1] * len(tokens)
+    ids = {t: i for i, t in enumerate(tokens)}
+    for literal in JOYAI_LLM_CONTROL_TOKENS:
+        i = ids.get(literal)
+        if i is not None:
+            types[i] = 3
+    return types
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -88,7 +272,18 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        # The pre-tokenizer is selected by the pack's `pre`, never re-derived from the model name.  An
+        # unknown one raises instead of silently falling back to qwen35: the wrong split still produces
+        # valid ids and a plausible-looking answer, which is the failure mode this module exists to avoid.
+        if pre == "qwen35":
+            self._re = regex.compile(QWEN35_PATTERN)
+            self._pieces = self._re.findall
+        elif pre == "joyai-llm":
+            self._re = None
+            self._pieces = joyai_split
+        else:
+            raise ValueError("unsupported pre-tokenizer %r: this build implements 'qwen35' and 'joyai-llm'"
+                             % (pre,))
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -107,6 +302,18 @@ class Tokenizer:
             for i, ty in enumerate(token_types):
                 if ty in (3, 4):
                     self.special_tokens[tokens[i]] = i
+        if pre == "joyai-llm":
+            # The reference engine's special scan also maps three ASCII spellings of the sentence markers
+            # that this vocabulary does not contain as tokens (`ds4.c` special_token_at; both the C table
+            # and the Rust port have them).  They emit BOS/EOS when a prompt spells them literally.
+            for literal, target in (("<|endoftext|>", "<｜end▁of▁sentence｜>"),
+                                    ("<|beginoftext|>", "<｜begin▁of▁sentence｜>"),
+                                    ("<|startoftext|>", "<｜begin▁of▁sentence｜>")):
+                if target in self.ids:
+                    self.special_tokens.setdefault(literal, self.ids[target])
+        # A special token's text is a literal, not byte-mapped (DeepSeek's `<｜User｜>` and `<｜begin▁of▁sentence｜>`
+        # contain characters outside the byte alphabet), so decode emits it as written.
+        self.special_token_ids = frozenset(self.special_tokens.values())
         always = [t for t, i in self.special_tokens.items() if token_types and token_types[i] == 4]
         self.control_tokens = [t for t, i in self.special_tokens.items() if token_types and token_types[i] == 3]
         # Longest literal first, or `<|im_end|>` could match a shorter prefix of itself.  `regex.escape` so a
@@ -141,9 +348,12 @@ class Tokenizer:
             raise ValueError("expected a byte-level BPE tokenizer (model 'gpt2'), got %r" % model)
         special = {k: int(md[k]) for k in md
                    if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")}
-        return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
-                   list(md.get("tokenizer.ggml.token_type") or []) or None,
-                   md.get("tokenizer.ggml.pre", "qwen35"), special)
+        tokens = list(md["tokenizer.ggml.tokens"])
+        types = list(md.get("tokenizer.ggml.token_type") or []) or None
+        pre = md.get("tokenizer.ggml.pre", "qwen35")
+        if types is None:
+            types = family_control_types(pre, tokens)
+        return cls(tokens, list(md["tokenizer.ggml.merges"]), types, pre, special)
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:
@@ -223,7 +433,7 @@ class Tokenizer:
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
         cache = self._piece_ids
-        for piece in self._re.findall(text):
+        for piece in self._pieces(text):
             got = cache.get(piece)
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
@@ -304,6 +514,9 @@ class Tokenizer:
         if b is None:
             if i < 0 or i >= len(self.tokens):
                 raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+            if i in self.special_token_ids:
+                b = cache[i] = self.tokens[i].encode("utf-8")
+                return b
             raw = bytearray()
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)
@@ -428,6 +641,18 @@ def extract(gguf_path, out_dir) -> dict:
     out = pathlib.Path(out_dir) / "tokenizer"
     out.mkdir(parents=True, exist_ok=True)
     tk = Tokenizer.from_gguf(gguf_path)
+    # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
+    # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again
+    # (qwen35) or to join three patterns into one alternation (joyai-llm).  A `joyai-llm` list is applied
+    # in order, each pattern re-splitting the pieces the previous one produced.
+    if tk.pre == "joyai-llm":
+        # Not a regex: the engine's byte scan, reproduced in `joyai_split` above.  Shipping the llama.cpp
+        # pattern triplet here would invite a port that uses it and gets different ids (see the comment).
+        pre_pattern, pre_source = "joyai_split: the reference engine's byte scan", \
+            "ds4.c bpe_tokenize_text_joyai (ported in ds4-core/src/tok.rs); llama.cpp's triplet is not equivalent"
+    else:
+        pre_pattern, pre_source = QWEN35_PATTERN, \
+            ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"
     cfg = {
         "model": "gpt2",
         "pre": tk.pre,
@@ -435,10 +660,8 @@ def extract(gguf_path, out_dir) -> dict:
         "n_merges": len(tk.ranks),
         "special_ids": tk.special_ids,
         "add_bos_token": False,
-        # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
-        # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": pre_pattern,
+        "pre_pattern_source": pre_source,
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in

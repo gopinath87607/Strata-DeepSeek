@@ -4,9 +4,14 @@ Status: fork `deepseek4`, cut from upstream main `477ac13c`. P0 is done. P1's
 loader half has landed — the family, its type table, geometry, blob-container
 checks and the tensor inventory are in `include/strata/artifact/deepseek4.hpp`
 with a synthetic test suite — and was checked against the real file's 64 MiB
-header: 1,000 tensors, 0 errors. P1's tokenizer and chat template, and the
-blob-payload gate, are still open (the latter waits for the full GGUF). This
-file is the state carrier for the port.
+header: 1,000 tensors, 0 errors. P1's tokenizer has landed too: the
+`joyai-llm` pre-tokenizer, the family's control-token table and the pack's
+`pre` dispatch are in `tools/strata_tokenizer.py`, and the
+`encode`/rendered-chat ids agree with the reference tokenizer oracle on every
+corpus string tried except one literal whose engine entry postdates this
+checkout's C source (see §8). P1's chat template and the blob-payload gate are
+still open (the latter waits for the full GGUF). This file is the state
+carrier for the port.
 
 Goal: serve the published DeepSeek-V4.1-Flash-1017 VQ artifact on one normal
 PC — NVIDIA or AMD cards plus system RAM — with Strata's layer split, expert
@@ -232,7 +237,7 @@ Each phase has a gate that is a comparison, not an inspection.
 | phase | work | gate |
 | --- | --- | --- |
 | P0 (done) | artifact opened; types, geometry and both hard formats read; VQ decoder written and checked | fixtures bit-exact; real layer-0 slot arithmetic closes; expert 0 decodes finite |
-| P1 (loader half landed) | family loader in Strata: `deepseek4` metadata, tensor types 42/44, inventory, tokenizer and chat template | the loader reports the 1,000-tensor inventory and every rejected tensor by name; malformed blobs are refused with a named error. Met for metadata, types, inventory and blob containers on the real header; the 43 blob payloads await the full file, and the tokenizer and chat template are not written yet |
+| P1 (loader and tokenizer landed) | family loader in Strata: `deepseek4` metadata, tensor types 42/44, inventory, tokenizer and chat template | the loader reports the 1,000-tensor inventory and every rejected tensor by name; malformed blobs are refused with a named error; the tokenizer's ids match the reference oracle. Met for metadata, types, inventory and blob containers on the real header, and for `encode` and rendered-chat ids on the tokenizer corpus; the 43 blob payloads await the full file, and the chat template is not written yet |
 | P2 | VQ decode on CUDA, then HIP: row-dot kernels that read the bit stream directly | GPU output bit-identical to the CPU decoder on the fixtures and on real expert 0 |
 | P3 | trunk forward: MLA q/kv LoRAs, compressors, sparse indexer, sinks, sliding window, hyper-connections, RoPE both bases, MoE 384/top-6 + shared, fused VQ MoE | temperature-0 token ids and logits match the reference engine per position |
 | P4 | Engram: hash, O_DIRECT row reader, q/k/wkv projections, io_uring overlap if prefill needs it | hash rows match the reference implementation on its fixture, then on rows captured from the same checkpoint; output matches with engram on and off |
@@ -285,8 +290,12 @@ tools/dsv4/vq_blob_info.cpp     geometry and decode stats for a real blob
 
 include/strata/artifact/deepseek4.hpp   family-scoped type table, geometry, blob check, inventory
 tools/dsv4/gguf_inspect.cpp             checks a real GGUF's header, inventory and blob containers
+tools/dsv4/make_tokenizer_gguf.py       writes a metadata-only GGUF from the file's header
 tests/core/deepseek4_test.cpp           50 checks: family, types, geometry, blobs, inventory
 tests/core/gguf_fixture.hpp             changed: a tensor can declare its own payload length
+tools/strata_tokenizer.py               changed: `pre` dispatch, the joyai-llm byte scan,
+                                        the family control table, special-token decode
+tools/test_tokenizer_joyai.py           17 tests: split rules, dispatch, goldens, oracle differential
 ```
 
 Build and run:
@@ -300,6 +309,9 @@ g++ -O2 -std=c++17 -Iinclude -Itests/core tests/core/deepseek4_test.cpp -o /tmp/
 /tmp/deepseek4_test
 g++ -O2 -std=c++17 -Iinclude tools/dsv4/gguf_inspect.cpp -o /tmp/dsv4_gguf_inspect
 /tmp/dsv4_gguf_inspect reference/head.bin --partial
+python3 tools/dsv4/make_tokenizer_gguf.py reference/head.bin reference/ds4-tokenizer.gguf
+python3 tools/strata_tokenizer.py --gguf reference/ds4-tokenizer.gguf --out /tmp/ds4-pack --check
+DS4_TOK_ORACLE=/tmp/ds4_tok_oracle python3 -m unittest tools.test_tokenizer_joyai -v
 ```
 
 Expected: `89 checks, 0 failures`, two fixture lines with 0 mismatches, three
@@ -308,6 +320,35 @@ failures`, and for a header prefix or the full file, `OK` with the inventory
 histogram (`F32 x531 Q4_K x330 I32 x1 I64 x3 BF16 x65 vqblob x43 fp8_32x32
 x27`). Without `--partial`, every payload must also be inside the file. The
 test is also a CMake target, `deepseek4_test`, under `STRATA_BUILD_TESTS`.
+The tokenizer extraction prints `vocab 129280, merges 127741, pre joyai-llm`
+and `round trip: 16 strings, 0 failed`; the unit suite runs 17 tests, with the
+four `Real` ones skipped when `reference/ds4-tokenizer.gguf` is absent and the
+oracle differential skipped without `DS4_TOK_ORACLE`.
+
+### The tokenizer, measured
+
+`tokenizer.ggml.pre` is `joyai-llm`, and the model's tokenizer.json shape (the
+one llama.cpp carries as a triplet of patterns) is **not** what the reference
+engine runs. The engine has a hand-written byte scan (`ds4.c`
+`bpe_tokenize_text_joyai`, ported 1:1 in `ds4-core/src/tok.rs`), and the two
+regex readings of the triplet each disagree with it on spaces before CJK: a
+single alternation merges the last space into the CJK letters, while llama.cpp's
+sequential application has already cut the CJK out and cannot. The engine also
+counts every non-ASCII byte as a letter, so `😀é` is one piece. The Python scan
+is a branch-for-branch port; measured against the C oracle built from
+`tests/parity/tokenizer_c_oracle.c`, it gives the same ids on 459 corpus
+strings in both plain-encode and rendered-chat modes.
+
+Two special-token facts come from the engine, not from the GGUF (it has no
+`token_type` array): the control literals are BOS/EOS, `<｜System｜>`,
+`<｜User｜>`, `<｜Assistant｜>`, `<think>`, `</think>`, `｜DSML｜` and
+`<｜deepseek_image｜>`, and the ASCII spellings `<|endoftext|>`,
+`<|beginoftext|>` and `<|startoftext|>` map to EOS/BOS even though they are not
+vocabulary tokens. `<｜System｜>` (id 128799) is the one known disagreement with
+this checkout's C oracle: its `special_token_at` table predates the engine's
+V4.1 row, which the reference port's plan records as a found-and-fixed gap
+(`docs/deepseek41-port-plan.md` §6.17 item 4). The Rust port and the V4.1
+renderer both have it, so this port keeps it.
 
 ## 9. Downloads for the next phases
 
