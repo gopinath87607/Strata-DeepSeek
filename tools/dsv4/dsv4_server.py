@@ -140,13 +140,19 @@ class Engine:
                    "--seed", str(sampling["seed"])]
             if sampling["top_k"]:
                 cmd += ["--top-k", str(sampling["top_k"])]
-            if self.args.chunk is not None:
-                cmd += ["--chunk", str(self.args.chunk)]
+            # P7: one block for the whole request by default (--chunk 0), and the layer split when asked.
+            cmd += ["--chunk", str(self.args.chunk if self.args.chunk is not None else 0)]
+            if self.args.devices:
+                cmd += ["--devices", self.args.devices]
+            if self.args.expert_cache_mib:
+                cmd += ["--expert-cache-mib", self.args.expert_cache_mib]
             cmd += ["--ctx", str(self.args.ctx)]
             if self.args.gpu is not None:
                 cmd += ["--gpu", str(self.args.gpu)]
             if self.args.no_engram:
                 cmd.append("--no-engram")
+            if self.args.engram_feed:
+                cmd.append("--engram-feed")
             deadline = time.monotonic() + self.args.timeout
             proc = None
             try:
@@ -651,11 +657,19 @@ def main(argv):
     ap.add_argument("--tokenizer-gguf", default=None, help="default: part 1 of --model")
     ap.add_argument("--engram-dir", default="/mnt/nvme")
     ap.add_argument("--binary", default=None)
-    ap.add_argument("--chunk", type=int, default=None)
+    ap.add_argument("--chunk", type=int, default=None,
+                    help="tokens per block; default 0 = auto: the largest block that fits in free VRAM, "
+                         "one block for the whole request when it does (up to 4096 rows)")
     ap.add_argument("--ctx", type=int, default=DEFAULT_CTX)
     ap.add_argument("--gpu", type=int, default=None)
+    ap.add_argument("--devices", default=None,
+                    help="P7 layer split: comma-separated gpu list, one stage each (e.g. 0,1,2,3)")
+    ap.add_argument("--expert-cache-mib", default=None,
+                    help="P7 expert cache: MiB of device slots per stage (a comma list gives one per stage)")
     ap.add_argument("--timeout", type=float, default=1800.0)
     ap.add_argument("--no-engram", action="store_true")
+    ap.add_argument("--engram-feed", action="store_true",
+                    help="P7 engram feed: read the next block's engram rows while the current block computes")
     args = ap.parse_args(argv[1:])
 
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.api_key:
