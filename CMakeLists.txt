@@ -414,8 +414,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/deepseek4_vq.cu
                           src/kernels/cuda/deepseek4_engram.cu
                           src/kernels/cuda/deepseek4_hc.cu
+                          src/kernels/cuda/deepseek4_dense.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/deepseek4_hc_host.cpp
+                          src/kernels/deepseek4_dense_host.cpp
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -474,6 +476,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(deepseek4_hc_cuda_test PRIVATE strata_kernels CUDA::cudart)
     add_test(NAME deepseek4_hc_cuda_test COMMAND deepseek4_hc_cuda_test)
     set_tests_properties(deepseek4_hc_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(deepseek4_dense_cuda_test tests/core/deepseek4_dense_cuda_test.cpp)
+    target_include_directories(deepseek4_dense_cuda_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(deepseek4_dense_cuda_test PRIVATE strata_kernels CUDA::cudart)
+    add_test(NAME deepseek4_dense_cuda_test COMMAND deepseek4_dense_cuda_test)
+    set_tests_properties(deepseek4_dense_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(qsa_topk_active_parity src/kernels/qsa_topk_active_parity.cpp)
     target_include_directories(qsa_topk_active_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_topk_active_parity PRIVATE strata_kernels CUDA::cudart)
