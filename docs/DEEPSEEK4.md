@@ -737,7 +737,10 @@ per-GPU utilisation, memory, temperature and power from `nvidia-smi`, host
 CPU, RAM and disk rates from `/proc/stat`, `/proc/meminfo` and `/sys/block`,
 the engine's model, context, expert-cache MiB and slots, a 60-point history,
 and the finished-request table with its totals.  `prompt_ms` is the time to
-the first token, so it holds the prefill plus the first decode step;
+the first token, so it holds the prefill plus the first decode step; a
+request that had to start (or restart) the driver also holds the model open
+there (measured: 2.82 s prefill reported for a request whose first token came
+7.32 s after it was sent, the difference being the reload).
 `decode_tok_s` counts `(tokens - 1)` over the span from the first token to the
 last; `reused` is 0 and `hit_rate` null because prefix reuse is not built.
 `/config`, `/settings` and `/mcp` are 404s - the page already treats those as
