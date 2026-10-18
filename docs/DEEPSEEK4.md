@@ -302,7 +302,7 @@ Each phase has a gate that is a comparison, not an inspection.
 | P3 (hyper-connections, dense primitives, RoPE, the quantized-KV group, sparse attention, the window ring, the sparse indexer and the router + routed VQ MoE landed and gated) | trunk forward: MLA q/kv LoRAs, compressor source steps, grouped output projection, inverse RoPE, sparse indexer, sinks, sliding window, hyper-connections, RoPE both bases, MoE 384/top-6 + shared, fused VQ MoE, the forward driver | temperature-0 token ids and logits match the reference engine per position. Met for hyper-connections: mix, the Sinkhorn split, hc_pre + the RMS norm and hc_post match the host oracle within summation-order tolerances on 5120x4 at one and five tokens, 300x2 and 128x8; every bf16 output is on the bf16 grid; fused and unfused agree bitwise (364 checks, RTX 3060). Met for the dense primitives: rms_norm, SwiGLU, add/round/scale/expand, the q4_K embedding and the f32/bf16/q4_K matmuls including the grouped output form match their host oracles; the shared q4_K decoder produces dequant_bf16's exact bits on exact headers and stays within one bf16 ulp on varied fp16 ones (171 checks, RTX 3060). Met for RoPE: forward and inverse, both bases, the YaRN ramp and the three head geometries (512/64 at 64 heads, compressor 512/64, indexer 128/64) agree with the host oracle and only the last n_rot values move, bitwise (70 checks, RTX 3060). Met for the quantized-KV group: the compressor pool matches its host oracle, an independent double-precision reference and the bf16 grid (and bitwise when the scores are equal); act_quant's three modes and the ckv (288 B) and idxk (72 B) packs agree with their host oracles bit for bit, the read-back equals act_quant's own write-back at every element, and the idxk pad is zero (201 checks, RTX 3060). Met for sparse attention: the window ring's row mapping and the DSpark draft block match an independent double-precision softmax over the intended rows, an invalid topk entry is bitwise the same output as topk = 0 across an 8-key tile boundary, and the kernel agrees with its host oracle (which writes out the device's 32-lane xor tree) across head widths 64 and 512, 8 and 64 heads, a win_lo clamp that bites and a window-less compressed-only layer (179 checks, RTX 3060). Met for the window ring: the commit and its spec-decode snapshot match their host oracles bitwise over the whole buffer, including the n > window aliasing case, the device position override and the no-rows no-op (77 checks, RTX 3060). Met for the sparse indexer: the score agrees bitwise with its host oracle and a hand-written expectation on integer fixtures (per-lane partials, the xor tree, relu and the bf16 rounding points included) over 32- and 128-dim keys and the compact candidate row; the candidate list's pin, equal-key fill, fewer-visible-than-kk fallback and kk >= nb paths match the oracle bitwise and by hand, including a random block set; the topk output matches by hand and against the oracle with ties, a tail of -1, NaN-treated-as-invisible, the compact candidate mapping and the graph position recompute of ng and topk (320 checks, RTX 3060). Met for the MoE: the router matches its host oracle and the known cases - all logits equal picks experts 0..topk-1 in order, a six-way tie at the top-k boundary picks exactly those six ascending, z = 100 takes softplus's threshold-20 branch (weight exactly 1, not nan), topk > n_expert leaves -1 rounds with weight 0 exactly, and an image token selects on bias_vl - with every id identical and weights within 3.0e-8; the routed chain matches the reference engine's own MoE fixture, all six one-hot cases bit-exact against its f32 dump and the two random cases within 2.7e-4 of the vector's own scale (the reference's own measured worst was 2.6e-4), and the 2-token call and the partials + tail path pass on the same fixture (174 checks, RTX 3060). The shared expert is deliberately not in this module: it is the q4_K dense path, folded by the tail, exactly as the reference composes it |
 | P4 (hash, reader, projections, wiring and a live on/off check done; the reference-side on/off comparison waits for the reference engine on this hardware) | Engram: hash, O_DIRECT row reader, q/k/wkv projections, io_uring overlap if prefill needs it | hash rows match the reference implementation on its fixture, then on rows captured from the same checkpoint; output matches with engram on and off. Met for the hash and the row decode: 0 differing rows or values on the reference's hash fixture and on the captured golden positions through all four read paths, and 0 bit-diffs on the GPU row decode of the real shards. The gate and wkv meet their float64 bounds on the fixtures and the real weights. Wired into the driver: `--no-engram` mirrors the reference's compare mode, and on the 11-token prompt the last-position logits differ on all 129,280 values between on and off (max abs difference 7.14) while the first 8 greedy ids coincide, so the path is live. The paired on/off comparison against the reference engine is blocked on this hardware like P3's |
 | P5 (towers, the window fill and the verify loop landed and gated; the acceptance numbers are below) | three DSpark towers and verify/rollback | greedy output byte-identical with drafting on and off; cache frontier exact. Met: the same 16 greedy ids from an 11-token chat prompt with drafting off, `--dspark-verify 1`, `--dspark-verify 2` and the full block 5, and with `--chunk 4` (narrower than the 6-row verify batch), and the same 12 ids from a 151-token prompt (whose first window fill takes the full 128 rows) with drafting off and on. The frontier is exact by observation: every later round's argmax reads the rolled-back window, the restored compressor pending rows and the rewound group counts, and the ids match the plain run |
-| P6 | serving: OpenAI and Anthropic surfaces, sampling defaults, thinking toggle | one served request per contract |
+| P6 (serving landed and gated; residency is P7) | serving: OpenAI and Anthropic surfaces, sampling defaults, thinking toggle | one served request per contract. Met on 127.0.0.1 against the real 40-part image: `POST /v1/chat/completions` buffered answers "Paris" with `finish_reason` stop and usage 16 + 2; its SSE form sends the role chunk, the text delta, the finish chunk, the usage chunk and `[DONE]`, then closes; `POST /v1/messages` buffered returns one text block with `stop_reason` end_turn and the same usage; its SSE form sends `message_start`, block start/delta/stop, `message_delta`, `message_stop`, then closes. The thinking toggle routes the pre-`</think>` text to `reasoning_content` (a live 16-token run under `enable_thinking` came back all reasoning, no answer yet, `finish_reason` length). The wire defaults are the reference host's: temperature 1.0, top_p 1.0, min_p 0.05 (the engine's own default is 0.0); temperature 0 is the greedy path |
 | P7 | Strata integration: layer split, compressed expert cache, prompt chunk, loan and ring | four-GPU run returns the same tokens as one GPU; then a measured performance ledger |
 | P8 | AMD HIP and Windows builds | P3's gate passes on the same hardware |
 
@@ -387,8 +387,9 @@ tests/core/deepseek4_win_commit_cuda_test.cpp the window ring gate: commit and s
 tests/core/deepseek4_indexer_cuda_test.cpp the sparse indexer gate: exact score fixtures, the candidate list's four selection paths, topk ties/tail/compact/pos
 include/strata/kernels/deepseek4_fp8.hpp  P5: the towers' fp8 skeleton matmuls and the draft's small helpers
 src/kernels/cuda/deepseek4_fp8.cu        P5 device half. The single-matrix GEMV is the engram's wkv (gated in P4); the grouped form is the same kernel with a grid.y offset. No separate unit test: P5's gate is the driver's byte identity
-tools/dsv4/dsv4_run.cu                   the forward driver: 40-part reader, blob staging, the reference's layer order, greedy decode; P5 adds the DSpark towers, the window fill and the verify loop behind `--dspark`
+tools/dsv4/dsv4_run.cu                   the forward driver: 40-part reader, blob staging, the reference's layer order, greedy decode; P5 adds the DSpark towers, the window fill and the verify loop behind `--dspark`; P6 adds host sampling, `--stop-eos` and `--stream-ids`
 tools/dsv4/dsv4_prompt.py                text in front of it: the DSML head, the artifact tokenizer, the ids file, decoding back
+tools/dsv4/dsv4_server.py                P6 serving: OpenAI Chat and Anthropic Messages, buffered and SSE, one driver process per request behind a GPU lock
 
 include/strata/artifact/deepseek4_engram.hpp       P4 host half: hash, O_DIRECT row reader, gate emulation
 include/strata/artifact/deepseek4_engram_bits.hpp  the fp8/bf16 conversions, host and device, shared by both
@@ -707,6 +708,92 @@ Two things from the port worth recording:
 cmake --build /tmp/dsv4-build --target dsv4_run
 /tmp/dsv4-build/dsv4_run --ids-file ids.txt --gen 16 --gpu 0 --dspark --dspark-trace
 ```
+
+### Serving, measured
+
+`tools/dsv4/dsv4_server.py` is the P6 front end: Python's standard library
+only, one `ThreadingHTTPServer`, and a single lock that a request holds from
+prompt rendering through the last token (the engine owns the GPU). It serves
+two contracts:
+
+- OpenAI Chat, `POST /v1/chat/completions`: `chat.completion`, or
+  `chat.completion.chunk` events ending in `data: [DONE]`;
+  `stream_options.include_usage` adds the usage chunk. `max_tokens` /
+  `max_completion_tokens` default to 4096 here (the reference host's own
+  default is 393216).
+- Anthropic Messages, `POST /v1/messages`: `message`, or `message_start` /
+  `content_block_start` / `content_block_delta` / `content_block_stop` /
+  `message_delta` / `message_stop`. `max_tokens` is required, as the
+  contract says.
+
+`GET /v1/models` and `GET /health` are there for the usual clients.
+
+Each request renders the DSML head with `dsml_render.render`, encodes with the
+artifact's tokenizer, writes the ids file, runs the driver, and reads the id
+stream back. The driver grew three flags for this: the sampler
+(`--temperature`, `--top-p`, `--min-p`, `--top-k`, `--seed`), `--stop-eos`
+(stop after the EOS id; off by default so every P5 gate stays byte-identical)
+and `--stream-ids` (one id per stdout line). A `</think>` in the stream splits
+the reply: the OpenAI surface puts the part before it in `reasoning_content`,
+the Anthropic surface in a `{"type": "thinking"}` block. The EOS id and the
+`<｜User｜>`/`<｜Assistant｜>` heads end the turn and are not sent; an
+incremental UTF-8 decoder keeps a character split across two ids intact, and
+stop strings hold back up to their own length so a stop that straddles two ids
+is cut cleanly.
+
+The gate, run on 127.0.0.1 against the real image (RTX 3060, chunk 8, the
+40-part VQ artifact):
+
+| request | result |
+| --- | --- |
+| OpenAI Chat, buffered, temperature 0, max_tokens 8 | `"Paris"`, `finish_reason` stop, usage 16 prompt + 2 completion |
+| OpenAI Chat, SSE, same | role chunk, `"Paris"` delta, finish chunk, usage chunk, `[DONE]`, connection close |
+| Anthropic Messages, buffered, same | one text block `"Paris"`, `stop_reason` end_turn, usage 16 + 2 |
+| Anthropic Messages, SSE, same | `message_start`, text block start/delta/stop, `message_delta`, `message_stop`, close |
+| OpenAI Chat, `enable_thinking: true`, max_tokens 16 | `reasoning_content` `"We need answer briefly. 2+2=4. Just respond."`, content empty, `finish_reason` length |
+
+The thinking row is the split working, not a failed answer: 16 tokens was too
+small to reach `</think>`, so the whole reply was still reasoning and the
+visible answer would follow in `content`.
+
+The sampler is host-side over the logits row the argmax path already reads
+back: temperature, top_k (ties to the lower id), min_p relative to the row
+maximum, top_p on the normalized prefix, then a seeded xorshift128+ draw.
+Checked on the P5 gate's chat prompt (whose greedy output is the 8 ids
+`671,6102,294,8760,344,2619,51119,42499`):
+
+| run | ids |
+| --- | --- |
+| default (temperature 0) | the greedy 8, unchanged |
+| `--temperature 0.8 --top-p 0.95 --min-p 0.05 --seed 42`, twice | identical both times: `671,6102,294,8760,344,11111,16,1` |
+| the same with `--seed 43` | the greedy 8 |
+| `--temperature 0.8 --top-k 1 --seed 7` | the greedy 8 |
+| `--temperature 0.8 --dspark` | refused by name: the DSpark verify is argmax-only |
+
+`--stop-eos` appends the EOS id and stops (`...,42499,1` with `--gen 16`);
+`--stream-ids` prints each id before the `generated=` line.
+
+The cost is the process. One request at 16 prompt tokens took 12.3-12.8 s
+wall: about 3.9-4.2 s of model open, 7.6-7.8 s of prefill and 0.8 s of decode
+(2.5 tok/s). The thinking request at 40 prompt tokens took 37.75 s (20.7 s
+prefill, 12.8 s for 16 tokens). Residency, prefix reuse and batching are P7;
+this server pays a fresh load and a cold prefill per request.
+
+Only text is served. `tools`, images and tool results are refused with a 400
+by name rather than dropped. There is no API key unless `--api-key` is given,
+and a non-loopback `--host` without one is refused.
+
+```
+python3 tools/dsv4/dsv4_server.py --port 8000
+curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+    -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"Capital of France?"}],"max_tokens":8,"temperature":0}'
+```
+
+One report fix came out of this: the driver's `generated N tokens` line
+printed the requested cap, not the number emitted, so a `--stop-eos` run that
+stopped after 2 of 8 read as 8. It now prints `generated.size()`. The DSpark
+arm also now streams accepted tokens and honours `--stop-eos` inside a round,
+which it did not before (no gate ran that combination).
 
 ## 9. Downloads for the next phases
 
