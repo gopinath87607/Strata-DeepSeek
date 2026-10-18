@@ -304,6 +304,18 @@ bool deepseek4_sparse_attn(float* d_o, const float* d_q, const float* d_kv_win, 
                            uint32_t ng, uint32_t topk, uint32_t n_head, uint32_t head_dim, float scale,
                            uint32_t full_block, bool ring, uint32_t win_lo, void* stream);
 
+/// The tensor-core prefill route (cuda/ds41_attn_mma.cuh:137-293): 16 heads and 16 keys per block, QK and PV as
+/// bf16 mma.m16n8k16.  It reproduces deepseek4_sparse_attn's arithmetic up to rounding, not bit for bit - the
+/// tensor-core accumulation order and the key-tile grouping differ, exactly as the reference's own header says
+/// of its kernel - so it is opt-in (`deepseek4_sparse_attn_set_mma`) and the scalar kernel stays the fallback.
+/// Only head_dim 512, n_head % 16, n_tok >= 64 and the causal ring window are taken; false means "not mine".
+bool deepseek4_sparse_attn_mma(float* d_o, const float* d_q, const float* d_kv_win, const uint8_t* d_kv_comp,
+                               const int32_t* d_idx, const float* d_sink, uint32_t n_tok, uint32_t pos0,
+                               uint32_t window, uint32_t ng, uint32_t topk, uint32_t n_head, uint32_t head_dim,
+                               float scale, uint32_t win_lo, void* stream);
+void deepseek4_sparse_attn_set_mma(bool on);
+bool deepseek4_sparse_attn_mma_enabled();
+
 // ---- SWA window ring commit ----
 //
 // The batch's rows sit in the window buffer at [window, window + n) until committed; committing moves row i to

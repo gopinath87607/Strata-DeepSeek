@@ -112,16 +112,30 @@ __device__ __forceinline__ float attn_ckv_get_s(const uint8_t* row, uint32_t d, 
 }
 
 // Sparse attention over the causal SWA window plus the topk compressed keys (cuda/ds41_attn.cuh:304-370).
-__global__ void attn_sparse_kernel(float* o, const float* q, const float* kvw, const uint8_t* kvc, const int32_t* idx,
-                                   const float* sink, uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk,
-                                   uint32_t n_head, uint32_t hd, float scale, uint32_t full_block, uint32_t ring,
-                                   uint32_t win_lo) {
+//
+// PER is the lane's share of the head (hd/32) as a compile-time constant, or 0 for the runtime fallback.  The
+// loops over it must unroll: with a runtime bound the arrays below (qa, acc, acc_add, s) are dynamically
+// indexed and ptxas puts every one of them in local memory — the first build answered with REG:64 and a
+// 336-byte stack frame, and each key's dot paid local-memory round trips instead of register reads.  Only
+// hd 64 (PER 2) and hd 512 (PER 16, this model) are instantiated; other head dims keep the dynamic kernel.
+template <uint32_t PER>
+__global__ __launch_bounds__(kDeepseek4AttnHeadsPerBlock * 16u, 4) void attn_sparse_kernel(
+        float* o, const float* q, const float* kvw, const uint8_t* kvc, const int32_t* idx, const float* sink,
+        uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk, uint32_t n_head, uint32_t hd, float scale,
+        uint32_t full_block, uint32_t ring, uint32_t win_lo) {
     const uint32_t i = blockIdx.x, lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
-    const uint32_t per = hd / 32u;
-    __shared__ float ks[kDeepseek4AttnKeyTile][512];
+    const uint32_t per = PER ? PER : hd / 32u;
+    // A lane's hd/32 values sit at an odd stride, not back to back: at stride 16 every lane*16+e addresses
+    // only two of the 32 shared banks, so each of the 32 loads a (key, head) pair makes replays 16 ways and the
+    // kernel runs on the LSU instead of the FP pipe.  An odd stride keeps lane -> bank one-to-one; the lane's
+    // values are still dims lane*per..lane*per+per-1, so the dot's reduction order (and every bit of the
+    // result) is the reference's.
+    const uint32_t sw = (per & 1u) ? per + 2u : per + 1u;
+    __shared__ float ks[kDeepseek4AttnKeyTile][576];
     __shared__ int kok[kDeepseek4AttnKeyTile];
     __shared__ float ksc[kDeepseek4AttnKeyTile][32];
     float qa[2][16], acc[2][16], mx[2], sum[2];
+#pragma unroll
     for (int hh = 0; hh < 2; hh++) {
         const uint32_t h = blockIdx.y * kDeepseek4AttnHeadsPerBlock + warp * 2u + hh;
         for (uint32_t e = 0; e < per; e++) {
@@ -156,15 +170,23 @@ __global__ void attn_sparse_kernel(float* o, const float* q, const float* kvw, c
             __syncwarp();
             // An invalid slot must be zeroed: 0 x stale shared bits is not 0 when those bits are NaN or Inf.
             for (uint32_t d = lane; d < hd; d += 32u)
-                ks[t][d] = krow ? krow[d] : (cpk ? attn_ckv_get_s(cpk, d, ksc[t]) : 0.f);
+                ks[t][(d / per) * sw + (d % per)] =
+                    krow ? krow[d] : (cpk ? attn_ckv_get_s(cpk, d, ksc[t]) : 0.f);
         }
         __syncthreads();
+#pragma unroll
         for (int hh = 0; hh < 2; hh++) {
             float s[kDeepseek4AttnKeyTile];
             float tm = -1e30f;
-            for (uint32_t t = 0; t < nt; t++) {
+#pragma unroll
+            for (uint32_t t = 0; t < kDeepseek4AttnKeyTile; t++) {
+                if (t >= nt) {   // the tile edge: staged slots past nt hold stale bytes, never read them
+                    s[t] = -1e30f;
+                    continue;
+                }
                 float d = 0.f;
-                for (uint32_t e = 0; e < per; e++) d += qa[hh][e] * ks[t][lane * per + e];
+#pragma unroll
+                for (uint32_t e = 0; e < per; e++) d += qa[hh][e] * ks[t][lane * sw + e];
                 for (int off = 16; off > 0; off >>= 1) d += __shfl_xor_sync(0xffffffffu, d, off);
                 s[t] = kok[t] ? d * scale : -1e30f;
                 tm = fmaxf(tm, s[t]);
@@ -172,19 +194,25 @@ __global__ void attn_sparse_kernel(float* o, const float* q, const float* kvw, c
             const float nm = fmaxf(mx[hh], tm);
             const float rs = expf(mx[hh] - nm);   // one rescale per tile
             float acc_add[16];
+#pragma unroll
             for (uint32_t e = 0; e < per; e++) acc_add[e] = 0.f;
             float ps = 0.f;
-            for (uint32_t t = 0; t < nt; t++) {
+#pragma unroll
+            for (uint32_t t = 0; t < kDeepseek4AttnKeyTile; t++) {
+                if (t >= nt) continue;
                 const float pv = expf(s[t] - nm);
                 ps += pv;
                 const float pb = engram_bf16r(pv);   // the official acc_s_cast
-                for (uint32_t e = 0; e < per; e++) acc_add[e] += pb * ks[t][lane * per + e];
+#pragma unroll
+                for (uint32_t e = 0; e < per; e++) acc_add[e] += pb * ks[t][lane * sw + e];
             }
             sum[hh] = sum[hh] * rs + ps;
+#pragma unroll
             for (uint32_t e = 0; e < per; e++) acc[hh][e] = acc[hh][e] * rs + acc_add[e];
             mx[hh] = nm;
         }
     }
+#pragma unroll
     for (int hh = 0; hh < 2; hh++) {
         const uint32_t h = blockIdx.y * kDeepseek4AttnHeadsPerBlock + warp * 2u + hh;
         const float den = sum[hh] + expf(sink[h] - mx[hh]);   // the sink enters the denominator only
@@ -631,10 +659,27 @@ bool deepseek4_sparse_attn(float* d_o, const float* d_q, const float* d_kv_win, 
     if (full_block == 0 && !ring) return false;   // the main path's window must be a ring (the reference entry)
     if (full_block > n_tok) return false;
     if (win_lo > pos0) return false;              // the clamp would pass the last query: the caller's window is short
-    attn_sparse_kernel<<<dim3(n_tok, n_head / kDeepseek4AttnHeadsPerBlock), kDeepseek4AttnHeadsPerBlock * 16u, 0,
-                         static_cast<cudaStream_t>(stream)>>>(
-        d_o, d_q, d_kv_win, d_kv_comp, d_idx, d_sink, pos0, window, ng, topk, n_head, head_dim, scale, full_block,
-        ring ? 1u : 0u, win_lo);
+    // Opt-in tensor-core route for the prompt (--attn-mma); it refuses shapes it does not take, and the scalar
+    // kernel below stays the reference and the fallback.
+    if (full_block == 0u && ring && n_tok >= 64u && deepseek4_sparse_attn_mma_enabled() &&
+        deepseek4_sparse_attn_mma(d_o, d_q, d_kv_win, d_kv_comp, d_idx, d_sink, n_tok, pos0, window, ng, topk,
+                                  n_head, head_dim, scale, win_lo, stream))
+        return true;
+    if (head_dim == 512u)
+        attn_sparse_kernel<16><<<dim3(n_tok, n_head / kDeepseek4AttnHeadsPerBlock), kDeepseek4AttnHeadsPerBlock * 16u,
+                                  0, static_cast<cudaStream_t>(stream)>>>(
+            d_o, d_q, d_kv_win, d_kv_comp, d_idx, d_sink, pos0, window, ng, topk, n_head, head_dim, scale,
+            full_block, ring ? 1u : 0u, win_lo);
+    else if (head_dim == 64u)
+        attn_sparse_kernel<2><<<dim3(n_tok, n_head / kDeepseek4AttnHeadsPerBlock), kDeepseek4AttnHeadsPerBlock * 16u,
+                                 0, static_cast<cudaStream_t>(stream)>>>(
+            d_o, d_q, d_kv_win, d_kv_comp, d_idx, d_sink, pos0, window, ng, topk, n_head, head_dim, scale,
+            full_block, ring ? 1u : 0u, win_lo);
+    else
+        attn_sparse_kernel<0><<<dim3(n_tok, n_head / kDeepseek4AttnHeadsPerBlock), kDeepseek4AttnHeadsPerBlock * 16u,
+                                0, static_cast<cudaStream_t>(stream)>>>(
+            d_o, d_q, d_kv_win, d_kv_comp, d_idx, d_sink, pos0, window, ng, topk, n_head, head_dim, scale,
+            full_block, ring ? 1u : 0u, win_lo);
     return finish(static_cast<cudaStream_t>(stream), "sparse attn");
 }
 

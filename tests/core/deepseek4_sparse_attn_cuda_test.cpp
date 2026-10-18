@@ -426,6 +426,76 @@ void random_case(const char* name, uint32_t hd, uint32_t nh, uint32_t n_tok, uin
     if (d_idx) cudaFree(d_idx);
 }
 
+// The opt-in tensor-core prefill route (--attn-mma, cuda/ds41_attn_mma.cuh:137-293).  It is NOT bit-equal to
+// the scalar kernel by design (tensor-core accumulation order, bf16 keys, 16-key tiles), so it is checked
+// against the same host oracle with the usual bf16 tolerance.  The fixture puts every output in [0.75, 1.75] (a
+// convex combination of positive keys), so the relative tolerance is not hiding cancellation.  The direct call
+// must return true: that is what proves the route ran, because a silent fall-through to the scalar kernel would
+// pass the same comparison.
+void mma_case(const char* name, uint32_t n_tok, uint32_t pos0, uint32_t win, uint32_t topk, uint32_t ng) {
+    const uint32_t hd = 512, nh = 64;
+    std::vector<float> kvw((size_t)(win + n_tok) * hd);
+    for (float& v : kvw) v = 0.75f + u01();
+    std::vector<float> q((size_t) n_tok * nh * hd);
+    for (float& v : q) v = urand();
+    std::vector<float> sink(nh);
+    for (float& v : sink) v = urand();
+
+    std::vector<float> comp((size_t) ng * strata::kernels::kDeepseek4CkvDim);
+    for (float& v : comp) v = 0.75f + u01();
+    std::vector<uint8_t> cache((size_t) ng * strata::kernels::kDeepseek4CkvBytes, 0);
+    strata::kernels::deepseek4_ckv_pack_host(cache.data(), 0, comp.data(), ng);
+    std::vector<int32_t> idx((size_t) n_tok * topk);
+    for (int32_t& g : idx) {
+        const uint32_t r = urng() % 5u;
+        g = r == 0 ? -1 : (r == 1 ? static_cast<int32_t>(ng) + 3 : static_cast<int32_t>(urng() % ng));
+    }
+
+    std::vector<float> want(q.size());
+    strata::kernels::deepseek4_sparse_attn_host(want.data(), q.data(), kvw.data(), cache.data(), idx.data(),
+                                                sink.data(), n_tok, pos0, win, ng, topk, nh, hd, 0.05f, 0, true, 0);
+
+    float* d_kvw = dev_f_from(kvw);
+    float* d_q = dev_f_from(q);
+    float* d_sink = dev_f_from(sink);
+    float* d_o = dev_f(want.size());
+    uint8_t* d_kvc = dev_from(cache);
+    int32_t* d_idx = dev_from(idx);
+
+    CHECK(strata::kernels::deepseek4_sparse_attn_mma(d_o, d_q, d_kvw, d_kvc, d_idx, d_sink, n_tok, pos0, win, ng,
+                                                     topk, nh, hd, 0.05f, 0, nullptr));
+    std::vector<float> got(want.size());
+    to_host(d_o, got);
+    check_close(name, got, want, 2e-2, 1e-6);
+    char gn[64];
+    std::snprintf(gn, sizeof(gn), "%s grid", name);
+    check_bf16_grid(gn, got);
+
+    // The opt-in switch: off by default, and the public entry then takes this route for the same shape.
+    CHECK(!strata::kernels::deepseek4_sparse_attn_mma_enabled());
+    strata::kernels::deepseek4_sparse_attn_set_mma(true);
+    CHECK(strata::kernels::deepseek4_sparse_attn_mma_enabled());
+    CHECK(strata::kernels::deepseek4_sparse_attn(d_o, d_q, d_kvw, d_kvc, d_idx, d_sink, n_tok, pos0, win, ng, topk,
+                                                 nh, hd, 0.05f, 0, true, 0, nullptr));
+    strata::kernels::deepseek4_sparse_attn_set_mma(false);
+    std::vector<float> via_entry(want.size());
+    to_host(d_o, via_entry);
+    check_close("via entry", via_entry, want, 2e-2, 1e-6);
+
+    // The route's floor: 63 tokens (one short) or another head width is refused, never mis-launched.
+    CHECK(!strata::kernels::deepseek4_sparse_attn_mma(d_o, d_q, d_kvw, d_kvc, d_idx, d_sink, 63, pos0, win, ng,
+                                                      topk, nh, hd, 0.05f, 0, nullptr));
+    CHECK(!strata::kernels::deepseek4_sparse_attn_mma(d_o, d_q, d_kvw, d_kvc, d_idx, d_sink, n_tok, pos0, win, ng,
+                                                      topk, nh, 64, 0.05f, 0, nullptr));
+
+    cudaFree(d_kvw);
+    cudaFree(d_q);
+    cudaFree(d_sink);
+    cudaFree(d_o);
+    cudaFree(d_kvc);
+    cudaFree(d_idx);
+}
+
 void guards() {
     const uint32_t hd = 64, nh = 8;
     float* dq = dev_f((size_t) nh * hd);
@@ -514,6 +584,11 @@ int main() {
     random_case("rand clamp", 512, 8, 5, 40, 16, 8, 12, 30);
     random_case("rand no shift", 64, 64, 3, 3, 8, 5, 4, 0);
     random_case("rand window 0", 512, 8, 2, 0, 0, 5, 6, 0);
+
+    // The opt-in tensor-core prefill route: a 96-token batch with 64-key windows crosses several 16-key tiles,
+    // and the second fixture is compressed-only (no window at all).
+    mma_case("mma 96 tok", 96, 200, 64, 8, 24);
+    mma_case("mma comp only", 96, 200, 0, 8, 24);
 
     guards();
 
