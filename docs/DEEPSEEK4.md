@@ -728,6 +728,17 @@ two contracts:
 
 `GET /v1/models` and `GET /health` are there for the usual clients.
 
+The same server also serves the checkout's own `serve/web` chat page at `/`
+(`--web-dir` points elsewhere; a missing directory leaves the API only), so
+the page known from Strata talks to this engine.  `/health` reports the model
+id and context, `/metrics` is an empty idle report, and `/config`, `/settings`
+and `/mcp` are 404s - the page already treats those as an older server, hides
+those cards and keeps the chat.  `image_generation` is false, so the Images
+tab stays hidden.  A thinking-high web request ("What is the capital of
+France? Answer in one short sentence.", 96 max tokens) streamed 31 events and
+answered `The capital of France is Paris.` in 34.64 s through the resident
+server.
+
 Each request renders the DSML head with `dsml_render.render`, encodes with the
 artifact's tokenizer, writes the ids file, runs the driver, and reads the id
 stream back. The driver grew three flags for this: the sampler
