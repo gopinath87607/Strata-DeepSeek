@@ -215,4 +215,31 @@ void deepseek4_sparse_attn_host(float* o, const float* q, const float* kvw, cons
     }
 }
 
+void deepseek4_win_commit_host(float* win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim,
+                               const int32_t* pos) {
+    if (!win || n == 0 || window == 0 || head_dim == 0) return;
+    if (pos) pos0 = (uint32_t) pos[0];
+    const uint32_t i0 = n > window ? n - window : 0u;
+    for (uint32_t i = i0; i < n; i++) {
+        const float* src = win + (size_t)(window + i) * head_dim;
+        float* dst = win + (size_t)((pos0 + i) % window) * head_dim;
+        for (uint32_t d = 0; d < head_dim; d++) dst[d] = src[d];
+    }
+}
+
+void deepseek4_win_ring_snap_host(float* win, float* snap, uint32_t pos0, uint32_t i0, uint32_t n, uint32_t window,
+                                  uint32_t head_dim, bool back, const int32_t* pos) {
+    if (!win || !snap || window == 0 || head_dim == 0 || n <= i0) return;
+    if (pos) pos0 = (uint32_t) pos[0];
+    for (uint32_t i = i0; i < n; i++) {
+        float* ring = win + (size_t)((pos0 + i) % window) * head_dim;
+        float* sp = snap + (size_t) i * head_dim;
+        if (back) {
+            for (uint32_t d = 0; d < head_dim; d++) ring[d] = sp[d];
+        } else {
+            for (uint32_t d = 0; d < head_dim; d++) sp[d] = ring[d];
+        }
+    }
+}
+
 }  // namespace strata::kernels

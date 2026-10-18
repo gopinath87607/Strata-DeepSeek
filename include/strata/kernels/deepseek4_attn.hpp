@@ -304,4 +304,26 @@ bool deepseek4_sparse_attn(float* d_o, const float* d_q, const float* d_kv_win, 
                            uint32_t ng, uint32_t topk, uint32_t n_head, uint32_t head_dim, float scale,
                            uint32_t full_block, bool ring, uint32_t win_lo, void* stream);
 
+// ---- SWA window ring commit ----
+//
+// The batch's rows sit in the window buffer at [window, window + n) until committed; committing moves row i to
+// ring cell (pos0 + i) % window (cuda/ds41_attn.cuh:382-405).  Only the last window rows move when n > window:
+// ring cells alias at +window, so the ascending write's net result is exactly "the last window rows in place",
+// and the surviving destinations are distinct, which makes the block order irrelevant.  `pos`, when non-null,
+// overrides pos0 with pos[0] (the graph route's dynamic position); that route takes n <= 8 and is refused
+// otherwise.  The caller allocates at least (window + n) * head_dim floats in win.
+
+void deepseek4_win_commit_host(float* win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim,
+                               const int32_t* pos);
+bool deepseek4_win_commit(float* d_win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim,
+                          const int32_t* d_pos, void* stream);
+
+// The spec-decode snapshot (cuda/ds41_attn.cuh:407-425): save (back=false) copies ring cell
+// (pos0 + i) % window into snap[i]; restore (back=true) writes it back.  Only rows [i0, n) are touched, snap is
+// indexed by batch row and holds n rows of head_dim.  n <= i0 is a successful no-op.
+void deepseek4_win_ring_snap_host(float* win, float* snap, uint32_t pos0, uint32_t i0, uint32_t n, uint32_t window,
+                                  uint32_t head_dim, bool back, const int32_t* pos);
+bool deepseek4_win_ring_snap(float* d_win, float* d_snap, uint32_t pos0, uint32_t i0, uint32_t n, uint32_t window,
+                             uint32_t head_dim, bool back, const int32_t* d_pos, void* stream);
+
 }  // namespace strata::kernels

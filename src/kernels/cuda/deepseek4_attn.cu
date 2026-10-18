@@ -193,6 +193,29 @@ __global__ void attn_sparse_kernel(float* o, const float* q, const float* kvw, c
     }
 }
 
+// The window ring commit and its spec-decode snapshot (cuda/ds41_attn.cuh:382-425).
+__global__ void attn_win_commit_kernel(float* win, uint32_t pos0, uint32_t i0, uint32_t window, uint32_t hd,
+                                       const int32_t* posd) {
+    const uint32_t i = i0 + blockIdx.x;
+    if (posd) pos0 = (uint32_t) posd[0];
+    const float* src = win + (uint64_t)(window + i) * hd;
+    float* dst = win + (uint64_t)((pos0 + i) % window) * hd;
+    for (uint32_t d = threadIdx.x; d < hd; d += blockDim.x) dst[d] = src[d];
+}
+
+__global__ void attn_win_ring_snap_kernel(float* win, float* snap, uint32_t pos0, uint32_t i0, uint32_t window,
+                                          uint32_t hd, uint32_t back, const int32_t* posd) {
+    const uint32_t i = i0 + blockIdx.x;
+    if (posd) pos0 = (uint32_t) posd[0];
+    float* ring = win + (uint64_t)((pos0 + i) % window) * hd;
+    float* sp = snap + (uint64_t) i * hd;
+    if (back) {
+        for (uint32_t d = threadIdx.x; d < hd; d += blockDim.x) ring[d] = sp[d];
+    } else {
+        for (uint32_t d = threadIdx.x; d < hd; d += blockDim.x) sp[d] = ring[d];
+    }
+}
+
 bool finish(cudaStream_t stream, const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -297,6 +320,25 @@ bool deepseek4_sparse_attn(float* d_o, const float* d_q, const float* d_kv_win, 
         d_o, d_q, d_kv_win, d_kv_comp, d_idx, d_sink, pos0, window, ng, topk, n_head, head_dim, scale, full_block,
         ring ? 1u : 0u, win_lo);
     return finish(static_cast<cudaStream_t>(stream), "sparse attn");
+}
+
+bool deepseek4_win_commit(float* d_win, uint32_t pos0, uint32_t n, uint32_t window, uint32_t head_dim,
+                          const int32_t* d_pos, void* stream) {
+    if (!d_win || n == 0 || window == 0 || head_dim == 0) return false;
+    if (d_pos && n > 8u) return false;   // the reference's graph route takes only decode-sized batches
+    const uint32_t i0 = n > window ? n - window : 0u, rows = n - i0;
+    attn_win_commit_kernel<<<rows, 256, 0, static_cast<cudaStream_t>(stream)>>>(d_win, pos0, i0, window, head_dim,
+                                                                                d_pos);
+    return finish(static_cast<cudaStream_t>(stream), "win commit");
+}
+
+bool deepseek4_win_ring_snap(float* d_win, float* d_snap, uint32_t pos0, uint32_t i0, uint32_t n, uint32_t window,
+                             uint32_t head_dim, bool back, const int32_t* d_pos, void* stream) {
+    if (!d_win || !d_snap || window == 0 || head_dim == 0) return false;
+    if (n <= i0) return true;   // no rows to touch: success, the reference's rule
+    attn_win_ring_snap_kernel<<<n - i0, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        d_win, d_snap, pos0, i0, window, head_dim, back ? 1u : 0u, d_pos);
+    return finish(static_cast<cudaStream_t>(stream), back ? "win ring restore" : "win ring save");
 }
 
 }  // namespace strata::kernels
