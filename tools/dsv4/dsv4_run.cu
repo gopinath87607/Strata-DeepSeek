@@ -763,6 +763,7 @@ private:
     bool pf_ev4_valid_ = false;   // the pending record got its end marker (see layer(): cross-stage, it can't)
     uint32_t pf_ev_stage_ = 0, pf_ev_layer_ = 0, pf_ev_rows_ = 0, pf_ev_exp_ = 0;
     uint64_t pf_ev_bytes_ = 0;
+    double pf_stage_host_ms_ = 0.0;   // host time inside the last stage_blob_b, for the --pf-time line
     void pf_flush();
 };
 
@@ -1420,6 +1421,7 @@ bool Runner::stage_blob(uint32_t il, const int32_t* sel, uint32_t n_pairs, std::
 }
 
 bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, uint32_t n_pairs, std::string& err) {
+    const double stage_t0 = now_sec();   // host time inside this function, printed beside the stream's event time
     std::vector<bool> used(b.experts, false);
     for (uint32_t i = 0; i < n_pairs; ++i) {
         const int32_t e = sel[i];
@@ -1446,9 +1448,15 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
     }
 
     const uint64_t table_end = 16 + static_cast<uint64_t>(b.experts) * 24;
+    // --ram-image: a miss's bytes are copied from the image straight to the container below, so the host staging
+    // vector only carries the header and the codebook.  Sizing it to the payloads would allocate and first-touch
+    // gigabytes for bytes that are never written, and reallocate whenever a layer selects more than any layer
+    // before it.
+    const uint8_t* const ram = parts_.ram_base();
     uint64_t need = table_end + b.cb_len;
-    for (uint32_t e : uniq_)
-        for (uint32_t w = 0; w < 3; ++w) need += b.span[static_cast<size_t>(e) * 3 + w];
+    if (ram == nullptr)
+        for (uint32_t e : uniq_)
+            for (uint32_t w = 0; w < 3; ++w) need += b.span[static_cast<size_t>(e) * 3 + w];
     if (stage_.size() < need) stage_.resize(static_cast<size_t>(need));
     uint8_t* p = stage_.data();
     std::memset(p, 0, static_cast<size_t>(table_end));
@@ -1472,7 +1480,6 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
     // --ram-image: a miss's slots are queued here and copied from the RAM image straight to the container
     // (dst is the container offset, src the absolute image offset), so the bytes are never assembled into the
     // pageable staging vector.  Empty when the tier is off, and then the path below is the old one.
-    const uint8_t* const ram = parts_.ram_base();
     std::vector<Move> pulls;
     // Least recently used slot the container does not point at; -1 when every slot is pinned.
     auto evict_one = [&]() -> int64_t {
@@ -1662,6 +1669,7 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
         st_bytes_[stage_cur_] += lending ? stage_read_ : stage_used_;
         st_experts_[stage_cur_] += uniq_.size();
     }
+    pf_stage_host_ms_ = (now_sec() - stage_t0) * 1e3;
     return true;
 }
 
@@ -2736,12 +2744,12 @@ void Runner::pf_flush() {
     }
     std::fprintf(stderr,
                  "[v41] pf time L%02u: %u row(s), %u expert(s), %" PRIu64 " B staged: front %.1f ms "
-                 "(attn %.1f = in %.1f + sparse %.1f + out %.1f), staging %.1f ms, moe %.1f ms, tail %.1f ms, "
-                 "layer %.1f ms\n",
+                 "(attn %.1f = in %.1f + sparse %.1f + out %.1f), staging %.1f ms (host %.1f), moe %.1f ms, "
+                 "tail %.1f ms, layer %.1f ms\n",
                  pf_ev_layer_, pf_ev_rows_, pf_ev_exp_, pf_ev_bytes_, static_cast<double>(front_ms),
                  static_cast<double>(attn_ms), static_cast<double>(attn_in_ms), static_cast<double>(sparse_ms),
-                 static_cast<double>(attn_out_ms), static_cast<double>(stage_ms), static_cast<double>(moe_ms),
-                 static_cast<double>(tail_ms), static_cast<double>(all_ms));
+                 static_cast<double>(attn_out_ms), static_cast<double>(stage_ms), pf_stage_host_ms_,
+                 static_cast<double>(moe_ms), static_cast<double>(tail_ms), static_cast<double>(all_ms));
     pf_ev_pending_ = false;
 }
 
@@ -2803,11 +2811,22 @@ bool Runner::engram_feed_start(uint32_t ei, int slot, uint32_t pos0, const int32
         // gathering it on one thread spends the whole first block in seek latency (~19 s of the first engram
         // layer's front for a 2845-token prompt).  Split the id list over kEngramFanOut threads; pread on the
         // shared descriptor is thread-safe (the Windows FILE* path is not, and the feed stays off there).
-        constexpr size_t kEngramFanOut = 64;
-        const size_t nfan = rows >= kEngramFanOut * 256 ? kEngramFanOut : 1;
+        // STRATA_V4_ENGRAM_FAN overrides 64 for measurement (a QLC drive may be IOPS-bound, where more threads
+        // buy nothing).
+        const size_t kEngramFanOut = 64;
+        static const size_t fan_env = [] {
+            const char* v = std::getenv("STRATA_V4_ENGRAM_FAN");
+            if (v != nullptr) {
+                const long n = std::strtol(v, nullptr, 10);
+                if (n >= 1 && n <= 512) return static_cast<size_t>(n);
+            }
+            return kEngramFanOut;
+        }();
+        const double feed_t0 = now_sec();
+        const size_t nfan = rows >= fan_env * 256 ? fan_env : 1;
         const uint32_t stride = d4::EngramShard::row_stride(eng_hd_);
         std::atomic<bool> all_ok{true};
-        std::string errs[kEngramFanOut];
+        std::vector<std::string> errs(nfan);
         std::vector<std::thread> fan;
         for (size_t w = 0; w < nfan; ++w) {
             const size_t lo = rows * w / nfan, hi = rows * (w + 1) / nfan;
@@ -2821,6 +2840,14 @@ bool Runner::engram_feed_start(uint32_t ei, int slot, uint32_t pos0, const int32
             });
         }
         for (std::thread& w : fan) w.join();
+        if (opt_.pf_time) {
+            const double ms = (now_sec() - feed_t0) * 1e3;
+            std::fprintf(stderr,
+                         "[v41] engram feed table %u: %zu rows over %zu thread(s), %.1f ms (%.0f MB/s useful, "
+                         "%.0f MB/s at 4 KiB a pread)\n",
+                         ei, rows, nfan, ms, static_cast<double>(rows) * stride / (ms * 1e3),
+                         static_cast<double>(rows) * 8192.0 / (ms * 1e3));
+        }
         if (!all_ok.load()) jj.err = errs[0].empty() ? std::string("engram feed: the read failed") : errs[0];
         jj.ok = all_ok.load();
     });
