@@ -303,7 +303,7 @@ Each phase has a gate that is a comparison, not an inspection.
 | P4 (hash, reader, projections, wiring and a live on/off check done; the reference-side on/off comparison waits for the reference engine on this hardware) | Engram: hash, O_DIRECT row reader, q/k/wkv projections, io_uring overlap if prefill needs it | hash rows match the reference implementation on its fixture, then on rows captured from the same checkpoint; output matches with engram on and off. Met for the hash and the row decode: 0 differing rows or values on the reference's hash fixture and on the captured golden positions through all four read paths, and 0 bit-diffs on the GPU row decode of the real shards. The gate and wkv meet their float64 bounds on the fixtures and the real weights. Wired into the driver: `--no-engram` mirrors the reference's compare mode, and on the 11-token prompt the last-position logits differ on all 129,280 values between on and off (max abs difference 7.14) while the first 8 greedy ids coincide, so the path is live. The paired on/off comparison against the reference engine is blocked on this hardware like P3's |
 | P5 (towers, the window fill and the verify loop landed and gated; the acceptance numbers are below) | three DSpark towers and verify/rollback | greedy output byte-identical with drafting on and off; cache frontier exact. Met: the same 16 greedy ids from an 11-token chat prompt with drafting off, `--dspark-verify 1`, `--dspark-verify 2` and the full block 5, and with `--chunk 4` (narrower than the 6-row verify batch), and the same 12 ids from a 151-token prompt (whose first window fill takes the full 128 rows) with drafting off and on. The frontier is exact by observation: every later round's argmax reads the rolled-back window, the restored compressor pending rows and the rewound group counts, and the ids match the plain run |
 | P6 (serving landed and gated; residency is P7) | serving: OpenAI and Anthropic surfaces, sampling defaults, thinking toggle | one served request per contract. Met on 127.0.0.1 against the real 40-part image: `POST /v1/chat/completions` buffered answers "Paris" with `finish_reason` stop and usage 16 + 2; its SSE form sends the role chunk, the text delta, the finish chunk, the usage chunk and `[DONE]`, then closes; `POST /v1/messages` buffered returns one text block with `stop_reason` end_turn and the same usage; its SSE form sends `message_start`, block start/delta/stop, `message_delta`, `message_stop`, then closes. The thinking toggle routes the pre-`</think>` text to `reasoning_content` (a live 16-token run under `enable_thinking` came back all reasoning, no answer yet, `finish_reason` length). The wire defaults are the reference host's: temperature 1.0, top_p 1.0, min_p 0.05 (the engine's own default is 0.0); temperature 0 is the greedy path |
-| P7 | Strata integration: layer split, compressed expert cache, prompt chunk, loan and ring | four-GPU run returns the same tokens as one GPU; then a measured performance ledger |
+| P7 (layer split, auto chunk, expert cache and engram feed landed and gated; the loan and ring are open) | Strata integration: layer split, compressed expert cache, prompt chunk, loan and ring | four-GPU run returns the same tokens as one GPU; then a measured performance ledger. Met for the split and the chunk: the 79-token prompt returns `33001,14,2513,734,4189,1910,270,3417` on one RTX 5060 at chunk 8, on four cards at chunk 8 and on four cards in one auto block; the 1017-token prompt returns `671,3051,440,4496,344,260,8837,294` on one 5060 (auto 593 rows, two blocks) and on four cards (auto 672 rows, two blocks, cache on). The ledger is measured: the split costs prefill because the stages serialize (226.1 s on four cards vs 178.5 s on one 5060 at 1017 tokens; 38.2 s vs 36.2 s at 79), the auto chunk takes a 79-token run from 10 blocks to 1 (prefill 38.2 -> 26.2 s, chunk 8 vs one block, four cards) and sizes itself from free VRAM (593 rows on a 2.3 GiB-free 8 GB card, 3360 of 4061 on the four-card chain), and the cache trades 0.25 s of prefill for 1.65 s of decode at 79 tokens (5.63 -> 3.98 s, 17.8% hits, 6.9 GiB not read). The engram feed (`--engram-feed`) returns the same ids and takes 12.5 s off the two stages that own an engram layer (1017 tokens: 225.82 -> 213.37 s; 79 tokens: 38.58 -> 36.89 s). A 4,053-token run picked 3,360 rows and took 832.6 s (4.9 tok/s, 81.2 GiB staged): the block cut bytes a token 3.7x but time a row barely moved, so the dial is flat on this rig. The loan and the ring are not built; the 1k ledger (52.4 GiB staged, I/O about 47-50% of prefill, reads dependency-bound across layers) is in the section below |
 | P8 | AMD HIP and Windows builds | P3's gate passes on the same hardware |
 
 P1's synthetic suite and P2's fixtures need no downloads. P1's blob gate and
@@ -794,6 +794,139 @@ printed the requested cap, not the number emitted, so a `--stop-eos` run that
 stopped after 2 of 8 read as 8. It now prints `generated.size()`. The DSpark
 arm also now streams accepted tokens and honours `--stop-eos` inside a round,
 which it did not before (no gate ran that combination).
+
+### The layer split, the prompt chunk and the expert cache, measured (P7)
+
+Three switches, all in `tools/dsv4/dsv4_run.cu`.  `--devices` and
+`--expert-cache-mib` are opt-in and change nothing when absent; the server
+passes `--chunk 0` (auto) by default.
+
+- **`--devices 0,1,2,3`** puts one stage per GPU, in layer order.  A cut is
+  legal only at a compressed-cache seam - no layer at or after it may take its
+  compressed-KV or index source from before it, and the candidate block's
+  owner must sit in the same stage as its users - which on this model means
+  {2, 8, 14, 20}.  Four stages choose {8, 14, 20}: L0..7 on gpu 0, L8..13 on
+  gpu 1, L14..19 on gpu 2, L20..39 on gpu 3.  Each stage holds only its own
+  layers' window and source caches and its own copy of every scratch buffer,
+  with its own stream; only `hc_` (f32, cap x 4 x 5120), the evolved
+  `pre_mix` and the positions cross a boundary, through host memory.
+- **`--chunk 0`** is auto: the driver picks the block after the weights and
+  the engram are resident, from each stage's free memory.  It takes the
+  largest block whose cap-scaled state (about 0.88 MiB a row on an 8-layer
+  stage, windows and a stage's engram row buffers included) plus one layer's
+  expert container - the union of the block's selected experts, reserved at no
+  more than all 384 - stays inside 90% of free memory, up to 4096 rows (the
+  MoE grid takes `n_tok * topk <= 65535`) and the run's own length.  A stage
+  that owns no engram layer holds no engram row buffers.  Each stage prints
+  its own cap, so the binding card is visible: at 1,017 tokens with the
+  3072/3072/6144/6144 MiB cache the caps are 743, 992, 1,025 and 672 rows
+  (stage 3, the 20-layer 3060), and the block is 672 for every stage.
+- **`--expert-cache-mib`** keeps staged expert payloads in device slots keyed
+  by `(layer, expert)`.  A hit copies the 6.7-7.2 MB payload from its slot
+  into the layer's container instead of reading it back from the parts; a miss
+  reads the three spans and inserts, evicting least-recently-used slots and
+  never the current container's own hits.
+
+The identity gate is the same tokens through every plan - one card and four,
+chunk 8 and a whole-run block, one block and two:
+
+| prompt | plan | prefill | decode (8) | ids |
+| --- | --- | --- | --- | --- |
+| 79 tokens | chunk 8, one RTX 5060 | 36.24 s | 5.62 s | `33001,14,2513,734,4189,1910,270,3417` |
+| 79 tokens | chunk 8, four cards | 38.17 s | 5.64 s | same |
+| 79 tokens | auto = 87 rows, one block, four cards | 26.45 s | 3.98 s | same |
+| 1017 tokens | auto = 593 rows, two blocks, one RTX 5060 | 178.53 s | 6.56 s | `671,3051,440,4496,344,260,8837,294` |
+| 1017 tokens | auto = 672 rows, two blocks, four cards, cache on | 226.11 s | 4.91 s | same |
+
+The 1017-token pair is the wider check: different card count, a different
+block size (593 vs 672) and different block boundaries, the same eight ids.
+The four-card row carried `--expert-cache-mib 3072,3072,6144,6144`; the fit
+includes the cache budget, which is why its block is 672 rather than the
+run's 1025 rows.
+
+On this machine the split is capacity, not throughput.  The stages run one
+after another - a layer's router needs the previous layer's output - so the
+chain costs the sum of its stages: at 1017 tokens the four cards spent
+40.18 + 24.17 + 42.09 + 119.53 s of prefill, 75.1 GiB staged, 11,804 expert
+slots over 2 blocks (43-46% repeats).  One 5060 did the same prompt in
+178.53 s with 2 blocks and 75.3 GiB staged (11,846 slots, 45% repeats).  The
+3060s are slower at compute than the 5060s and four contexts add their own
+cost.  What the split buys here is room for state and for the cache: on the
+one 8 GB card, free memory after the weights (2.3 GiB) caps auto at 593 rows
+and leaves no space for cache slots, while the four-card chain held
+3072-6144 MiB of cache slots beside a 672-row block at 1017 tokens.
+
+The cache is a decode trade.  The clean pair is the 79-token run at one block:
+prefill 26.20 s without and 26.45 s with it (the insert copies), decode
+5.63 s without and 3.98 s with.  It hit 1,081 of 6,077 lookups (17.8%) and did
+not read 6.9 GiB.  Per stage, with 3072, 3072, 6144 and 6144 MiB:
+
+| stage | layers | slots | hits / misses | not read |
+| --- | --- | --- | --- | --- |
+| 0 | L0..7 | 446 | 208 / 1016 (17%) | 1429.8 MiB |
+| 1 | L8..13 | 446 | 186 / 689 (21%) | 1278.6 MiB |
+| 2 | L14..19 | 893 | 210 / 725 (22%) | 1332.8 MiB |
+| 3 | L20..39 | 893 | 477 / 2566 (16%) | 3027.4 MiB |
+
+At 1017 tokens over two blocks the same cache avoided 9.9 GiB of reads (hits
+202/179/759/424, 10%/11%/42%/7%).  Stage 3 is capacity-bound: 893 slots
+against 6,381 lookups over 20 layers.  In the 79-token run the hits are the
+decode blocks': the single prefill block fills the slots and every later
+block reads them, which is why the cache earns its space there and costs
+prefill a fraction of a second.
+
+Auto chunk, measured: 87 rows for the 79-token run; 593 for a 1025-row run on
+one 5060 (the old fixed clamp would have asked for 1025 rows, which does not
+fit in the 2.3 GiB free after the weights); 672 on the four cards with a
+3072 MiB cache on stage 0; 3360 for a 4061-row prompt on the four cards
+without one.
+
+The 4,053-token prompt is the block-size check, and it says the dial is
+flat: 3,360 rows, 832.6 s prefill (4.9 tok/s), 81.2 GiB staged in 12,767
+expert slots, stage 3 alone 437.5 s.  Per token the block cut the staged
+bytes 3.7x (20.1 MiB against 75.6 at 1,017 tokens over two blocks) and the
+time per row barely moved (stage 3: 0.108 s against 0.116; stage 0: 0.0355
+against 0.0392), so throughput rose 8% (4.87 against 4.50 tok/s).  At 672
+rows a layer already routes to most of the 384 experts, so the block's reads
+are near the full set at either size; the part that grows with rows is
+compute, and it grows linearly.  Stage 3 reads about 357 MB/s while it is
+I/O-bound at 1,017 tokens and about 104 MB/s at 4,053, where its per-token
+compute is the long pole.  With every stage serial there is no other stage
+to fill the gap.
+
+```
+/tmp/dsv4-build/dsv4_run --ids-file ids.txt --gen 8 --devices 0,1,2,3 --chunk 0 --ledger \
+    --expert-cache-mib 3072,3072,6144,6144
+/tmp/dsv4-build/dsv4_run --ids-file ids.txt --gen 8 --gpu 0 --chunk 0 --ledger
+```
+
+The loan and ring are not built, and the 1k ledger says why they are not
+free.  A 1017-token prompt at chunk 1024 staged 52.4 GiB through the parts
+reader - about 47-50% of prefill at the measured 250-330 MB/s effective
+rate (550 MB/s direct) - and the reads are dependency-bound: layer `il+1`'s
+router cannot run before layer `il`'s MoE output exists, so a read of
+`il+1`'s experts cannot start earlier than that.  What remains available is
+the same layer's own spans.  A fixed ring of prompt rows, as upstream uses,
+does not map onto this path either: the block's state is per row and per
+stage (about 0.88 MiB a row), so the chunk is bounded by free VRAM, not by a
+byte budget chosen in advance.  Both stay open, and this port claims no
+number for either.
+
+The overlap that was built instead is the reference's engram feed
+(`--engram-feed`, opt-in): `prepare` / `wait` / `prefetch_next` from
+`ds4_ds41_forward.inc`.  A block's engram row ids depend only on token ids
+and positions, so while a prefill block computes, a worker reads the next
+block's rows from the two shards into the other of two host buffers per
+engram layer; each engram layer then joins the read and uploads its rows.
+The hash stays on the main thread, and one event per (layer, buffer) keeps a
+worker from overwriting a buffer whose upload may still be in flight.  It is
+worth exactly what the synchronous reads cost: at 1,017 tokens prefill goes
+225.82 -> 213.37 s (4.5 -> 4.8 tok/s) and the whole 12.5 s comes off the two
+stages that own an engram layer (stage 0: 40.23 -> 35.22 s for L1, stage 2:
+42.31 -> 34.71 s for L14); stages 1 and 3 do not move (24.18 and 119.18 s).
+At 79 tokens over ten 8-row blocks it is 38.58 -> 36.89 s, decode 5.69 ->
+5.52 s.  Both pairs return the gate ids above, and without the flag the
+synchronous path runs unchanged.
 
 ## 9. Downloads for the next phases
 
