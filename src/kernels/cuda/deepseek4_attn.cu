@@ -11,9 +11,14 @@
 // for the unpack direction.  The encode conversions are the header's shared inline functions, so a packed
 // byte is the same byte the host oracle writes.
 //
-// Attention's remaining primitives (the window ring, sparse attention, the indexer) join this file as they
-// land; each keeps the same entry convention: device pointers, an optional stream (null = default stream, the
-// call synchronizes), bad shapes refused before any launch, false on a launch error.
+// Sparse attention is the reference's scalar kernel (cuda/ds41_attn.cuh:304-370) with its geometry intact: one
+// block per (query, 8-head group), four warps x two heads, keys staged through shared eight at a time, the
+// 32-lane xor dot, the bf16-rounded probability (acc_s_cast), invalid slots zeroed, and the sink in the
+// denominator only.
+//
+// Attention's remaining primitives (the window ring and the indexer) join this file as they land; each keeps the
+// same entry convention: device pointers, an optional stream (null = default stream, the call synchronizes), bad
+// shapes refused before any launch, false on a launch error.
 #include "strata/kernels/deepseek4_attn.hpp"
 
 #include <cuda_runtime.h>
@@ -95,6 +100,96 @@ __global__ void attn_kv_unpack_kernel(float* out, const uint8_t* cache, uint64_t
          i += (uint64_t) gridDim.x * blockDim.x) {
         const uint8_t* row = cache + (i / dim) * row_bytes;
         out[i] = idxk ? deepseek4_idxk_get(row, (uint32_t)(i % dim)) : deepseek4_ckv_get(row, (uint32_t)(i % dim));
+    }
+}
+
+// The compressed row's scale decoded once into shared (cuda/ds41_attn.cuh:247-251): same value, same multiply as
+// deepseek4_ckv_get's per-element decode, so the kernel and the host oracle stay bit-identical.
+__device__ __forceinline__ float attn_ckv_get_s(const uint8_t* row, uint32_t d, const float* scales) {
+    const uint8_t by = row[d >> 1];
+    const uint8_t nib = (d & 1u) ? (uint8_t)(by >> 4) : (uint8_t)(by & 0x0Fu);
+    return engram_bf16r(deepseek4_fp4_from_nibble(nib) * scales[d >> 4]);
+}
+
+// Sparse attention over the causal SWA window plus the topk compressed keys (cuda/ds41_attn.cuh:304-370).
+__global__ void attn_sparse_kernel(float* o, const float* q, const float* kvw, const uint8_t* kvc, const int32_t* idx,
+                                   const float* sink, uint32_t pos0, uint32_t window, uint32_t ng, uint32_t topk,
+                                   uint32_t n_head, uint32_t hd, float scale, uint32_t full_block, uint32_t ring,
+                                   uint32_t win_lo) {
+    const uint32_t i = blockIdx.x, lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const uint32_t per = hd / 32u;
+    __shared__ float ks[kDeepseek4AttnKeyTile][512];
+    __shared__ int kok[kDeepseek4AttnKeyTile];
+    __shared__ float ksc[kDeepseek4AttnKeyTile][32];
+    float qa[2][16], acc[2][16], mx[2], sum[2];
+    for (int hh = 0; hh < 2; hh++) {
+        const uint32_t h = blockIdx.y * kDeepseek4AttnHeadsPerBlock + warp * 2u + hh;
+        for (uint32_t e = 0; e < per; e++) {
+            qa[hh][e] = q[((uint64_t) i * n_head + h) * hd + lane * per + e];
+            acc[hh][e] = 0.f;
+        }
+        mx[hh] = -1e30f;
+        sum[hh] = 0.f;
+    }
+    const uint32_t p = pos0 + i;
+    const uint32_t last = full_block ? pos0 + full_block - 1u : p;
+    uint32_t lo = full_block ? (pos0 > window ? pos0 - window : 0u)
+                             : (p + 1u > window ? p + 1u - window : 0u);
+    if (lo < win_lo) lo = win_lo;
+    const uint32_t nwin = last - lo + 1u;
+    const uint32_t nkeys = nwin + topk;
+    for (uint32_t base = 0; base < nkeys; base += kDeepseek4AttnKeyTile) {
+        const uint32_t nt = (nkeys - base) < kDeepseek4AttnKeyTile ? (nkeys - base) : kDeepseek4AttnKeyTile;
+        __syncthreads();   // the previous tile is read out before it is overwritten
+        for (uint32_t t = threadIdx.x / 32u; t < nt; t += blockDim.x / 32u) {
+            const uint32_t kk = base + t;
+            const float* krow = NULL;
+            const uint8_t* cpk = NULL;
+            if (kk < nwin) {
+                krow = kvw + (uint64_t) deepseek4_win_row((int64_t) lo + kk, pos0, window, ring) * hd;
+            } else {
+                const int32_t g = idx[(uint64_t) i * topk + (kk - nwin)];
+                if (g >= 0 && (uint32_t) g < ng) cpk = kvc + (uint64_t) g * kDeepseek4CkvBytes;
+            }
+            if (lane == 0) kok[t] = (krow != NULL || cpk != NULL) ? 1 : 0;
+            if (cpk) ksc[t][lane] = strata::deepseek4::engram_e4m3_to_f32(cpk[kDeepseek4CkvNibbleBytes + lane]);
+            __syncwarp();
+            // An invalid slot must be zeroed: 0 x stale shared bits is not 0 when those bits are NaN or Inf.
+            for (uint32_t d = lane; d < hd; d += 32u)
+                ks[t][d] = krow ? krow[d] : (cpk ? attn_ckv_get_s(cpk, d, ksc[t]) : 0.f);
+        }
+        __syncthreads();
+        for (int hh = 0; hh < 2; hh++) {
+            float s[kDeepseek4AttnKeyTile];
+            float tm = -1e30f;
+            for (uint32_t t = 0; t < nt; t++) {
+                float d = 0.f;
+                for (uint32_t e = 0; e < per; e++) d += qa[hh][e] * ks[t][lane * per + e];
+                for (int off = 16; off > 0; off >>= 1) d += __shfl_xor_sync(0xffffffffu, d, off);
+                s[t] = kok[t] ? d * scale : -1e30f;
+                tm = fmaxf(tm, s[t]);
+            }
+            const float nm = fmaxf(mx[hh], tm);
+            const float rs = expf(mx[hh] - nm);   // one rescale per tile
+            float acc_add[16];
+            for (uint32_t e = 0; e < per; e++) acc_add[e] = 0.f;
+            float ps = 0.f;
+            for (uint32_t t = 0; t < nt; t++) {
+                const float pv = expf(s[t] - nm);
+                ps += pv;
+                const float pb = engram_bf16r(pv);   // the official acc_s_cast
+                for (uint32_t e = 0; e < per; e++) acc_add[e] += pb * ks[t][lane * per + e];
+            }
+            sum[hh] = sum[hh] * rs + ps;
+            for (uint32_t e = 0; e < per; e++) acc[hh][e] = acc[hh][e] * rs + acc_add[e];
+            mx[hh] = nm;
+        }
+    }
+    for (int hh = 0; hh < 2; hh++) {
+        const uint32_t h = blockIdx.y * kDeepseek4AttnHeadsPerBlock + warp * 2u + hh;
+        const float den = sum[hh] + expf(sink[h] - mx[hh]);   // the sink enters the denominator only
+        for (uint32_t e = 0; e < per; e++)
+            o[((uint64_t) i * n_head + h) * hd + lane * per + e] = engram_bf16r(acc[hh][e] / den);
     }
 }
 
@@ -183,6 +278,25 @@ bool deepseek4_idxk_unpack(const uint8_t* d_cache, uint32_t n_rows, float* d_out
     const uint64_t n = (uint64_t) n_rows * kDeepseek4IdxkDim;
     attn_kv_unpack_kernel<<<unpack_blocks(n), 256, 0, static_cast<cudaStream_t>(stream)>>>(d_out, d_cache, n, 1);
     return finish(static_cast<cudaStream_t>(stream), "idxk unpack");
+}
+
+bool deepseek4_sparse_attn(float* d_o, const float* d_q, const float* d_kv_win, const uint8_t* d_kv_comp,
+                           const int32_t* d_idx, const float* d_sink, uint32_t n_tok, uint32_t pos0, uint32_t window,
+                           uint32_t ng, uint32_t topk, uint32_t n_head, uint32_t head_dim, float scale,
+                           uint32_t full_block, bool ring, uint32_t win_lo, void* stream) {
+    if (!d_o || !d_q || !d_kv_win || !d_sink || n_tok == 0 || n_head == 0 || head_dim == 0 || head_dim > 512 ||
+        (head_dim % 32u) != 0 || (n_head % kDeepseek4AttnHeadsPerBlock) != 0)
+        return false;
+    if ((d_kv_comp == nullptr) != (d_idx == nullptr)) return false;
+    if (d_kv_comp == nullptr) topk = 0;
+    if (full_block == 0 && !ring) return false;   // the main path's window must be a ring (the reference entry)
+    if (full_block > n_tok) return false;
+    if (win_lo > pos0) return false;              // the clamp would pass the last query: the caller's window is short
+    attn_sparse_kernel<<<dim3(n_tok, n_head / kDeepseek4AttnHeadsPerBlock), kDeepseek4AttnHeadsPerBlock * 16u, 0,
+                         static_cast<cudaStream_t>(stream)>>>(
+        d_o, d_q, d_kv_win, d_kv_comp, d_idx, d_sink, pos0, window, ng, topk, n_head, head_dim, scale, full_block,
+        ring ? 1u : 0u, win_lo);
+    return finish(static_cast<cudaStream_t>(stream), "sparse attn");
 }
 
 }  // namespace strata::kernels

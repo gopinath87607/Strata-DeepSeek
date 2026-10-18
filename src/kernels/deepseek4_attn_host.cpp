@@ -11,6 +11,7 @@
 #include "strata/kernels/deepseek4_attn.hpp"
 
 #include <cmath>
+#include <vector>
 
 namespace strata::kernels {
 
@@ -122,6 +123,95 @@ void deepseek4_idxk_unpack_host(const uint8_t* cache, uint32_t n_rows, float* ou
         const uint8_t* row = cache + (size_t) r * kDeepseek4IdxkBytes;
         float* o = out + (size_t) r * kDeepseek4IdxkDim;
         for (uint32_t d = 0; d < kDeepseek4IdxkDim; d++) o[d] = deepseek4_idxk_get(row, d);
+    }
+}
+
+void deepseek4_sparse_attn_host(float* o, const float* q, const float* kvw, const uint8_t* kvc, const int32_t* idx,
+                                const float* sink, uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng,
+                                uint32_t topk, uint32_t n_head, uint32_t head_dim, float scale, uint32_t full_block,
+                                bool ring, uint32_t win_lo) {
+    if (!o || !q || !kvw || !sink || n_tok == 0 || n_head == 0 || head_dim == 0 || head_dim > 512 ||
+        (head_dim % 32u) != 0 || (n_head % kDeepseek4AttnHeadsPerBlock) != 0)
+        return;
+    if ((kvc == nullptr) != (idx == nullptr)) return;
+    if (kvc == nullptr) topk = 0;
+    if (full_block == 0 && !ring) return;   // the entry's contract: the main path's window is a ring
+    if (full_block > n_tok) return;
+    if (win_lo > pos0) return;              // the clamp would pass the last query: the caller's window is short
+
+    const uint32_t per = head_dim / 32u;
+    const uint32_t ktile = kDeepseek4AttnKeyTile;
+    std::vector<float> ks((size_t) ktile * head_dim);
+    std::vector<float> acc(head_dim), acc_add(head_dim);
+    std::vector<int> kok(ktile);
+
+    for (uint32_t i = 0; i < n_tok; i++) {
+        const uint32_t p = pos0 + i;
+        const uint32_t last = full_block ? pos0 + full_block - 1u : p;
+        uint32_t lo = full_block ? (pos0 > window ? pos0 - window : 0u)
+                                 : (p + 1u > window ? p + 1u - window : 0u);
+        if (lo < win_lo) lo = win_lo;
+        const uint32_t nwin = last - lo + 1u;
+        const uint32_t nkeys = nwin + topk;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float* qh = q + ((size_t) i * n_head + h) * head_dim;
+            float mx = -1e30f, sum = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) acc[d] = 0.0f;
+            for (uint32_t base = 0; base < nkeys; base += ktile) {
+                const uint32_t nt = (nkeys - base) < ktile ? (nkeys - base) : ktile;
+                for (uint32_t t = 0; t < nt; t++) {
+                    const uint32_t kk = base + t;
+                    const float* krow = nullptr;
+                    const uint8_t* cpk = nullptr;
+                    if (kk < nwin) {
+                        krow = kvw + (size_t) deepseek4_win_row((int64_t) lo + kk, pos0, window, ring ? 1u : 0u) *
+                                          head_dim;
+                    } else {
+                        const int32_t g = idx[(size_t) i * topk + (kk - nwin)];
+                        if (g >= 0 && (uint32_t) g < ng) cpk = kvc + (size_t) g * kDeepseek4CkvBytes;
+                    }
+                    kok[t] = (krow != nullptr || cpk != nullptr) ? 1 : 0;
+                    for (uint32_t d = 0; d < head_dim; d++)
+                        ks[(size_t) t * head_dim + d] = krow ? krow[d] : (cpk ? deepseek4_ckv_get(cpk, d) : 0.0f);
+                }
+                float st[kDeepseek4AttnKeyTile];
+                float tm = -1e30f;
+                for (uint32_t t = 0; t < nt; t++) {
+                    // The kernel's 32-lane dot: each lane sums `per` contiguous dims, then the xor tree.
+                    float part[32], next[32];
+                    for (uint32_t l = 0; l < 32u; l++) {
+                        float a = 0.0f;
+                        for (uint32_t e = 0; e < per; e++)
+                            a += qh[l * per + e] * ks[(size_t) t * head_dim + l * per + e];
+                        part[l] = a;
+                    }
+                    for (int off = 16; off > 0; off >>= 1) {
+                        for (uint32_t l = 0; l < 32u; l++) next[l] = part[l] + part[l ^ (uint32_t) off];
+                        for (uint32_t l = 0; l < 32u; l++) part[l] = next[l];
+                    }
+                    const float dot = part[0];
+                    st[t] = kok[t] ? dot * scale : -1e30f;
+                    tm = fmaxf(tm, st[t]);
+                }
+                const float nm = fmaxf(mx, tm);
+                const float rs = expf(mx - nm);
+                float ps = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) acc_add[d] = 0.0f;
+                for (uint32_t t = 0; t < nt; t++) {
+                    const float pv = expf(st[t] - nm);
+                    ps += pv;
+                    const float pb = attn_bf16r(pv);
+                    for (uint32_t d = 0; d < head_dim; d++)
+                        acc_add[d] += pb * ks[(size_t) t * head_dim + d];
+                }
+                sum = sum * rs + ps;
+                for (uint32_t d = 0; d < head_dim; d++) acc[d] = acc[d] * rs + acc_add[d];
+                mx = nm;
+            }
+            const float den = sum + expf(sink[h] - mx);
+            float* oh = o + ((size_t) i * n_head + h) * head_dim;
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] = attn_bf16r(acc[d] / den);
+        }
     }
 }
 

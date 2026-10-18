@@ -261,4 +261,47 @@ bool deepseek4_ckv_unpack(const uint8_t* d_cache, uint32_t n_rows, float* d_out,
 void deepseek4_idxk_unpack_host(const uint8_t* cache, uint32_t n_rows, float* out);
 bool deepseek4_idxk_unpack(const uint8_t* d_cache, uint32_t n_rows, float* d_out, void* stream);
 
+// ---- sparse attention ----
+//
+// The layer's attention over the causal SWA window plus the topk compressed keys (cuda/ds41_attn.cuh:304-370).
+// One block per (query, 8-head group), 128 threads = 4 warps x 2 heads, lane l owning dims l*per ..
+// l*per+per-1 of a head.  The key order is the window rows in ascending position, then the topk compressed
+// rows, 8 keys at a time through shared.  The online softmax keeps a running (max, sum, acc): each tile takes
+// its max, one rescale of the running values, and every probability is bf16-rounded before it multiplies a key
+// (the official acc_s_cast).  An invalid topk entry - negative, or >= ng - scores -1e30 and its shared row is
+// zeroed, because 0 times stale shared bits is not 0 when those bits are NaN.  The sink enters the denominator
+// only: out = bf16r(acc / (sum + exp(sink[h] - mx))).
+//
+// The scalar form is the reference engine's own fallback, kept here as P3's correctness path; its tensor-core
+// and split-K routes (cuda/ds41_attn_mma.cuh) are P7's performance work and must reproduce this arithmetic.
+
+inline constexpr uint32_t kDeepseek4AttnHeadsPerBlock = 8;  // 4 warps x 2 heads
+inline constexpr uint32_t kDeepseek4AttnKeyTile = 8;        // keys staged through shared per step
+
+/// Which row of the SWA window buffer absolute position `a` occupies (cuda/ds41_attn.cuh:39-50): [0, window)
+/// is the history segment, [window, window + n) this batch's rows.  ring=1 keeps a % window; ring=0 (the
+/// DSpark tower) is the linear segment its positions live in.
+STRATA_DSV4_HD inline uint64_t deepseek4_win_row(int64_t a, uint32_t pos0, uint32_t window, uint32_t ring) {
+    if (a >= (int64_t) pos0) return (uint64_t)((int64_t) window + a - (int64_t) pos0);
+    return ring ? (uint64_t)(a % (int64_t) window)
+                : (uint64_t)(a - ((int64_t) pos0 - (int64_t) window));
+}
+
+/// The host oracle: the reference kernel's gather, tile order, reduction tree and online softmax, written for
+/// one thread.  `kvw` has window + n_tok rows of head_dim f32; the compressed entries are the header's packed
+/// rows.  `full_block` is 0 for the causal main path, else the draft block's length (all its positions visible
+/// to every query).  When `kvc` is null `topk` is treated as 0.
+void deepseek4_sparse_attn_host(float* o, const float* q, const float* kvw, const uint8_t* kvc, const int32_t* idx,
+                                const float* sink, uint32_t n_tok, uint32_t pos0, uint32_t window, uint32_t ng,
+                                uint32_t topk, uint32_t n_head, uint32_t head_dim, float scale, uint32_t full_block,
+                                bool ring, uint32_t win_lo);
+
+/// The GPU form.  head_dim must be a multiple of 32 and at most 512 (the shared tile's width), n_head a
+/// multiple of 8; kvc and idx must be both null or both present.  `win_lo` clamps the window's lower bound
+/// (ring cells before it were never written); 0 disables it.
+bool deepseek4_sparse_attn(float* d_o, const float* d_q, const float* d_kv_win, const uint8_t* d_kv_comp,
+                           const int32_t* d_idx, const float* d_sink, uint32_t n_tok, uint32_t pos0, uint32_t window,
+                           uint32_t ng, uint32_t topk, uint32_t n_head, uint32_t head_dim, float scale,
+                           uint32_t full_block, bool ring, uint32_t win_lo, void* stream);
+
 }  // namespace strata::kernels

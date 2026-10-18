@@ -273,7 +273,7 @@ Each phase has a gate that is a comparison, not an inspection.
 | P0 (done) | artifact opened; types, geometry and both hard formats read; VQ decoder written and checked | fixtures bit-exact; real layer-0 slot arithmetic closes; expert 0 decodes finite |
 | P1 (loader, tokenizer and template landed) | family loader in Strata: `deepseek4` metadata, tensor types 42/44, inventory, tokenizer and chat template | the loader reports the 1,000-tensor inventory and every rejected tensor by name; malformed blobs are refused with a named error; the tokenizer's ids match the reference oracle; the template's bytes match the reference renderer. Met for metadata, types, inventory and blob containers on the real header, for `encode` and rendered-chat ids on the tokenizer corpus, and for the V4.1 DSML template on the official and differential vectors; the 43 blob payloads await the full file |
 | P2 (CUDA done; HIP waits for AMD hardware) | VQ decode on CUDA, then HIP: row-dot kernels that read the bit stream directly | GPU output bit-identical to the CPU decoder on the fixtures and on real expert 0. Met on CUDA: 0 mismatching bytes on both v2 fixtures (also against the engine's own dumps) and on all 35.4M decoded values of the real layer-0 expert 0, whose three matrices are v3 13-bit; the row dot agrees with a float64 reference to 9.1e-9 of the term scale. The same source is HIP-translated by the gfx906 build, but no ROCm device exists here to run it |
-| P3 (hyper-connections, dense primitives, RoPE and the quantized-KV group landed and gated) | trunk forward: MLA q/kv LoRAs, compressors, sparse indexer, sinks, sliding window, hyper-connections, RoPE both bases, MoE 384/top-6 + shared, fused VQ MoE | temperature-0 token ids and logits match the reference engine per position. Met for hyper-connections: mix, the Sinkhorn split, hc_pre + the RMS norm and hc_post match the host oracle within summation-order tolerances on 5120x4 at one and five tokens, 300x2 and 128x8; every bf16 output is on the bf16 grid; fused and unfused agree bitwise (364 checks, RTX 3060). Met for the dense primitives: rms_norm, SwiGLU, add/round/scale/expand, the q4_K embedding and the f32/bf16/q4_K matmuls including the grouped output form match their host oracles; the shared q4_K decoder produces dequant_bf16's exact bits on exact headers and stays within one bf16 ulp on varied fp16 ones (171 checks, RTX 3060). Met for RoPE: forward and inverse, both bases, the YaRN ramp and the three head geometries (512/64 at 64 heads, compressor 512/64, indexer 128/64) agree with the host oracle and only the last n_rot values move, bitwise (70 checks, RTX 3060). Met for the quantized-KV group: the compressor pool matches its host oracle, an independent double-precision reference and the bf16 grid (and bitwise when the scores are equal); act_quant's three modes and the ckv (288 B) and idxk (72 B) packs agree with their host oracles bit for bit, the read-back equals act_quant's own write-back at every element, and the idxk pad is zero (201 checks, RTX 3060) |
+| P3 (hyper-connections, dense primitives, RoPE, the quantized-KV group and sparse attention landed and gated) | trunk forward: MLA q/kv LoRAs, compressors, sparse indexer, sinks, sliding window, hyper-connections, RoPE both bases, MoE 384/top-6 + shared, fused VQ MoE | temperature-0 token ids and logits match the reference engine per position. Met for hyper-connections: mix, the Sinkhorn split, hc_pre + the RMS norm and hc_post match the host oracle within summation-order tolerances on 5120x4 at one and five tokens, 300x2 and 128x8; every bf16 output is on the bf16 grid; fused and unfused agree bitwise (364 checks, RTX 3060). Met for the dense primitives: rms_norm, SwiGLU, add/round/scale/expand, the q4_K embedding and the f32/bf16/q4_K matmuls including the grouped output form match their host oracles; the shared q4_K decoder produces dequant_bf16's exact bits on exact headers and stays within one bf16 ulp on varied fp16 ones (171 checks, RTX 3060). Met for RoPE: forward and inverse, both bases, the YaRN ramp and the three head geometries (512/64 at 64 heads, compressor 512/64, indexer 128/64) agree with the host oracle and only the last n_rot values move, bitwise (70 checks, RTX 3060). Met for the quantized-KV group: the compressor pool matches its host oracle, an independent double-precision reference and the bf16 grid (and bitwise when the scores are equal); act_quant's three modes and the ckv (288 B) and idxk (72 B) packs agree with their host oracles bit for bit, the read-back equals act_quant's own write-back at every element, and the idxk pad is zero (201 checks, RTX 3060). Met for sparse attention: the window ring's row mapping and the DSpark draft block match an independent double-precision softmax over the intended rows, an invalid topk entry is bitwise the same output as topk = 0 across an 8-key tile boundary, and the kernel agrees with its host oracle (which writes out the device's 32-lane xor tree) across head widths 64 and 512, 8 and 64 heads, a win_lo clamp that bites and a window-less compressed-only layer (179 checks, RTX 3060) |
 | P4 (hash, reader, projections and their GPU gates done; wiring and the on/off gate await P3) | Engram: hash, O_DIRECT row reader, q/k/wkv projections, io_uring overlap if prefill needs it | hash rows match the reference implementation on its fixture, then on rows captured from the same checkpoint; output matches with engram on and off. Met for the hash and the row decode: 0 differing rows or values on the reference's hash fixture and on the captured golden positions through all four read paths, and 0 bit-diffs on the GPU row decode of the real shards. The gate and wkv meet their float64 bounds on the fixtures and the real weights. The on/off output gate needs the forward pass |
 | P5 | three DSpark towers and verify/rollback | greedy output byte-identical with drafting on and off; cache frontier exact |
 | P6 | serving: OpenAI and Anthropic surfaces, sampling defaults, thinking toggle | one served request per contract |
@@ -346,11 +346,12 @@ include/strata/kernels/deepseek4_dense.hpp  P3: dense semantics + the shared q4_
 src/kernels/deepseek4_dense_host.cpp     P3 host oracle: norm, swiglu, elementwise, embed, three matmuls and grouped
 src/kernels/cuda/deepseek4_dense.cu      P3 device half: the elementwise kernels, embed and row-per-block matmuls
 tests/core/deepseek4_dense_cuda_test.cpp the dense gate: decoder vs dequant_bf16, kernels vs oracle, exact where exact
-include/strata/kernels/deepseek4_attn.hpp   P3: attention primitives - the shared rope frequency, block quant, pack formats, entries
-src/kernels/deepseek4_attn_host.cpp       P3 host oracle: RoPE, the compressor pool, block quant, KV pack and unpack
-src/kernels/cuda/deepseek4_attn.cu        P3 device half: the rope, pool, quant, pack and unpack kernels
+include/strata/kernels/deepseek4_attn.hpp   P3: attention primitives - the shared rope frequency, block quant, pack formats, window rows, sparse attention
+src/kernels/deepseek4_attn_host.cpp       P3 host oracle: RoPE, the compressor pool, block quant, KV pack and unpack, sparse attention
+src/kernels/cuda/deepseek4_attn.cu        P3 device half: the rope, pool, quant, pack, unpack and sparse attention kernels
 tests/core/deepseek4_rope_cuda_test.cpp   the RoPE gate: six geometries vs oracle, bf16 grid, the prefix bitwise
 tests/core/deepseek4_attn_kv_cuda_test.cpp the quantized-KV gate: pool, three quant modes, ckv/idxk pack and unpack
+tests/core/deepseek4_sparse_attn_cuda_test.cpp the sparse attention gate: exact fixtures, ring and draft-block geometry, host-vs-device
 
 include/strata/artifact/deepseek4_engram.hpp       P4 host half: hash, O_DIRECT row reader, gate emulation
 include/strata/artifact/deepseek4_engram_bits.hpp  the fp8/bf16 conversions, host and device, shared by both
@@ -395,6 +396,8 @@ cmake --build /tmp/dsv4-build --target deepseek4_rope_cuda_test
 /tmp/dsv4-build/deepseek4_rope_cuda_test
 cmake --build /tmp/dsv4-build --target deepseek4_attn_kv_cuda_test
 /tmp/dsv4-build/deepseek4_attn_kv_cuda_test
+cmake --build /tmp/dsv4-build --target deepseek4_sparse_attn_cuda_test
+/tmp/dsv4-build/deepseek4_sparse_attn_cuda_test
 ```
 
 Expected: `89 checks, 0 failures`, two fixture lines with 0 mismatches, three
@@ -419,7 +422,7 @@ line reports `0 bit-diffs`, the dense gate case `2 differ, 0 over bound`, and
 each real wkv line its `max rel` (about `1.2e-7`) and `0 over 1e-3*scale`.
 Both engram tests are CMake targets under `STRATA_BUILD_TESTS`; the host test
 runs its synthetic shard section even with no fixtures, and the GPU test exits
-77 when no CUDA device is present. The two P3 gates print `PASS: 364 checks, 0
+77 when no CUDA device is present. The P3 gates print `PASS: 364 checks, 0
 failures` (hyper-connections) and `PASS: 171 checks, 0 failures` (dense
 primitives, whose decoder lines report `0 differ` on the exact headers and a
 worst of 0.951 x the one-bf16-ulp bound on varied fp16 ones) and `PASS: 70
@@ -427,7 +430,10 @@ checks, 0 failures` (RoPE, whose prefix lines report `0 moved` on every
 geometry) and `PASS: 201 checks, 0 failures` (the quantized-KV group, whose
 lines report `0 bits differ` for act_quant and both packs, `0 differ from
 act_quant's write-back` for the read-back identity, and `0 nonzero` for the
-idxk pad); all exit 77 without a CUDA device.
+idxk pad) and `PASS: 179 checks, 0 failures` (sparse attention, whose lines
+report `0 bits differ` for the exact fixtures and the invalid-topk equivalence,
+`0 differ between replicated queries` in the draft block, and `0 off the bf16
+grid` everywhere); all exit 77 without a CUDA device.
 
 ### The tokenizer, measured
 
