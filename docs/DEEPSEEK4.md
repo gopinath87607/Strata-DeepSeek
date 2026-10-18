@@ -295,7 +295,7 @@ Each phase has a gate that is a comparison, not an inspection.
 | P2 (CUDA done; HIP waits for AMD hardware) | VQ decode on CUDA, then HIP: row-dot kernels that read the bit stream directly | GPU output bit-identical to the CPU decoder on the fixtures and on real expert 0. Met on CUDA: 0 mismatching bytes on both v2 fixtures (also against the engine's own dumps) and on all 35.4M decoded values of the real layer-0 expert 0, whose three matrices are v3 13-bit; the row dot agrees with a float64 reference to 9.1e-9 of the term scale. The same source is HIP-translated by the gfx906 build, but no ROCm device exists here to run it |
 | P3 (hyper-connections, dense primitives, RoPE, the quantized-KV group, sparse attention, the window ring, the sparse indexer and the router + routed VQ MoE landed and gated) | trunk forward: MLA q/kv LoRAs, compressor source steps, grouped output projection, inverse RoPE, sparse indexer, sinks, sliding window, hyper-connections, RoPE both bases, MoE 384/top-6 + shared, fused VQ MoE, the forward driver | temperature-0 token ids and logits match the reference engine per position. Met for hyper-connections: mix, the Sinkhorn split, hc_pre + the RMS norm and hc_post match the host oracle within summation-order tolerances on 5120x4 at one and five tokens, 300x2 and 128x8; every bf16 output is on the bf16 grid; fused and unfused agree bitwise (364 checks, RTX 3060). Met for the dense primitives: rms_norm, SwiGLU, add/round/scale/expand, the q4_K embedding and the f32/bf16/q4_K matmuls including the grouped output form match their host oracles; the shared q4_K decoder produces dequant_bf16's exact bits on exact headers and stays within one bf16 ulp on varied fp16 ones (171 checks, RTX 3060). Met for RoPE: forward and inverse, both bases, the YaRN ramp and the three head geometries (512/64 at 64 heads, compressor 512/64, indexer 128/64) agree with the host oracle and only the last n_rot values move, bitwise (70 checks, RTX 3060). Met for the quantized-KV group: the compressor pool matches its host oracle, an independent double-precision reference and the bf16 grid (and bitwise when the scores are equal); act_quant's three modes and the ckv (288 B) and idxk (72 B) packs agree with their host oracles bit for bit, the read-back equals act_quant's own write-back at every element, and the idxk pad is zero (201 checks, RTX 3060). Met for sparse attention: the window ring's row mapping and the DSpark draft block match an independent double-precision softmax over the intended rows, an invalid topk entry is bitwise the same output as topk = 0 across an 8-key tile boundary, and the kernel agrees with its host oracle (which writes out the device's 32-lane xor tree) across head widths 64 and 512, 8 and 64 heads, a win_lo clamp that bites and a window-less compressed-only layer (179 checks, RTX 3060). Met for the window ring: the commit and its spec-decode snapshot match their host oracles bitwise over the whole buffer, including the n > window aliasing case, the device position override and the no-rows no-op (77 checks, RTX 3060). Met for the sparse indexer: the score agrees bitwise with its host oracle and a hand-written expectation on integer fixtures (per-lane partials, the xor tree, relu and the bf16 rounding points included) over 32- and 128-dim keys and the compact candidate row; the candidate list's pin, equal-key fill, fewer-visible-than-kk fallback and kk >= nb paths match the oracle bitwise and by hand, including a random block set; the topk output matches by hand and against the oracle with ties, a tail of -1, NaN-treated-as-invisible, the compact candidate mapping and the graph position recompute of ng and topk (320 checks, RTX 3060). Met for the MoE: the router matches its host oracle and the known cases - all logits equal picks experts 0..topk-1 in order, a six-way tie at the top-k boundary picks exactly those six ascending, z = 100 takes softplus's threshold-20 branch (weight exactly 1, not nan), topk > n_expert leaves -1 rounds with weight 0 exactly, and an image token selects on bias_vl - with every id identical and weights within 3.0e-8; the routed chain matches the reference engine's own MoE fixture, all six one-hot cases bit-exact against its f32 dump and the two random cases within 2.7e-4 of the vector's own scale (the reference's own measured worst was 2.6e-4), and the 2-token call and the partials + tail path pass on the same fixture (174 checks, RTX 3060). The shared expert is deliberately not in this module: it is the q4_K dense path, folded by the tail, exactly as the reference composes it |
 | P4 (hash, reader, projections and their GPU gates done; wiring and the on/off gate await P3) | Engram: hash, O_DIRECT row reader, q/k/wkv projections, io_uring overlap if prefill needs it | hash rows match the reference implementation on its fixture, then on rows captured from the same checkpoint; output matches with engram on and off. Met for the hash and the row decode: 0 differing rows or values on the reference's hash fixture and on the captured golden positions through all four read paths, and 0 bit-diffs on the GPU row decode of the real shards. The gate and wkv meet their float64 bounds on the fixtures and the real weights. The on/off output gate needs the forward pass |
-| P5 | three DSpark towers and verify/rollback | greedy output byte-identical with drafting on and off; cache frontier exact |
+| P5 (towers, the window fill and the verify loop landed and gated; the acceptance numbers are below) | three DSpark towers and verify/rollback | greedy output byte-identical with drafting on and off; cache frontier exact. Met: the same 16 greedy ids from an 11-token chat prompt with drafting off, `--dspark-verify 1`, `--dspark-verify 2` and the full block 5, and with `--chunk 4` (narrower than the 6-row verify batch), and the same 12 ids from a 151-token prompt (whose first window fill takes the full 128 rows) with drafting off and on. The frontier is exact by observation: every later round's argmax reads the rolled-back window, the restored compressor pending rows and the rewound group counts, and the ids match the plain run |
 | P6 | serving: OpenAI and Anthropic surfaces, sampling defaults, thinking toggle | one served request per contract |
 | P7 | Strata integration: layer split, compressed expert cache, prompt chunk, loan and ring | four-GPU run returns the same tokens as one GPU; then a measured performance ledger |
 | P8 | AMD HIP and Windows builds | P3's gate passes on the same hardware |
@@ -379,7 +379,9 @@ tests/core/deepseek4_attn_kv_cuda_test.cpp the quantized-KV gate: pool, three qu
 tests/core/deepseek4_sparse_attn_cuda_test.cpp the sparse attention gate: exact fixtures, ring and draft-block geometry, host-vs-device
 tests/core/deepseek4_win_commit_cuda_test.cpp the window ring gate: commit and snapshot vs oracle, whole buffer bitwise
 tests/core/deepseek4_indexer_cuda_test.cpp the sparse indexer gate: exact score fixtures, the candidate list's four selection paths, topk ties/tail/compact/pos
-tools/dsv4/dsv4_run.cu                   the P3 forward driver: 40-part reader, blob staging, the reference's layer order, greedy decode
+include/strata/kernels/deepseek4_fp8.hpp  P5: the towers' fp8 skeleton matmuls and the draft's small helpers
+src/kernels/cuda/deepseek4_fp8.cu        P5 device half. The single-matrix GEMV is the engram's wkv (gated in P4); the grouped form is the same kernel with a grid.y offset. No separate unit test: P5's gate is the driver's byte identity
+tools/dsv4/dsv4_run.cu                   the forward driver: 40-part reader, blob staging, the reference's layer order, greedy decode; P5 adds the DSpark towers, the window fill and the verify loop behind `--dspark`
 tools/dsv4/dsv4_prompt.py                text in front of it: the DSML head, the artifact tokenizer, the ids file, decoding back
 
 include/strata/artifact/deepseek4_engram.hpp       P4 host half: hash, O_DIRECT row reader, gate emulation
@@ -609,6 +611,96 @@ reason to add the instruction behind an arch guard when P7 has a number, not a
 reason for two different conversions now. HIP is wired (the gfx906 build
 translates every `src/*.cu`, and the compat shim supplies the runtime calls),
 but there is no ROCm device on this machine, so the HIP run stays open.
+
+### The DSpark towers and the verify loop, measured
+
+P5 adds the draft path behind `--dspark`; without the flag the driver takes the
+plain P3 path unchanged. The driver carries the towers' forward (the fp8
+skeleton matrices, the routed VQ experts, the bf16 gates, the borrowed head,
+the per-position markov greedy chain, the confidence head), the main-hidden
+capture, the tower window's right-aligned fill, and the verify batch with its
+rollback. The kernel entries the towers added live in
+`include/strata/kernels/deepseek4_fp8.hpp` (CUDA source
+`src/kernels/cuda/deepseek4_fp8.cu`): `matmul_fp8` and `matmul_fp8_grouped`
+for the towers' type-44 matrices, then `hc_mean` (the capture), `ring_rows`
+(the fill's row gather), `row_gather_bf16` (the markov embedding), `argmax`
+and `row_add` (the greedy chain and the head bias), each against its reference
+kernel.
+
+The gate is byte identity of the greedy stream, not acceptance:
+
+| prompt | drafting | rounds | generated ids |
+| --- | --- | --- | --- |
+| 11-token chat, `--gen 16` | off | - | `671,6102,294,8760,344,2619,51119,42499,1,0,30,94,8277,19704,19053,94` |
+| 11-token chat | `--dspark` (block 5) | 11 | same |
+| 11-token chat | `--dspark-verify 2` | 11 | same |
+| 11-token chat | `--dspark-verify 1` | 12 | same |
+| 11-token chat, `--chunk 4`, `--gen 10` | off | - | `671,6102,294,8760,344,2619,51119,42499,1,0` |
+| 11-token chat, `--chunk 4`, `--gen 10` | `--dspark` | 5 | same |
+| 151-token prompt, `--chunk 64`, `--gen 12` | off | - | `2389,43,3018,343,82845,60845,14362,17399,305,14733,11,1` |
+| 151-token prompt, `--chunk 64`, `--gen 12` | `--dspark` | 10 | same |
+
+`--chunk 4` makes the prefill chunk narrower than the 6-row verify batch (the
+runner raises its per-block cap to `block + 1`). The 151-token prompt is
+longer than the 128-row tower window, so its first window fill takes 128 rows
+and every later one a single row; the 11-token prompt's first fill takes 11.
+Both are in the table. `--dspark-verify K` pins the batch to 1+K rows, which
+walks a rollback at every width from 2 to 6.
+
+The frontier is exact by construction and by observation. Each round
+snapshots the window cells the batch will overwrite (per layer) and the
+compressor's pending rows; the verify runs the plain block at
+`pos0 = n_past - 1`; `a` is the longest matching prefix; rollback restores
+the window, rewinds the group counts to `n_past / ratio`, puts the last
+`n_past % ratio` pending rows back and drops the rejected main-hidden cells.
+Every later round's argmax reads that rolled-back cache, so the ids staying
+equal to the plain run's is the observation.
+
+On acceptance, measured on the RTX 3060 (sm_86) with the 40-part VQ image,
+16 generated tokens from the 11-token chat prompt, over the generation span
+the driver prints (after prefill):
+
+| drafting | time | tokens/s | rounds | accepted/round | of drafted |
+| --- | --- | --- | --- | --- | --- |
+| off | 11.87 s | 1.3 | - | - | - |
+| `--dspark-verify 1` | 17.48 s | 0.9 | 12 | 0.25 | 25.0% |
+| `--dspark-verify 2` | 21.81 s | 0.7 | 11 | 0.36 | 18.2% |
+| `--dspark` (block 5) | 35.93 s | 0.4 | 11 | 0.36 | 7.3% |
+
+The drafter does not pay for itself here: a verify step costs a 2- to 6-row
+batch and this content accepts 0.25-0.36 tokens per round. That is a property
+of this artifact on this content, not a performance claim; P7 owns any speed
+number. The reference's own table (M3 Ultra, Q4-imatrix target, public 2-bit
+Q2K drafter, temperature 0, yield guard off) is content-dependent in the same
+way: ~68% repetitive with ~2.4 tokens/step, ~22% stepwise arithmetic at
+~1.3x, ~20% code at ~1.2x, ~13% free prose at ~1.2x, and its yield guard
+shuts the drafter off per sequence when it loses. The 151-token prose prompt
+lands at 0.10 accepted per round (2.0% of drafted).
+
+`--dspark-trace` prints each round's `k`, `a`, the five confidence sigmoids
+and both id lists. It is what to read when acceptance moves: on the prose run
+the single accepted first position carried confidence 0.650 and the misses
+carried 0.11-0.35, so the head's ordering is meaningful. The towers' small
+matrices are read by their registered GGUF type, never assumed: the probe
+reports `mtp.markov_embd`, `mtp.markov_head` and `mtp.confidence` bf16,
+`mtp.main_norm`/`mtp.out_norm` f32 and `mtp.main_proj` type 44, which is what
+the reference's 2026-09-15 crash (f32 read as bf16, acceptance 0.14/5)
+requires. That signature is not what the numbers above are.
+
+Two things from the port worth recording:
+
+- The towers' kv buffers are `prod = max(cap_, SWA)` rows, not
+  `cap2 = block + 1`. The first run died with `tower window shift: invalid
+  argument`: the verify batch is 6 rows but the fill writes up to 128 into
+  that same buffer.
+- The reference's fill ends with a copy of `main_x` row 0 <- row `rows - 1`.
+  It runs after `push_main` (the only reader), and the next fill's
+  `main_norm` rewrites row 0, so it is a dead store and is not ported.
+
+```
+cmake --build /tmp/dsv4-build --target dsv4_run
+/tmp/dsv4-build/dsv4_run --ids-file ids.txt --gen 16 --gpu 0 --dspark --dspark-trace
+```
 
 ## 9. Downloads for the next phases
 

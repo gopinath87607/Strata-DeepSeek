@@ -417,6 +417,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/deepseek4_dense.cu
                           src/kernels/cuda/deepseek4_attn.cu
                           src/kernels/cuda/deepseek4_moe.cu
+                          src/kernels/cuda/deepseek4_fp8.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/deepseek4_hc_host.cpp
                           src/kernels/deepseek4_dense_host.cpp

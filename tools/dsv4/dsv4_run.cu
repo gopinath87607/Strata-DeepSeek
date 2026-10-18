@@ -15,6 +15,7 @@
 //
 // Usage:
 //   dsv4_run --ids 1,2,3 [--gen 32] [--model BASE] [--engram-dir DIR] [--chunk 8] [--ctx N] [--gpu 0]
+//            [--dspark [--dspark-verify K] [--dspark-trace]]
 //
 // The runner takes token ids, not text: the tokenizer is Python (tools/strata_tokenizer.py); see
 // tools/dsv4/dsv4_prompt.py for the text wrapper.
@@ -24,6 +25,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cinttypes>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +44,7 @@
 #include "strata/kernels/deepseek4_attn.hpp"
 #include "strata/kernels/deepseek4_dense.hpp"
 #include "strata/kernels/deepseek4_engram.hpp"
+#include "strata/kernels/deepseek4_fp8.hpp"
 #include "strata/kernels/deepseek4_hc.hpp"
 #include "strata/kernels/deepseek4_moe.hpp"
 #include "strata/kernels/deepseek4_vq.hpp"
@@ -204,9 +207,11 @@ struct Blob {
     uint64_t abs = 0;          // payload offset in the assembled image
     uint64_t size = 0;         // the container's payload length
     uint32_t experts = 0;
+    uint32_t ver = 3;          // container version (2 or 3; the tower blobs are the same format)
+    bool v3 = true;            // payload magic DQV3 (shared codebook) or DQVQ (own codebook)
     uint32_t nc = 0;
-    uint64_t cb_off = 0;       // shared codebook offset (== 16 + experts*24)
-    uint64_t cb_len = 0;
+    uint64_t cb_off = 0;       // shared codebook offset (v3: 16 + experts*24)
+    uint64_t cb_len = 0;       // 0 on a DQVQ container
     std::vector<uint64_t> slot;   // experts * 3 payload offsets (0 = absent)
     std::vector<uint64_t> span;   // the packed payload length of each slot
 };
@@ -262,6 +267,11 @@ struct Options {
     bool engram = true;
     bool check = true;   // the inventory check (header only)
     std::string logits_out;
+    // DSpark: the MTP towers draft, the main forward verifies, the cache rolls back.  Off unless asked, and the
+    // gate that matters is generated= byte-identical to this same run without it.
+    bool dspark = false;
+    uint32_t dspark_verify = 0;   // 0: verify the tower's whole block; else pin k (the trace gate)
+    bool dspark_trace = false;    // print each round's k, accepted count, confidence and both id lists
 };
 
 // ---- The runner -----------------------------------------------------------------------------------------------
@@ -285,9 +295,11 @@ private:
     bool alloc_state(uint32_t total, std::string& err);
     bool ensure_index_scratch(uint32_t rows, uint32_t ng, std::string& err);
     bool load_blob(uint32_t il, std::string& err);
+    bool load_blob_named(const std::string& name, bool tower, std::string& err, Blob& b);
     bool stage_blob(uint32_t il, const int32_t* sel, uint32_t n_pairs, std::string& err);
+    bool stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, uint32_t n_pairs, std::string& err);
 
-    bool block(const int32_t* ids, uint32_t n, bool head, std::string& err);
+    bool block(const int32_t* ids, uint32_t n, bool head, bool head_all, std::string& err);
     bool layer(uint32_t il, std::string& err);
     bool hc_half(uint32_t il, bool attn_half, std::string& err);
     bool attn(uint32_t il, std::string& err);
@@ -296,6 +308,17 @@ private:
     bool moe(uint32_t il, std::string& err);
     bool engram_layer(uint32_t il, std::string& err);
     int32_t argmax_logits(std::string& err);
+    // ---- DSpark (P5): the draft towers, the verify batch and its rollback ----
+    bool load_towers(std::string& err);
+    bool draft_alloc(std::string& err);
+    bool tower_half(uint32_t T, bool attn_half, std::string& err);
+    bool tower_attn(uint32_t T, std::string& err);
+    bool tower_moe(uint32_t T, std::string& err);
+    bool tower_layer(uint32_t T, std::string& err);
+    bool draft_block(uint32_t pos0, std::string& err);
+    int draft_round(int32_t tok, uint32_t pos_main, std::string& err);
+    bool spec_snapshot(uint32_t n, std::string& err);
+    bool spec_rollback(uint32_t keep, std::string& err);
     void probe(const char* tag, void* d, uint64_t n_floats);
     float theta_of(uint32_t ratio) const {
         return ratio ? static_cast<float>(geo.compress_rope_freq_base) : static_cast<float>(geo.rope_freq_base);
@@ -384,6 +407,53 @@ private:
     d4::EngramHash hash_;
     std::unique_ptr<d4::EngramShard> shard_[2];
     bool engram_on_ = false;
+
+    // ---- DSpark (P5) ----
+    bool mtp_on_ = false;
+    uint32_t mtp_towers_ = 0, mtp_experts_ = 0, mtp_used_ = 0, mtp_block_ = 0, mtp_rank_ = 0;
+    uint32_t mtp_noise_ = 0, mtp_n_target_ = 0, cap2_ = 0, prod_cap_ = 0, mainh_cap_ = 0;
+    int mtp_slot_[64] {};        // per main layer: the ring slot of its capture, or -1
+    LayerW TW_[8];               // per tower
+    Blob tblob_[8];              // per tower expert container
+    void* mtp_main_proj_ = nullptr;    // fp8_32x32 [n_target*E][E]
+    void* mtp_main_norm_ = nullptr;    // f32 [E]
+    void* mtp_markov_embd_ = nullptr;  // bf16 [R][V]
+    void* mtp_markov_head_ = nullptr;  // bf16 [V][R]
+    void* mtp_conf_ = nullptr;         // bf16 [1][E+R]
+    void* mtp_out_norm_ = nullptr;     // f32 [E]
+    bool tw_gate_f32_[8] {};           // the tower router gate's registered type (f32 or bf16)
+    bool mtp_conf_f32_ = false;        // the confidence matrix's registered type (f32 or bf16)
+    float* mainh_ = nullptr;           // [mainh_cap][n_target][E] f32 ring
+    float* t_mainh_lin_ = nullptr;     // [SWA][n_target][E] the fill's contiguous run
+    float* t_mainx_raw_ = nullptr;     // [prod_cap][E] main_proj output
+    float* t_main_x_ = nullptr;        // [prod_cap][E] main_norm output
+    uint32_t mainh_n_ = 0, mainh_wrote_ = 0;
+    int64_t mainh_end_ = -1, win_end_ = -1;
+    float* snap_win_ = nullptr;        // [nlayers][cap2][HD] the cells the batch overwrites
+    float* snap_cpre_kv_[64] {};       // per ratio>1 kv source: [ratio+cap2][HD]
+    float* snap_cpre_sc_[64] {};
+    uint32_t snap_cpend_[64] {};
+    uint32_t snap_n_ = 0, snap_past_ = 0;
+    bool snap_on_ = false;
+    // draft device state
+    int32_t *t_tok_ = nullptr, *t_pos_ = nullptr, *t_sel_ = nullptr;
+    int32_t *t_ids_ = nullptr, *t_ids_next_ = nullptr, *t_want_ = nullptr;
+    float *t_premix_ = nullptr, *t_pre_ = nullptr, *t_hc_ = nullptr, *t_hc2_ = nullptr, *t_mix_ = nullptr;
+    float *t_post_ = nullptr, *t_comb_ = nullptr, *t_x_ = nullptr, *t_xn_ = nullptr;
+    float *t_qr_ = nullptr, *t_qrn_ = nullptr, *t_q_ = nullptr, *t_kv_ = nullptr, *t_kvn_ = nullptr;
+    float *t_o_ = nullptr, *t_low_ = nullptr, *t_attn_ = nullptr;
+    float *t_glog_ = nullptr, *t_rw_ = nullptr, *t_partial_ = nullptr, *t_routed_ = nullptr, *t_so_ = nullptr;
+    float *t_sg_ = nullptr, *t_su_ = nullptr, *t_sh_ = nullptr;
+    float* t_y_ = nullptr;
+    float* t_logits_ = nullptr;        // [cap2][V] the draft block's per-row logits
+    float* vlogits_ = nullptr;         // [cap2][V] the verify batch's per-row head output
+    uint16_t* t_x16_ = nullptr;        // the fp8 towers' bf16 activation copy
+    std::vector<float*> twin_;         // per tower [SWA + prod_cap][HD]
+    float* t_wintmp_ = nullptr;        // [SWA][HD] the push's shift scratch
+    float *t_mk_embed_ = nullptr, *t_mk_cur_ = nullptr, *t_mk_bias_ = nullptr;
+    float *t_conf_in_ = nullptr, *t_conf_ = nullptr;
+    std::vector<int32_t> t_tok_host_, t_bpos_host_, t_wpos_host_, t_want_host_, t_id_host_;
+    std::vector<float> t_conf_host_;
 
     std::vector<int32_t> hist_;
     std::vector<int32_t> pm_host_;
@@ -565,6 +635,49 @@ bool Runner::open(const Options& o, std::string& err) {
     cap_ = std::max(1u, opt_.chunk);
     if (cap_ > ctx_) cap_ = ctx_;
 
+    // DSpark: the draft towers' metadata.  The path is opt-in; without --dspark the run is the plain one.
+    if (opt_.dspark) {
+        constexpr uint32_t kMtpMaxTowers = 8, kMtpMaxBlock = 8;   // the reference's DS4_MTP_MAX_TOWERS / _BLOCK
+        if (geo.mtp_tower_count == 0 || geo.mtp_target_layers.empty()) {
+            err = "--dspark: the image carries no MTP tensors";
+            return false;
+        }
+        if (geo.mtp_tower_count > kMtpMaxTowers) { err = "--dspark: more than 8 towers"; return false; }
+        if (geo.mtp_block_size == 0 || geo.mtp_block_size > kMtpMaxBlock) {
+            err = "--dspark: the block size is 0 or above 8";
+            return false;
+        }
+        if (geo.mtp_expert_count == 0 || geo.mtp_expert_count > kNExpertMax) {
+            err = "--dspark: the tower expert count is outside the parser's bound";
+            return false;
+        }
+        if (geo.mtp_expert_used_count == 0 ||
+            geo.mtp_expert_used_count > k::kDeepseek4MoeMaxTopk) {
+            err = "--dspark: the tower top-k is outside the kernel's bound";
+            return false;
+        }
+        if (geo.mtp_markov_rank == 0) { err = "--dspark: markov_rank is zero"; return false; }
+        mtp_towers_ = static_cast<uint32_t>(geo.mtp_tower_count);
+        mtp_experts_ = static_cast<uint32_t>(geo.mtp_expert_count);
+        mtp_used_ = static_cast<uint32_t>(geo.mtp_expert_used_count);
+        mtp_block_ = static_cast<uint32_t>(geo.mtp_block_size);
+        mtp_noise_ = static_cast<uint32_t>(geo.mtp_noise_token_id);
+        mtp_rank_ = static_cast<uint32_t>(geo.mtp_markov_rank);
+        mtp_n_target_ = mtp_towers_;
+        for (uint32_t il = 0; il < 64; ++il) mtp_slot_[il] = -1;
+        for (uint32_t T = 0; T < mtp_towers_; ++T) {
+            const uint64_t tl = geo.mtp_target_layers[T];
+            if (tl >= nlayers_) { err = "--dspark: an mtp target layer is not a block"; return false; }
+            mtp_slot_[tl] = static_cast<int>(T);
+        }
+        cap2_ = mtp_block_ + 1;   // the verify batch runs up to 1+block rows
+        if (cap2_ > ctx_) { err = "--dspark: the verify batch is wider than the context"; return false; }
+        if (cap2_ > cap_) cap_ = cap2_;   // every per-block buffer must hold the verify batch
+        if (cap_ > ctx_) cap_ = ctx_;
+        mtp_on_ = true;
+    }
+    prod_cap_ = std::max(cap_, SWA_);
+
     std::fprintf(stderr,
                  "[v41] model: %u layers, E %u, V %u, H %u x HD %u, Q %u, OL %u x NG %u, experts %u top %u FF %u,\n"
                  "      HC %u sinkhorn %u, indexer %u x %u top %" PRIu64 ", sources",
@@ -663,6 +776,12 @@ bool Runner::load_weights(std::string& err) {
     for (uint32_t il = 0; il < nlayers_; ++il)
         if (!load_blob(il, err)) return false;
 
+    // DSpark (opt-in): the three towers, then the draft state.  Both read the geometry open() validated.
+    if (opt_.dspark) {
+        if (!load_towers(err)) return false;
+        if (!draft_alloc(err)) return false;
+    }
+
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
     std::fprintf(stderr, "[v41] weights resident; device %.1f GiB used, %.1f GiB free\n",
@@ -671,49 +790,61 @@ bool Runner::load_weights(std::string& err) {
 }
 
 bool Runner::load_blob(uint32_t il, std::string& err) {
-    const TensorInfo* t = gguf_->find("blk." + std::to_string(il) + ".ffn_exps_vq.blob");
-    if (t == nullptr) { err = "missing expert blob at layer " + std::to_string(il); return false; }
-    Blob& b = blob_[il];
+    return load_blob_named("blk." + std::to_string(il) + ".ffn_exps_vq.blob", false, err, blob_[il]);
+}
+
+// One expert container: the main layer's or a tower's (the same format, a different expert count).  Container
+// versions 2 (each payload carries its own codebook, payload magic DQVQ) and 3 (one shared codebook behind the
+// slot table, payload magic DQV3) are both accepted, mirroring the parser's own contract.
+bool Runner::load_blob_named(const std::string& name, bool tower, std::string& err, Blob& b) {
+    const TensorInfo* t = gguf_->find(name);
+    if (t == nullptr) { err = "missing expert blob '" + name + "'"; return false; }
+    b = Blob{};
     b.abs = gguf_->data_start() + t->offset;
     b.size = d4::payload_bytes(*t);
-    if (b.size == 0) { err = "layer " + std::to_string(il) + ": the expert blob has no payload size"; return false; }
+    if (b.size == 0) { err = "'" + name + "': the expert blob has no payload size"; return false; }
     uint8_t hdr[16];
     if (!parts_.read(b.abs, hdr, sizeof hdr, err)) return false;
-    if (rd32(hdr) != d4::kBlobMagic || rd32(hdr + 4) != 3) {
-        err = "layer " + std::to_string(il) + ": expert blob header unreadable in " + parts_.where(b.abs) +
+    b.ver = rd32(hdr + 4);
+    if (rd32(hdr) != d4::kBlobMagic || b.ver < 2 || b.ver > 3) {
+        err = "'" + name + "': expert blob header unreadable in " + parts_.where(b.abs) +
               " (a hole in the download reads as zeros)";
         return false;
     }
     b.experts = rd32(hdr + 12);
-    if (b.experts != NE_) { err = "layer " + std::to_string(il) + ": blob carries a different expert count"; return false; }
+    const uint32_t expect_experts = tower ? mtp_experts_ : NE_;
+    if (b.experts != expect_experts) {
+        err = "'" + name + "': blob carries " + std::to_string(b.experts) + " experts, expected " +
+              std::to_string(expect_experts);
+        return false;
+    }
 
     b.slot.resize(static_cast<size_t>(b.experts) * 3);
     std::vector<uint8_t> table(static_cast<size_t>(b.experts) * 24);
     if (!parts_.read(b.abs + 16, table.data(), table.size(), err)) return false;
     for (size_t i = 0; i < b.slot.size(); ++i) b.slot[i] = rd64(table.data() + i * 8);
 
-    // Payload metadata from the first present slot (the container shares one codebook).
+    // Payload metadata from the first present slot (a v3 container shares one codebook).
     uint64_t first = 0;
     for (size_t i = 0; i < b.slot.size(); ++i)
         if (b.slot[i] != 0) { first = b.slot[i]; break; }
-    if (first == 0) { err = "layer " + std::to_string(il) + ": no expert payloads"; return false; }
+    if (first == 0) { err = "'" + name + "': no expert payloads"; return false; }
     uint8_t ph[32];
     if (!parts_.read(b.abs + first, ph, sizeof ph, err)) return false;
-    if (rd32(ph) != d4::kMatV3Magic) {
-        err = "layer " + std::to_string(il) + ": first expert payload header unreadable in " + parts_.where(b.abs + first);
+    const uint32_t magic = rd32(ph);
+    b.v3 = magic == d4::kMatV3Magic;
+    if (!b.v3 && magic != d4::kMatV2Magic) {
+        err = "'" + name + "': first expert payload header unreadable in " + parts_.where(b.abs + first);
         return false;
     }
+    if (b.v3 != (b.ver == 3)) { err = "'" + name + "': container version and payload magic disagree"; return false; }
     b.nc = static_cast<uint32_t>(ph[6]) | (static_cast<uint32_t>(ph[7]) << 8);
-    b.cb_off = rd64(ph + 24);
-    b.cb_len = static_cast<uint64_t>(b.nc) * 8;
-    const uint64_t expect_cb = 16 + static_cast<uint64_t>(b.experts) * 24;
-    if (b.cb_off != expect_cb) {
-        err = "layer " + std::to_string(il) + ": codebook offset is not the container's";
-        return false;
-    }
-    if (b.cb_off + b.cb_len > b.size) {
-        err = "layer " + std::to_string(il) + ": codebook outside the blob";
-        return false;
+    if (b.v3) {
+        b.cb_off = rd64(ph + 24);
+        b.cb_len = static_cast<uint64_t>(b.nc) * 8;
+        const uint64_t expect_cb = 16 + static_cast<uint64_t>(b.experts) * 24;
+        if (b.cb_off != expect_cb) { err = "'" + name + "': codebook offset is not the container's"; return false; }
+        if (b.cb_off + b.cb_len > b.size) { err = "'" + name + "': codebook outside the blob"; return false; }
     }
 
     // The packed slot spans: the next greater slot offset, or the container end for the last.
@@ -728,14 +859,17 @@ bool Runner::load_blob(uint32_t il, std::string& err) {
         if (s == 0) continue;
         const auto it = std::upper_bound(offs.begin(), offs.end(), s);
         const uint64_t end = it == offs.end() ? b.size : *it;
-        if (end <= s || end > b.size) { err = "layer " + std::to_string(il) + ": slot table is not packed"; return false; }
+        if (end <= s || end > b.size) { err = "'" + name + "': slot table is not packed"; return false; }
         b.span[i] = end - s;
     }
     return true;
 }
 
 bool Runner::stage_blob(uint32_t il, const int32_t* sel, uint32_t n_pairs, std::string& err) {
-    const Blob& b = blob_[il];
+    return stage_blob_b(blob_[il], il, sel, n_pairs, err);
+}
+
+bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, uint32_t n_pairs, std::string& err) {
     std::vector<bool> used(b.experts, false);
     for (uint32_t i = 0; i < n_pairs; ++i) {
         const int32_t e = sel[i];
@@ -757,10 +891,10 @@ bool Runner::stage_blob(uint32_t il, const int32_t* sel, uint32_t n_pairs, std::
     uint8_t* p = stage_.data();
     std::memset(p, 0, static_cast<size_t>(table_end));
     wr32(p, d4::kBlobMagic);
-    wr32(p + 4, 3);
-    wr32(p + 8, il);
+    wr32(p + 4, b.ver);
+    wr32(p + 8, layer_id);
     wr32(p + 12, b.experts);
-    if (!parts_.read(b.abs + b.cb_off, p + table_end, b.cb_len, err)) return false;
+    if (b.cb_len != 0 && !parts_.read(b.abs + b.cb_off, p + table_end, b.cb_len, err)) return false;
 
     uint64_t cur = table_end + b.cb_len;
     uint32_t holes = 0;
@@ -781,7 +915,7 @@ bool Runner::stage_blob(uint32_t il, const int32_t* sel, uint32_t n_pairs, std::
     }
     if (holes != 0)
         std::fprintf(stderr, "[v41] L%02u: %u of %u selected expert payloads are unreadable (a holey part); "
-                             "the kernel skips them\n", il, holes, static_cast<uint32_t>(uniq_.size()) * 3u);
+                             "the kernel skips them\n", layer_id, holes, static_cast<uint32_t>(uniq_.size()) * 3u);
     if (cur > blob_dcap_) {
         if (blob_dev_ != nullptr) cudaFree(blob_dev_);
         blob_dev_ = dev(cur, "expert container");
@@ -848,6 +982,564 @@ bool Runner::load_engram(std::string& err) {
     engram_on_ = true;
     std::fprintf(stderr, "[v41] engram: %zu table(s), cols %u, head dim %u, in %u out %u\n", layers, eng_cols_,
                  eng_hd_, eng_in_dim_, eng_out_dim_);
+    return true;
+}
+
+// ---- DSpark (P5): the draft towers, the verify batch and its rollback -----------------------------------------
+
+bool Runner::load_towers(std::string& err) {
+    auto any = [&](const std::string& name, std::initializer_list<uint32_t> types) -> void* {
+        const TensorInfo* t = gguf_->find(name);
+        if (t == nullptr) { last_error = "missing tensor '" + name + "'"; return nullptr; }
+        bool ok = false;
+        for (uint32_t ty : types) ok = ok || t->type == ty;
+        if (!ok) {
+            last_error = "tensor '" + name + "' is type " + std::to_string(t->type) + " (an accepted type is f32/bf16)";
+            return nullptr;
+        }
+        return load_tensor(name, t->type, name.c_str());
+    };
+    mtp_main_proj_ = any("mtp.main_proj.weight", {kFp8});
+    mtp_main_norm_ = any("mtp.main_norm.weight", {kF32});
+    mtp_markov_embd_ = any("mtp.markov_embd.weight", {kBF16});
+    mtp_markov_head_ = any("mtp.markov_head.weight", {kBF16});
+    mtp_conf_ = any("mtp.confidence.weight", {kBF16, kF32});
+    if (mtp_conf_ != nullptr) {
+        const TensorInfo* ct = gguf_->find("mtp.confidence.weight");
+        mtp_conf_f32_ = ct != nullptr && ct->type == kF32;
+    }
+    mtp_out_norm_ = any("mtp.out_norm.weight", {kF32});
+    if (!mtp_main_proj_ || !mtp_main_norm_ || !mtp_markov_embd_ || !mtp_markov_head_ || !mtp_conf_ ||
+        !mtp_out_norm_) {
+        err = "DSpark: " + last_error;
+        return false;
+    }
+    for (uint32_t T = 0; T < mtp_towers_; ++T) {
+        const std::string p = "mtp." + std::to_string(T) + ".";
+        LayerW& l = TW_[T];
+        auto need = [&](const char* suffix, uint32_t type) -> void* {
+            void* w = load_tensor(p + suffix, type, suffix);
+            if (w == nullptr) std::fprintf(stderr, "  tower %u: %s\n", T, last_error.c_str());
+            return w;
+        };
+        l.hc_attn_fn = need("hc_attn_fn.weight", kF32);
+        l.hc_attn_scale = need("hc_attn_scale.weight", kF32);
+        l.hc_attn_base = need("hc_attn_base.weight", kF32);
+        l.attn_norm = need("attn_norm.weight", kF32);
+        l.q_a = need("attn_q_a.weight", kFp8);
+        l.q_a_norm = need("attn_q_a_norm.weight", kF32);
+        l.q_b = need("attn_q_b.weight", kFp8);
+        l.kv = need("attn_kv.weight", kFp8);
+        l.kv_a_norm = need("attn_kv_a_norm.weight", kF32);
+        l.sinks = need("attn_sinks.weight", kF32);
+        l.out_a = need("attn_output_a.weight", kFp8);
+        l.out_b = need("attn_output_b.weight", kFp8);
+        l.hc_ffn_fn = need("hc_ffn_fn.weight", kF32);
+        l.hc_ffn_scale = need("hc_ffn_scale.weight", kF32);
+        l.hc_ffn_base = need("hc_ffn_base.weight", kF32);
+        l.ffn_norm = need("ffn_norm.weight", kF32);
+        l.exp_bias = need("exp_probs_b.bias", kF32);
+        l.shexp_gate = need("ffn_gate_shexp.weight", kFp8);
+        l.shexp_up = need("ffn_up_shexp.weight", kFp8);
+        l.shexp_down = need("ffn_down_shexp.weight", kFp8);
+        // The router gate is bf16 in this artifact; the reference also accepts an f32 registration.
+        const TensorInfo* gt = gguf_->find(p + "ffn_gate_inp.weight");
+        if (gt == nullptr || (gt->type != kBF16 && gt->type != kF32)) {
+            err = "tower " + std::to_string(T) + ": ffn_gate_inp.weight is missing or neither bf16 nor f32";
+            return false;
+        }
+        tw_gate_f32_[T] = gt->type == kF32;
+        l.gate_inp = need("ffn_gate_inp.weight", gt->type);
+        if (!l.hc_attn_fn || !l.hc_attn_scale || !l.hc_attn_base || !l.attn_norm || !l.q_a || !l.q_a_norm ||
+            !l.q_b || !l.kv || !l.kv_a_norm || !l.sinks || !l.out_a || !l.out_b || !l.hc_ffn_fn ||
+            !l.hc_ffn_scale || !l.hc_ffn_base || !l.ffn_norm || !l.gate_inp || !l.exp_bias || !l.shexp_gate ||
+            !l.shexp_up || !l.shexp_down) {
+            err = "tower " + std::to_string(T) + ": " + last_error;
+            return false;
+        }
+        if (!load_blob_named(p + "ffn_exps_vq.blob", true, err, tblob_[T])) return false;
+    }
+    std::fprintf(stderr,
+                 "[v41] DSpark: %u tower(s) x %u experts top-%u, block %u, markov rank %u, noise %u, targets",
+                 mtp_towers_, mtp_experts_, mtp_used_, mtp_block_, mtp_rank_, mtp_noise_);
+    for (uint32_t T = 0; T < mtp_towers_; ++T) {
+        for (uint32_t il = 0; il < nlayers_; ++il)
+            if (mtp_slot_[il] == static_cast<int>(T)) std::fprintf(stderr, " L%02u", il);
+    }
+    std::fprintf(stderr, "\n");
+    return true;
+}
+
+// The tower state and the draft round's buffers.  cap2_ = block + 1 is the verify batch's widest row count (the
+// reference's `cap`); prod_cap_ = max(cap_, SWA_) is what the window top-up needs (up to SWA rows at once).
+bool Runner::draft_alloc(std::string& err) {
+    const uint64_t cap2 = cap2_, prod = prod_cap_, R = mtp_rank_;
+    auto dv = [&](uint64_t bytes, const char* what) -> void* {
+        void* p = dev(bytes, what);
+        if (p == nullptr) err = last_error;
+        return p;
+    };
+    // The hidden states and the hc block.
+    t_tok_ = static_cast<int32_t*>(dv(cap2 * 4, "draft tokens"));
+    t_pos_ = static_cast<int32_t*>(dv(prod * 4, "draft positions"));
+    t_premix_ = static_cast<float*>(dv(cap2 * HC_ * 4, "draft pre_mix"));
+    t_pre_ = static_cast<float*>(dv(cap2 * HC_ * 4, "draft pre"));
+    t_hc_ = static_cast<float*>(dv(cap2 * HC_ * E_ * 4, "draft hc"));
+    t_hc2_ = static_cast<float*>(dv(cap2 * HC_ * E_ * 4, "draft hc2"));
+    t_mix_ = static_cast<float*>(dv(cap2 * (2u * HC_ + HC_ * HC_) * 4, "draft mix"));
+    t_post_ = static_cast<float*>(dv(cap2 * HC_ * 4, "draft post"));
+    t_comb_ = static_cast<float*>(dv(cap2 * HC_ * HC_ * 4, "draft comb"));
+    t_x_ = static_cast<float*>(dv(cap2 * E_ * 4, "draft x"));
+    t_xn_ = static_cast<float*>(dv(cap2 * E_ * 4, "draft xn"));
+    // The tower's attention path.  The kv pair holds the block's rows in tower_attn and the fill's window rows
+    // (up to SWA at a time), so it carries the wider of the two.
+    t_qr_ = static_cast<float*>(dv(cap2 * Q_ * 4, "draft qr"));
+    t_qrn_ = static_cast<float*>(dv(cap2 * Q_ * 4, "draft qrn"));
+    t_q_ = static_cast<float*>(dv(cap2 * H_ * HD_ * 4, "draft q"));
+    t_kv_ = static_cast<float*>(dv(prod * HD_ * 4, "draft kv"));
+    t_kvn_ = static_cast<float*>(dv(prod * HD_ * 4, "draft kvn"));
+    t_o_ = static_cast<float*>(dv(cap2 * H_ * HD_ * 4, "draft o"));
+    t_low_ = static_cast<float*>(dv(cap2 * NG_ * OL_ * 4, "draft low"));
+    t_attn_ = static_cast<float*>(dv(cap2 * E_ * 4, "draft attn_out"));
+    // The tower's MoE.
+    t_glog_ = static_cast<float*>(dv(cap2 * mtp_experts_ * 4, "tower router logits"));
+    t_sel_ = static_cast<int32_t*>(dv(cap2 * mtp_used_ * 4, "tower router sel"));
+    t_rw_ = static_cast<float*>(dv(cap2 * mtp_used_ * 4, "tower router w"));
+    t_partial_ = static_cast<float*>(dv(cap2 * mtp_used_ * E_ * 4, "tower moe partial"));
+    t_routed_ = static_cast<float*>(dv(cap2 * E_ * 4, "tower routed"));
+    t_sg_ = static_cast<float*>(dv(cap2 * FF_ * 4, "tower shared gate"));
+    t_su_ = static_cast<float*>(dv(cap2 * FF_ * 4, "tower shared up"));
+    t_sh_ = static_cast<float*>(dv(cap2 * FF_ * 4, "tower shared h"));
+    t_so_ = static_cast<float*>(dv(cap2 * E_ * 4, "tower shared out"));
+    t_y_ = static_cast<float*>(dv(cap2 * E_ * 4, "tower y"));
+    // The draft block's exits.
+    t_logits_ = static_cast<float*>(dv(cap2 * V_ * 4, "draft logits"));
+    vlogits_ = static_cast<float*>(dv(cap2 * V_ * 4, "verify logits"));
+    t_mk_embed_ = static_cast<float*>(dv(cap2 * R * 4, "markov embed"));
+    t_mk_cur_ = static_cast<float*>(dv(R * 4, "markov cur"));
+    t_mk_bias_ = static_cast<float*>(dv(uint64_t(V_) * 4, "markov bias"));
+    t_conf_in_ = static_cast<float*>(dv(cap2 * (E_ + R) * 4, "confidence in"));
+    t_conf_ = static_cast<float*>(dv(cap2 * 4, "confidence"));
+    t_ids_ = static_cast<int32_t*>(dv(cap2 * 4, "draft ids"));
+    t_ids_next_ = static_cast<int32_t*>(dv(16, "draft ids next"));
+    t_want_ = static_cast<int32_t*>(dv(cap2 * 4, "verify picks"));
+    // The bf16 activation copy every fp8 matmul with n > 1 reads.  Its widest user is the fill's main_proj
+    // (SWA rows x n_target*E); the block's widest is out_a's H*HD input.
+    uint64_t t16 = uint64_t(SWA_) * mtp_n_target_ * E_;
+    const uint64_t block16 = uint64_t(cap2) * H_ * HD_;
+    if (block16 > t16) t16 = block16;
+    const uint64_t e16 = uint64_t(cap2) * E_;
+    if (e16 > t16) t16 = e16;
+    t_x16_ = static_cast<uint16_t*>(dv(t16 * 2, "draft x bf16"));
+    // The main-hidden ring and the fill's staging.
+    mainh_cap_ = SWA_;
+    mainh_ = static_cast<float*>(dv(uint64_t(mainh_cap_) * mtp_n_target_ * E_ * 4, "main hidden ring"));
+    t_mainh_lin_ = static_cast<float*>(dv(uint64_t(SWA_) * mtp_n_target_ * E_ * 4, "main hidden rows"));
+    t_mainx_raw_ = static_cast<float*>(dv(prod * E_ * 4, "main x raw"));
+    t_main_x_ = static_cast<float*>(dv(prod * E_ * 4, "main x"));
+    t_wintmp_ = static_cast<float*>(dv(uint64_t(SWA_) * HD_ * 4, "tower window shift"));
+    twin_.assign(mtp_towers_, nullptr);
+    for (uint32_t T = 0; T < mtp_towers_; ++T) {
+        twin_[T] = static_cast<float*>(dv(uint64_t(SWA_ + prod) * HD_ * 4, "tower window"));
+        // The reference zeroes its windows: below the window the linear segment's leftmost cells are never
+        // written, and the attention must not read cudaMalloc's leftovers.
+        if (twin_[T] != nullptr) cudaMemset(twin_[T], 0, static_cast<size_t>(uint64_t(SWA_ + prod) * HD_ * 4));
+    }
+    // The verify batch's snapshot.
+    snap_win_ = static_cast<float*>(dv(uint64_t(nlayers_) * cap2 * HD_ * 4, "spec window snapshot"));
+    for (uint32_t il = 0; il < nlayers_; ++il) {
+        if (!is_kv_src_[il]) continue;
+        const uint32_t ratio = static_cast<uint32_t>(geo.compress_ratios[il]);
+        if (ratio <= 1) continue;
+        snap_cpre_kv_[il] = static_cast<float*>(dv(uint64_t(ratio + cap2) * HD_ * 4, "spec pending kv"));
+        snap_cpre_sc_[il] = static_cast<float*>(dv(uint64_t(ratio + cap2) * HD_ * 4, "spec pending score"));
+        if (snap_cpre_kv_[il] == nullptr || snap_cpre_sc_[il] == nullptr) return false;
+    }
+    if (err.empty() == false) return false;
+    // Host slots.
+    t_tok_host_.assign(cap2, 0);
+    t_bpos_host_.assign(cap2, 0);
+    t_wpos_host_.assign(SWA_, 0);
+    t_want_host_.assign(cap2, 0);
+    t_id_host_.assign(cap2, 0);
+    t_conf_host_.assign(cap2, 0.f);
+    if (sel_host_.size() < cap2 * mtp_used_) sel_host_.resize(static_cast<size_t>(cap2) * mtp_used_);
+    std::fprintf(stderr, "[v41] DSpark state: batch cap %u, window cap %u, ring %u x %u x %u\n", cap2_,
+                 static_cast<unsigned>(prod), mainh_cap_, mtp_n_target_, E_);
+    return true;
+}
+
+bool Runner::tower_half(uint32_t T, bool attn_half, std::string& err) {
+    const LayerW& l = TW_[T];
+    const float* fn = static_cast<const float*>(attn_half ? l.hc_attn_fn : l.hc_ffn_fn);
+    const float* sc = static_cast<const float*>(attn_half ? l.hc_attn_scale : l.hc_ffn_scale);
+    const float* bs = static_cast<const float*>(attn_half ? l.hc_attn_base : l.hc_ffn_base);
+    const float* nm = static_cast<const float*>(attn_half ? l.attn_norm : l.ffn_norm);
+    if (!k::deepseek4_hc_mix(fn, t_hc_, t_mix_, E_, HC_, cur_n_, rms_eps_, stream_)) {
+        err = "tower hc_mix failed";
+        return false;
+    }
+    if (!k::deepseek4_hc_fused(t_mix_, sc, bs, t_premix_, t_hc_, nm, t_pre_, t_post_, t_comb_, t_x_, t_xn_, E_, HC_,
+                               sinkhorn_, hc_eps_, rms_eps_, cur_n_, stream_)) {
+        err = "tower hc_fused failed";
+        return false;
+    }
+    std::swap(t_pre_, t_premix_);
+    return true;
+}
+
+bool Runner::tower_attn(uint32_t T, std::string& err) {
+    const LayerW& l = TW_[T];
+    const uint32_t n = cur_n_;
+    const uint16_t* x16 = n > 1 ? t_x16_ : nullptr;
+    const float theta = theta_of(0);
+    const uint32_t osl = osl_of(0);
+    const uint32_t grp = H_ / NG_;
+    // The reference's v41_draft_attention: q_a -> norm -> q_b -> rope, kv -> norm -> rope -> fp8 grid -> the
+    // linear window's block region, the full-block attention, then the inverse rope and the grouped output.
+    if ((n > 1 && !k::deepseek4_engram_x_to_bf16(t_xn_, t_x16_, uint64_t(n) * E_, stream_)) ||
+        !k::deepseek4_matmul_fp8(t_qr_, static_cast<const uint8_t*>(l.q_a), t_xn_, x16, E_, Q_, n, true, stream_) ||
+        !k::deepseek4_rms_norm(t_qrn_, t_qr_, static_cast<const float*>(l.q_a_norm), Q_, n, rms_eps_, stream_)) {
+        err = "tower q_a path failed";
+        return false;
+    }
+    if ((n > 1 && !k::deepseek4_engram_x_to_bf16(t_qrn_, t_x16_, uint64_t(n) * Q_, stream_)) ||
+        !k::deepseek4_matmul_fp8(t_q_, static_cast<const uint8_t*>(l.q_b), t_qrn_, x16, Q_,
+                                 uint64_t(H_) * HD_, n, true, stream_) ||
+        !k::deepseek4_rope(t_q_, t_pos_, n, H_, HD_, nrot_, theta, osl, rope_factor_, beta_fast_, beta_slow_,
+                           false, stream_)) {
+        err = "tower q_b/rope failed";
+        return false;
+    }
+    if ((n > 1 && !k::deepseek4_engram_x_to_bf16(t_xn_, t_x16_, uint64_t(n) * E_, stream_)) ||
+        !k::deepseek4_matmul_fp8(t_kv_, static_cast<const uint8_t*>(l.kv), t_xn_, x16, E_, HD_, n, true,
+                                 stream_) ||
+        !k::deepseek4_rms_norm(t_kvn_, t_kv_, static_cast<const float*>(l.kv_a_norm), HD_, n, rms_eps_,
+                               stream_) ||
+        !k::deepseek4_rope(t_kvn_, t_pos_, n, 1, HD_, nrot_, theta, osl, rope_factor_, beta_fast_, beta_slow_,
+                           false, stream_) ||
+        !k::deepseek4_act_quant(t_kvn_, n, HD_, 32, k::kDeepseek4QuantFp8E8m0, stream_)) {
+        err = "tower kv path failed";
+        return false;
+    }
+    cudaError_t ce = cudaMemcpyAsync(twin_[T] + uint64_t(SWA_) * HD_, t_kvn_, uint64_t(n) * HD_ * 4,
+                                     cudaMemcpyDeviceToDevice, stream_);
+    if (ce != cudaSuccess) { err = std::string("tower window append: ") + cudaGetErrorString(ce); return false; }
+    const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(HD_)));
+    // full_block = n: every position of the block sees the whole block (the API takes the length where the
+    // reference flag means n_tok); ring = false: this window is the linear segment push_main maintains.
+    if (!k::deepseek4_sparse_attn(t_o_, t_q_, twin_[T], nullptr, nullptr, static_cast<const float*>(l.sinks), n,
+                                  cur_pos0_, SWA_, 0, 0, H_, HD_, scale, n, false, 0, stream_)) {
+        err = "tower sparse attention failed";
+        return false;
+    }
+    if (!k::deepseek4_rope(t_o_, t_pos_, n, H_, HD_, nrot_, theta, osl, rope_factor_, beta_fast_, beta_slow_, true,
+                           stream_)) {
+        err = "tower inverse rope failed";
+        return false;
+    }
+    if ((n > 1 && !k::deepseek4_engram_x_to_bf16(t_o_, t_x16_, uint64_t(n) * H_ * HD_, stream_)) ||
+        !k::deepseek4_matmul_fp8_grouped(t_low_, static_cast<const uint8_t*>(l.out_a), t_o_, x16, NG_,
+                                         uint64_t(grp) * HD_, OL_, n, true, stream_)) {
+        err = "tower attn_output_a failed";
+        return false;
+    }
+    if ((n > 1 && !k::deepseek4_engram_x_to_bf16(t_low_, t_x16_, uint64_t(n) * NG_ * OL_, stream_)) ||
+        !k::deepseek4_matmul_fp8(t_attn_, static_cast<const uint8_t*>(l.out_b), t_low_, x16, uint64_t(NG_) * OL_,
+                                 E_, n, true, stream_)) {
+        err = "tower attn_output_b failed";
+        return false;
+    }
+    return true;
+}
+
+bool Runner::tower_moe(uint32_t T, std::string& err) {
+    const LayerW& l = TW_[T];
+    const uint32_t n = cur_n_;
+    const uint16_t* x16 = n > 1 ? t_x16_ : nullptr;
+    // The reference's v41_moe with st->draft set: shared expert, then the 128-expert router and the routed VQ
+    // experts, and never the decode tail arm (`!st->draft && n <= 8` is false for a tower).
+    if ((n > 1 && !k::deepseek4_engram_x_to_bf16(t_xn_, t_x16_, uint64_t(n) * E_, stream_)) ||
+        !k::deepseek4_matmul_fp8(t_sg_, static_cast<const uint8_t*>(l.shexp_gate), t_xn_, x16, E_, FF_, n, true,
+                                 stream_) ||
+        !k::deepseek4_matmul_fp8(t_su_, static_cast<const uint8_t*>(l.shexp_up), t_xn_, x16, E_, FF_, n, true,
+                                 stream_) ||
+        !k::deepseek4_swiglu(t_sh_, t_sg_, t_su_, uint64_t(n) * FF_, clamp_, stream_)) {
+        err = "tower shared expert failed";
+        return false;
+    }
+    if ((n > 1 && !k::deepseek4_engram_x_to_bf16(t_sh_, t_x16_, uint64_t(n) * FF_, stream_)) ||
+        !k::deepseek4_matmul_fp8(t_so_, static_cast<const uint8_t*>(l.shexp_down), t_sh_, x16, FF_, E_, n, true,
+                                 stream_)) {
+        err = "tower shared down failed";
+        return false;
+    }
+    // Router gate: the registered type decides f32 vs bf16 (the reference's v41_small_matmul rule).
+    const bool gate_ok = tw_gate_f32_[T]
+                             ? k::deepseek4_matmul_f32(t_glog_, static_cast<const float*>(l.gate_inp), t_xn_, E_,
+                                                       mtp_experts_, n, false, stream_)
+                             : k::deepseek4_matmul_bf16(t_glog_, static_cast<const uint16_t*>(l.gate_inp), t_xn_,
+                                                        E_, mtp_experts_, n, false, stream_);
+    if (!gate_ok) { err = "tower router gate failed"; return false; }
+    if (!k::deepseek4_router(t_sel_, t_rw_, t_glog_, static_cast<const float*>(l.exp_bias), nullptr, nullptr, n,
+                             mtp_experts_, mtp_used_, route_scale_, stream_)) {
+        err = "tower deepseek4_router failed";
+        return false;
+    }
+    cudaError_t ce = cudaMemcpyAsync(sel_host_.data(), t_sel_, uint64_t(n) * mtp_used_ * 4, cudaMemcpyDeviceToHost,
+                                     stream_);
+    if (ce != cudaSuccess) { err = std::string("tower selection readback: ") + cudaGetErrorString(ce); return false; }
+    if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "tower selection readback sync failed"; return false; }
+    if (!stage_blob_b(tblob_[T], T, sel_host_.data(), n * mtp_used_, err)) return false;
+    if (!k::deepseek4_routed_moe(t_y_, t_partial_, blob_dev_, stage_used_, E_, FF_, E_, t_sel_, t_rw_, mtp_used_,
+                                 clamp_, t_xn_, n, tblob_[T].nc, tblob_[T].v3 ? 1u : 0u, nullptr, stream_)) {
+        err = "tower deepseek4_routed_moe failed";
+        return false;
+    }
+    if (!k::deepseek4_add(t_y_, t_so_, uint64_t(n) * E_, stream_) ||
+        !k::deepseek4_round_bf16(t_y_, uint64_t(n) * E_, stream_)) {
+        err = "tower moe add/round failed";
+        return false;
+    }
+    return true;
+}
+
+bool Runner::tower_layer(uint32_t T, std::string& err) {
+    if (!tower_half(T, true, err)) return false;
+    if (!tower_attn(T, err)) return false;
+    if (!k::deepseek4_hc_post(t_attn_, t_hc_, t_post_, t_comb_, t_hc2_, E_, HC_, cur_n_, stream_)) {
+        err = "tower hc_post (attn) failed";
+        return false;
+    }
+    std::swap(t_hc_, t_hc2_);
+    if (!tower_half(T, false, err)) return false;
+    if (!tower_moe(T, err)) return false;
+    if (!k::deepseek4_hc_post(t_y_, t_hc_, t_post_, t_comb_, t_hc2_, E_, HC_, cur_n_, stream_)) {
+        err = "tower hc_post (ffn) failed";
+        return false;
+    }
+    std::swap(t_hc_, t_hc2_);
+    return true;
+}
+
+// One draft block forward (the reference's v41_draft_block): the hills of the three towers, the borrowed head,
+// the per-position markov greedy chain and the confidence head.  ids[0] is the real token; ids[1..B] come out of
+// the chain.  All host reads happen in one sync at the end.
+bool Runner::draft_block(uint32_t pos0, std::string& err) {
+    const uint32_t B = mtp_block_;
+    cur_n_ = B;
+    cur_pos0_ = pos0;
+    for (uint32_t i = 0; i < B; ++i) t_bpos_host_[i] = static_cast<int32_t>(pos0 + i);
+    for (uint32_t i = 0; i < B; ++i)
+        for (uint32_t c = 0; c < HC_; ++c)
+            pm_host_[static_cast<size_t>(i) * HC_ + c] = (c == 0) ? 1.0f : 0.0f;
+    cudaError_t ce = cudaMemcpyAsync(t_tok_, t_tok_host_.data(), uint64_t(B) * 4, cudaMemcpyHostToDevice, stream_);
+    if (ce == cudaSuccess)
+        ce = cudaMemcpyAsync(t_pos_, t_bpos_host_.data(), uint64_t(B) * 4, cudaMemcpyHostToDevice, stream_);
+    if (ce == cudaSuccess)
+        ce = cudaMemcpyAsync(t_premix_, pm_host_.data(), uint64_t(B) * HC_ * 4, cudaMemcpyHostToDevice, stream_);
+    // Only ids[0] is a host input: the chain writes ids[i+1] from row i's argmax on the device.
+    if (ce == cudaSuccess)
+        ce = cudaMemcpyAsync(t_ids_, t_tok_host_.data(), 4, cudaMemcpyHostToDevice, stream_);
+    if (ce != cudaSuccess) { err = std::string("draft block inputs: ") + cudaGetErrorString(ce); return false; }
+    if (!k::deepseek4_embed_q4k(t_x_, t_tok_, tok_embd_, V_, B, E_, stream_) ||
+        !k::deepseek4_expand_hc(t_hc_, t_x_, E_, HC_, B, stream_)) {
+        err = "draft embed/expand failed";
+        return false;
+    }
+    for (uint32_t T = 0; T < mtp_towers_; ++T)
+        if (!tower_layer(T, err)) return false;
+    // Exit: mtp.out_norm over the last half's hc_pre, then the main model's own output matrix.
+    if (!k::deepseek4_hc_pre(t_hc_, t_premix_, static_cast<const float*>(mtp_out_norm_), t_x_, t_xn_, E_, HC_,
+                             rms_eps_, B, stream_)) {
+        err = "draft exit hc_pre failed";
+        return false;
+    }
+    if (!k::deepseek4_matmul_q4k(t_logits_, out_w_, t_xn_, E_, V_, B, false, stream_)) {
+        err = "draft head projection failed";
+        return false;
+    }
+    const uint16_t* mk = static_cast<const uint16_t*>(mtp_markov_embd_);
+    const uint16_t* mh = static_cast<const uint16_t*>(mtp_markov_head_);
+    for (uint32_t i = 0; i < B; ++i) {
+        // Row i's embedding feeds the confidence input; the same row goes through markov_head into row i's logits.
+        if (!k::deepseek4_row_gather_bf16(t_mk_embed_, mk, V_, mtp_rank_, t_ids_, i, i, stream_) ||
+            !k::deepseek4_row_gather_bf16(t_mk_cur_, mk, V_, mtp_rank_, t_ids_, i, 0, stream_) ||
+            !k::deepseek4_matmul_bf16(t_mk_bias_, mh, t_mk_cur_, mtp_rank_, V_, 1, false, stream_) ||
+            !k::deepseek4_row_add(t_logits_ + uint64_t(i) * V_, t_mk_bias_, V_, stream_) ||
+            !k::deepseek4_argmax(t_ids_next_, t_logits_ + uint64_t(i) * V_, V_, stream_)) {
+            err = "draft markov chain failed at row " + std::to_string(i);
+            return false;
+        }
+        ce = cudaMemcpyAsync(t_ids_ + i + 1, t_ids_next_, 4, cudaMemcpyDeviceToDevice, stream_);
+        if (ce != cudaSuccess) { err = std::string("draft ids copy: ") + cudaGetErrorString(ce); return false; }
+    }
+    // confidence = proj([h_i; markov_embed_i])
+    const uint64_t er = uint64_t(E_) + mtp_rank_;
+    for (uint32_t i = 0; i < B; ++i) {
+        ce = cudaMemcpyAsync(t_conf_in_ + uint64_t(i) * er, t_x_ + uint64_t(i) * E_, uint64_t(E_) * 4,
+                             cudaMemcpyDeviceToDevice, stream_);
+        if (ce == cudaSuccess)
+            ce = cudaMemcpyAsync(t_conf_in_ + uint64_t(i) * er + E_, t_mk_embed_ + uint64_t(i) * mtp_rank_,
+                                 uint64_t(mtp_rank_) * 4, cudaMemcpyDeviceToDevice, stream_);
+        if (ce != cudaSuccess) { err = std::string("confidence input copy: ") + cudaGetErrorString(ce); return false; }
+    }
+    const bool conf_ok =
+        mtp_conf_f32_ ? k::deepseek4_matmul_f32(t_conf_, static_cast<const float*>(mtp_conf_), t_conf_in_,
+                                                E_ + mtp_rank_, 1, B, false, stream_)
+                      : k::deepseek4_matmul_bf16(t_conf_, static_cast<const uint16_t*>(mtp_conf_), t_conf_in_,
+                                                 E_ + mtp_rank_, 1, B, false, stream_);
+    if (!conf_ok) {
+        err = "confidence projection failed";
+        return false;
+    }
+    ce = cudaMemcpyAsync(t_id_host_.data(), t_ids_, uint64_t(B + 1) * 4, cudaMemcpyDeviceToHost, stream_);
+    if (ce == cudaSuccess)
+        ce = cudaMemcpyAsync(t_conf_host_.data(), t_conf_, uint64_t(B) * 4, cudaMemcpyDeviceToHost, stream_);
+    if (ce != cudaSuccess) { err = std::string("draft readback: ") + cudaGetErrorString(ce); return false; }
+    if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "draft readback sync failed"; return false; }
+    return true;
+}
+
+// One draft round (the reference's v41_draft_launch, direct arm): top the tower windows up from the main-hidden
+// ring, then the block.  Returns 0 when the inputs are missing (the caller then verifies a single token).
+int Runner::draft_round(int32_t tok, uint32_t pos_main, std::string& err) {
+    if (!mtp_on_ || mainh_ == nullptr) return 0;
+    if (mainh_end_ != static_cast<int64_t>(pos_main)) {
+        std::fprintf(stderr,
+                     "[dspark] the main-hidden ring ends at %lld != pos_main %u, no draft this round\n",
+                     static_cast<long long>(mainh_end_), pos_main);
+        return 0;
+    }
+    // Top up (win_end_, pos_main]: rounds that sat out are all caught here; a gap wider than the window rebuilds it.
+    int64_t first = win_end_ + 1;
+    if (static_cast<int64_t>(pos_main) - first + 1 > static_cast<int64_t>(SWA_))
+        first = static_cast<int64_t>(pos_main) - static_cast<int64_t>(SWA_) + 1;
+    if (first < 0) first = 0;
+    const uint32_t rows = static_cast<uint32_t>(static_cast<int64_t>(pos_main) - first + 1);
+    if (rows) {
+        const int64_t avail_first = mainh_end_ - static_cast<int64_t>(mainh_n_) + 1;
+        if (first < avail_first) {
+            std::fprintf(stderr,
+                         "[dspark] the window needs %lld..%u, the ring's contiguous run starts at %lld (%u rows), "
+                         "no draft this round\n",
+                         static_cast<long long>(first), pos_main, static_cast<long long>(avail_first), mainh_n_);
+            return 0;
+        }
+    }
+    const uint32_t pos0 = pos_main + 1;
+    if (rows) {
+        for (uint32_t i = 0; i < rows; ++i) t_wpos_host_[i] = static_cast<int32_t>(first + i);
+        cudaError_t ce = cudaMemcpyAsync(t_pos_, t_wpos_host_.data(), uint64_t(rows) * 4, cudaMemcpyHostToDevice,
+                                         stream_);
+        if (ce != cudaSuccess) { err = std::string("fill positions: ") + cudaGetErrorString(ce); return -1; }
+        if (!k::deepseek4_ring_rows(t_mainh_lin_, mainh_, mtp_n_target_ * E_, mainh_cap_,
+                                    static_cast<uint32_t>(first % mainh_cap_), rows, stream_)) {
+            err = "the main-hidden ring rows failed";
+            return -1;
+        }
+        const uint16_t* x16 = rows > 1 ? t_x16_ : nullptr;
+        if ((rows > 1 && !k::deepseek4_engram_x_to_bf16(t_mainh_lin_, t_x16_,
+                                                        uint64_t(rows) * mtp_n_target_ * E_, stream_)) ||
+            !k::deepseek4_matmul_fp8(t_mainx_raw_, static_cast<const uint8_t*>(mtp_main_proj_), t_mainh_lin_, x16,
+                                     mtp_n_target_ * E_, E_, rows, true, stream_) ||
+            !k::deepseek4_rms_norm(t_main_x_, t_mainx_raw_, static_cast<const float*>(mtp_main_norm_), E_, rows,
+                                   rms_eps_, stream_)) {
+            err = "main_proj/main_norm failed";
+            return -1;
+        }
+        const float theta = theta_of(0);
+        const uint32_t osl = osl_of(0);
+        for (uint32_t T = 0; T < mtp_towers_; ++T) {
+            const LayerW& l = TW_[T];
+            const uint16_t* px16 = rows > 1 ? t_x16_ : nullptr;
+            if ((rows > 1 && !k::deepseek4_engram_x_to_bf16(t_main_x_, t_x16_, uint64_t(rows) * E_, stream_)) ||
+                !k::deepseek4_matmul_fp8(t_kv_, static_cast<const uint8_t*>(l.kv), t_main_x_, px16, E_, HD_, rows,
+                                         true, stream_) ||
+                !k::deepseek4_rms_norm(t_kvn_, t_kv_, static_cast<const float*>(l.kv_a_norm), HD_, rows, rms_eps_,
+                                       stream_) ||
+                !k::deepseek4_rope(t_kvn_, t_pos_, rows, 1, HD_, nrot_, theta, osl, rope_factor_, beta_fast_,
+                                   beta_slow_, false, stream_) ||
+                !k::deepseek4_act_quant(t_kvn_, rows, HD_, 32, k::kDeepseek4QuantFp8E8m0, stream_)) {
+                err = "tower window push projection failed";
+                return -1;
+            }
+            // The linear window stays right-aligned: new rows land at [SWA, SWA+rows), then the whole thing shifts
+            // left by rows (the reference's v41_draft_push_main).
+            ce = cudaMemcpyAsync(twin_[T] + uint64_t(SWA_) * HD_, t_kvn_, uint64_t(rows) * HD_ * 4,
+                                 cudaMemcpyDeviceToDevice, stream_);
+            if (ce == cudaSuccess)
+                ce = cudaMemcpyAsync(t_wintmp_, twin_[T] + uint64_t(rows) * HD_, uint64_t(SWA_) * HD_ * 4,
+                                     cudaMemcpyDeviceToDevice, stream_);
+            if (ce == cudaSuccess)
+                ce = cudaMemcpyAsync(twin_[T], t_wintmp_, uint64_t(SWA_) * HD_ * 4, cudaMemcpyDeviceToDevice,
+                                     stream_);
+            if (ce != cudaSuccess) { err = std::string("tower window shift: ") + cudaGetErrorString(ce); return -1; }
+        }
+    }
+    // The block input: the real token then noise, at positions pos0..pos0+B-1.
+    t_tok_host_[0] = tok;
+    for (uint32_t i = 1; i <= mtp_block_; ++i) t_tok_host_[i] = static_cast<int32_t>(mtp_noise_);
+    if (!draft_block(pos0, err)) return -1;
+    if (rows) win_end_ = pos_main;
+    return 1;
+}
+
+// The spec verify's snapshot (the reference's v41_spec_snapshot): only the ring cells the batch is about to
+// overwrite, per layer.  The compressor's pending rows are snapshotted inside compress_source, before its shift.
+bool Runner::spec_snapshot(uint32_t n, std::string& err) {
+    if (n == 0 || n > cap2_) { err = "spec snapshot batch " + std::to_string(n) + " over the cap"; return false; }
+    for (uint32_t il = 0; il < nlayers_; ++il) {
+        if (!k::deepseek4_win_ring_snap(win_[il], snap_win_ + uint64_t(il) * cap2_ * HD_, n_past_, 0, n, SWA_, HD_,
+                                        false, nullptr, stream_)) {
+            err = "spec window snapshot failed at L" + std::to_string(il);
+            return false;
+        }
+    }
+    snap_n_ = n;
+    snap_past_ = n_past_;
+    snap_on_ = true;
+    return true;
+}
+
+// keep = the accepted positions in this batch (the confirmed head included): restore the window cells the
+// rejected rows overwrote, rewind the group counts, and put the accepted tokens' compressor pending rows back.
+bool Runner::spec_rollback(uint32_t keep, std::string& err) {
+    if (!snap_on_) { err = "spec rollback without a snapshot"; return false; }
+    if (keep == 0 || keep > snap_n_) { err = "spec rollback keep outside the batch"; return false; }
+    const uint32_t pos0 = snap_past_, np = pos0 + keep;
+    for (uint32_t il = 0; il < nlayers_; ++il) {
+        if (keep < snap_n_ &&
+            !k::deepseek4_win_ring_snap(win_[il], snap_win_ + uint64_t(il) * cap2_ * HD_, pos0, keep, snap_n_, SWA_,
+                                        HD_, true, nullptr, stream_)) {
+            err = "spec window restore failed at L" + std::to_string(il);
+            return false;
+        }
+        if (!is_kv_src_[il]) continue;
+        const uint32_t ratio = static_cast<uint32_t>(geo.compress_ratios[il]);
+        if (ratio == 0) continue;
+        ng_src_[il] = np / ratio;
+        if (ratio == 1 || cpre_kv_[il] == nullptr) { cpend_[il] = 0; continue; }
+        const uint32_t pend2 = np % ratio;
+        if (pend2) {
+            // The last accepted tokens' inputs are rows (snap_cpend + keep - pend2) onward of the pre-shift snapshot.
+            const uint64_t src = uint64_t(snap_cpend_[il] + keep - pend2) * HD_;
+            cudaError_t ce = cudaMemcpyAsync(cpre_kv_[il], snap_cpre_kv_[il] + src, uint64_t(pend2) * HD_ * 4,
+                                             cudaMemcpyDeviceToDevice, stream_);
+            if (ce == cudaSuccess)
+                ce = cudaMemcpyAsync(cpre_sc_[il], snap_cpre_sc_[il] + src, uint64_t(pend2) * HD_ * 4,
+                                     cudaMemcpyDeviceToDevice, stream_);
+            if (ce != cudaSuccess) { err = std::string("spec pending restore: ") + cudaGetErrorString(ce); return false; }
+        }
+        cpend_[il] = pend2;
+    }
+    n_past_ = np;
+    snap_on_ = false;
+    // Rejected rows leave the ring's contiguous run; their cells are overwritten next step, and until then the
+    // window fill must not read them.
+    const uint32_t dropped = snap_n_ - keep;
+    mainh_n_ = mainh_n_ > dropped ? mainh_n_ - dropped : 0;
+    mainh_end_ = static_cast<int64_t>(np) - 1;
     return true;
 }
 
@@ -1043,6 +1735,19 @@ bool Runner::compress_source(uint32_t il, uint32_t ratio, std::string& err) {
                                  stream_);
         if (ce != cudaSuccess) { err = std::string("compressor append: ") + cudaGetErrorString(ce); return false; }
         const uint32_t tot = pend + n;
+        if (snap_on_ && snap_cpre_kv_[il] != nullptr) {
+            // The verify batch's pending rows, before the pool and the shift: the rollback takes the accepted
+            // tokens' inputs back out of this (the reference snapshots inside its compress_source, same point).
+            const uint64_t bytes = uint64_t(tot) * HD_ * 4;
+            ce = cudaMemcpyAsync(snap_cpre_kv_[il], cpre_kv_[il], bytes, cudaMemcpyDeviceToDevice, stream_);
+            if (ce == cudaSuccess)
+                ce = cudaMemcpyAsync(snap_cpre_sc_[il], cpre_sc_[il], bytes, cudaMemcpyDeviceToDevice, stream_);
+            if (ce != cudaSuccess) {
+                err = std::string("compressor snapshot: ") + cudaGetErrorString(ce);
+                return false;
+            }
+            snap_cpend_[il] = pend;
+        }
         const uint32_t rem = tot % ratio;
         ng_new = tot / ratio;
         if (ng_new) {
@@ -1277,7 +1982,7 @@ bool Runner::moe(uint32_t il, std::string& err) {
     if (!stage_blob(il, sel_host_.data(), n * KU_, err)) return false;
     const bool tail = n <= kGemvMaxTok;
     if (!k::deepseek4_routed_moe(tail ? nullptr : y_, partial_, blob_dev_, stage_used_, E_, FF_, E_, sel_, rw_, KU_,
-                                 clamp_, xn_, n, blob_[il].nc, 1, nullptr, stream_)) {
+                                 clamp_, xn_, n, blob_[il].nc, blob_[il].v3 ? 1u : 0u, nullptr, stream_)) {
         err = "deepseek4_routed_moe failed";
         return false;
     }
@@ -1298,6 +2003,18 @@ bool Runner::moe(uint32_t il, std::string& err) {
 
 bool Runner::layer(uint32_t il, std::string& err) {
     if (engram_of_[il] >= 0 && engram_on_ && !engram_layer(il, err)) return false;
+    // DSpark: capture the target layers' attention input (the hc four-route mean, after the engram and before the
+    // layer) into the main-hidden ring.  A wrong capture point does not error; acceptance collapses to about 1.
+    if (mtp_on_ && mtp_slot_[il] >= 0) {
+        const uint32_t rows = cur_n_ < mainh_cap_ ? cur_n_ : mainh_cap_;
+        const uint32_t src0 = cur_n_ - rows;
+        if (!k::deepseek4_hc_mean(mainh_, hc_, E_, HC_, rows, src0, static_cast<uint32_t>(mtp_slot_[il]),
+                                  mtp_n_target_, cur_pos0_ + src0, mainh_cap_, stream_)) {
+            err = "main-hidden capture failed";
+            return false;
+        }
+        mainh_wrote_ = rows;
+    }
     if (opt_.trace) probe(("L" + std::to_string(il) + " hc_in").c_str(), hc_, uint64_t(cur_n_) * HC_ * E_);
     if (!hc_half(il, true, err)) return false;
     if (!attn(il, err)) return false;
@@ -1328,7 +2045,7 @@ int32_t Runner::argmax_logits(std::string& err) {
     return static_cast<int32_t>(best);
 }
 
-bool Runner::block(const int32_t* ids, uint32_t n, bool head, std::string& err) {
+bool Runner::block(const int32_t* ids, uint32_t n, bool head, bool head_all, std::string& err) {
     if (n == 0 || n > cap_) { err = "block size outside the chunk cap"; return false; }
     if (uint64_t(n_past_) + n > ctx_) {
         err = "context full (" + std::to_string(n_past_) + "+" + std::to_string(n) + " > " + std::to_string(ctx_) + ")";
@@ -1337,6 +2054,7 @@ bool Runner::block(const int32_t* ids, uint32_t n, bool head, std::string& err) 
     const uint32_t pos0 = n_past_;
     cur_n_ = n;
     cur_pos0_ = pos0;
+    mainh_wrote_ = 0;
 
     for (uint32_t i = 0; i < n; ++i) pos_host_[i] = static_cast<int32_t>(pos0 + i);
     for (uint32_t i = 0; i < n; ++i)
@@ -1366,17 +2084,35 @@ bool Runner::block(const int32_t* ids, uint32_t n, bool head, std::string& err) 
             return false;
         }
     if (head) {
-        // head: hc_pre (fused with the output norm) -> output projection of the last row only
+        // head: hc_pre (fused with the output norm) -> output projection.  The generate path projects the last
+        // row only; a spec verify batch projects every row into vlogits_ (the reference's full-GEMM arm).
         if (!k::deepseek4_hc_pre(hc_, d_prem_, static_cast<const float*>(out_norm_), x_, xn_, E_, HC_, rms_eps_, n,
                                  stream_)) {
             err = "head hc_pre failed";
             return false;
         }
-        const float* last = xn_ + uint64_t(n - 1) * E_;
-        if (!k::deepseek4_matmul_q4k(logits_, out_w_, last, E_, V_, 1, false, stream_)) {
-            err = "head projection failed";
-            return false;
+        if (head_all) {
+            if (!k::deepseek4_matmul_q4k(vlogits_, out_w_, xn_, E_, V_, n, false, stream_)) {
+                err = "head projection (all rows) failed";
+                return false;
+            }
+        } else {
+            const float* last = xn_ + uint64_t(n - 1) * E_;
+            if (!k::deepseek4_matmul_q4k(logits_, out_w_, last, E_, V_, 1, false, stream_)) {
+                err = "head projection failed";
+                return false;
+            }
         }
+    }
+    // The main-hidden ring's accounting (the reference's, core_v41_forward.c:391-400): continue the run when
+    // this block touches the previous one, restart it otherwise.  Only the contiguous run ending at mainh_end_
+    // is real; the draft window fill may read nothing else.  Must happen before n_past_ advances.
+    if (mainh_ != nullptr && mainh_wrote_) {
+        const int64_t first = static_cast<int64_t>(pos0) + static_cast<int64_t>(n - mainh_wrote_);
+        const bool contig = mainh_n_ > 0 && mainh_end_ == first - 1;
+        const uint32_t nn = contig ? mainh_n_ + mainh_wrote_ : mainh_wrote_;
+        mainh_n_ = nn > mainh_cap_ ? mainh_cap_ : nn;
+        mainh_end_ = static_cast<int64_t>(pos0) + static_cast<int64_t>(n) - 1;
     }
     n_past_ += n;
     return true;
@@ -1399,7 +2135,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
         const uint32_t rest = np - c0 - nc;
         if (rest > 0 && rest < SWA_ && nc > SWA_) nc -= SWA_ - rest;
         const bool last = c0 + nc >= np;
-        if (!block(prompt.data() + c0, nc, last, err)) return false;
+        if (!block(prompt.data() + c0, nc, last, false, err)) return false;
         c0 += nc;
         if (opt_.trace || np >= 64) std::fprintf(stderr, "[v41] prefill %u/%u (%.1fs)\r", c0, np, now_sec() - t0);
     }
@@ -1426,17 +2162,101 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
         int32_t t = argmax_logits(err);
         if (t < 0) return false;
         const double td = now_sec();
-        for (uint32_t g = 0; g < gen; ++g) {
+        // The DSpark summary counters (report-only; the token stream is what the gate reads).
+        uint64_t rounds = 0, accepted = 0, drafted = 0, plain_steps = 0;
+        for (uint32_t g = 0; g < gen;) {
+            // The loop-top emit (the reference's core_v41_api.c:246): this token's successor is already decided.
             generated.push_back(t);
-            if (g + 1 < gen) {
-                if (!block(&t, 1, true, err)) return false;
+            ++g;
+            if (g >= gen) break;
+            if (n_past_ + 1 > ctx_) {
+                err = "context full (" + std::to_string(n_past_) + "+1 > " + std::to_string(ctx_) + ")";
+                return false;
+            }
+            if (!opt_.dspark) {
+                // Plain decode: feed the token, pick its successor.
+                if (!block(&t, 1, true, false, err)) return false;
                 t = argmax_logits(err);
                 if (t < 0) return false;
+                continue;
             }
+            // ---- one DSpark round (the reference's core_v41_api.c:272-390, direct arm) ----
+            const uint32_t pos_round = n_past_;
+            const int dr = draft_round(t, n_past_ - 1, err);
+            if (dr < 0) return false;
+            uint32_t k = 0;
+            if (dr == 1) {
+                k = mtp_block_;
+                if (opt_.dspark_verify != 0 && opt_.dspark_verify < k) k = opt_.dspark_verify;
+                // Only positions inside the real context can be verified.
+                const uint32_t room_k = ctx_ - n_past_ - 1u;
+                if (k > room_k) k = room_k;
+            }
+            if (k == 0) {
+                // No draft, or a round the scheduler would have sat out: one direct token step.
+                ++plain_steps;
+                if (!block(&t, 1, true, false, err)) return false;
+                t = argmax_logits(err);
+                if (t < 0) return false;
+                continue;
+            }
+            int32_t batch[9];   // DS4_MTP_MAX_BLOCK + 1
+            batch[0] = t;
+            for (uint32_t i = 0; i < k; ++i) batch[i + 1] = t_id_host_[i + 1];
+            const uint32_t nb = 1 + k;
+            // Snapshot -> verify forward -> per-row argmax.  The snapshot is only the ring cells this batch
+            // overwrites; the compressor's pending rows are captured inside compress_source.
+            if (!spec_snapshot(nb, err)) return false;
+            if (!block(batch, nb, true, true, err)) return false;
+            for (uint32_t i = 0; i < nb; ++i) {
+                if (!k::deepseek4_argmax(t_want_ + i, vlogits_ + uint64_t(i) * V_, V_, stream_)) {
+                    err = "verify argmax failed at row " + std::to_string(i);
+                    return false;
+                }
+            }
+            cudaError_t ce = cudaMemcpyAsync(t_want_host_.data(), t_want_, uint64_t(nb) * 4,
+                                             cudaMemcpyDeviceToHost, stream_);
+            if (ce != cudaSuccess) { err = std::string("verify readback: ") + cudaGetErrorString(ce); return false; }
+            if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "verify readback sync failed"; return false; }
+            uint32_t a = 0;
+            while (a < k && t_want_host_[a] == batch[a + 1]) ++a;   // the longest matching prefix
+            if (opt_.dspark_trace) {
+                std::fprintf(stderr, "[dspark] pos %u k %u acc %u conf", pos_round, k, a);
+                for (uint32_t i = 0; i < mtp_block_; ++i) {
+                    const float c = t_conf_host_[i];
+                    std::fprintf(stderr, " %.3f", std::isfinite(c) ? 1.0 / (1.0 + std::exp(-static_cast<double>(c)))
+                                                                   : 0.0);
+                }
+                std::fprintf(stderr, " | draft");
+                for (uint32_t i = 0; i < k; ++i) std::fprintf(stderr, " %d", batch[i + 1]);
+                std::fprintf(stderr, " | main");
+                for (uint32_t i = 0; i < nb; ++i) std::fprintf(stderr, " %d", t_want_host_[i]);
+                std::fprintf(stderr, "\n");
+            }
+            ++rounds;
+            drafted += k;
+            accepted += a;
+            // Roll back to the accepted prefix: keep = the confirmed head + the accepted draft rows.
+            if (!spec_rollback(1u + a, err)) return false;
+            // The earned tokens, then the next round's head token.
+            for (uint32_t i = 0; i < a && g < gen; ++i) {
+                generated.push_back(batch[i + 1]);
+                ++g;
+            }
+            t = t_want_host_[a];
         }
         const double dt = now_sec() - td;
         std::fprintf(stderr, "[v41] generated %u tokens in %.2fs (%.1f tok/s)\n", gen, dt,
                      dt > 0 ? static_cast<double>(gen) / dt : 0.0);
+        if (rounds || plain_steps) {
+            std::fprintf(stderr, "[v41] DSpark: %llu round(s), %.2f accepted of %llu drafted (%.1f%%), %llu plain step(s)%s\n",
+                         static_cast<unsigned long long>(rounds),
+                         rounds ? static_cast<double>(accepted) / static_cast<double>(rounds) : 0.0,
+                         static_cast<unsigned long long>(drafted),
+                         drafted ? 100.0 * static_cast<double>(accepted) / static_cast<double>(drafted) : 0.0,
+                         static_cast<unsigned long long>(plain_steps),
+                         opt_.dspark ? "" : " (dspark off)");
+        }
     }
     std::printf("generated=");
     for (size_t i = 0; i < generated.size(); ++i) std::printf("%s%d", i ? "," : "", generated[i]);
@@ -1483,12 +2303,25 @@ int main(int argc, char** argv) {
         else if (a == "--gpu") o.gpu = std::atoi(next("--gpu"));
         else if (a == "--logits-out") o.logits_out = next("--logits-out");
         else if (a == "--trace") o.trace = true;
+        else if (a == "--dspark") o.dspark = true;
+        else if (a == "--dspark-verify") {
+            o.dspark_verify = static_cast<uint32_t>(std::strtoul(next("--dspark-verify"), nullptr, 10));
+            o.dspark = true;
+        } else if (a == "--dspark-trace") {
+            o.dspark_trace = true;
+            o.dspark = true;
+        }
         else if (a == "--no-engram") o.engram = false;
         else if (a == "--no-check") o.check = false;
         else if (a == "--help" || a == "-h") {
             std::fprintf(stderr,
                          "usage: dsv4_run --ids 1,2,3 [--gen N] [--model BASE] [--engram-dir DIR] [--chunk 8]\n"
-                         "               [--ctx N] [--gpu 0] [--trace] [--no-engram] [--no-check] [--logits-out F]\n");
+                         "               [--ctx N] [--gpu 0] [--trace] [--no-engram] [--no-check] [--logits-out F]\n"
+                         "               [--dspark] [--dspark-verify K] [--dspark-trace]\n"
+                         "  --dspark         the MTP towers draft, the main forward verifies, the cache rolls back;\n"
+                         "                   the greedy output must be byte-identical to the same run without it\n"
+                         "  --dspark-verify  pin the verified rows per round (1..block, default: the whole block)\n"
+                         "  --dspark-trace   print each round's k, accepted count, confidence and both id lists\n");
             return 0;
         } else {
             std::fprintf(stderr, "dsv4_run: unknown argument '%s'\n", a.c_str());
