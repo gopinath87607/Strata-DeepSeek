@@ -194,6 +194,75 @@ std::vector<float> host_decode(const std::vector<uint8_t>& w, uint32_t rows, uin
     return out;
 }
 
+// The tensor-core tiles take bf16 operands by design, so their reference rounds the same q4_K decode and the
+// same activation to bf16 before the product.  Comparing them against the f32-operand oracles above would
+// measure that operand rounding - 2^-9 a value, and on a 512-term sum a few 2^-9 of the sum, unbounded
+// relatively when the sum lands near zero - not the kernel.  These leave the kernel's own arithmetic (mma
+// accumulation order, its rounding) as the only difference, so the bounds can be tight.
+void matmul_q4k_bf16op_host(std::vector<float>& out, const std::vector<uint8_t>& w, const std::vector<float>& x,
+                            uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    namespace k = strata::kernels;
+    const uint32_t blocks = in_dim / k::kDeepseek4Q4kBlock;
+    const size_t row_bytes = static_cast<size_t>(blocks) * k::kDeepseek4Q4kBytes;
+    out.assign(static_cast<size_t>(n_tok) * out_dim, 0.f);
+    for (uint32_t t = 0; t < n_tok; t++)
+        for (uint32_t o = 0; o < out_dim; o++) {
+            double acc = 0.0;
+            for (uint32_t i = 0; i < in_dim; i++) {
+                const uint8_t* blk = w.data() + static_cast<size_t>(o) * row_bytes +
+                                     static_cast<size_t>(i / k::kDeepseek4Q4kBlock) * k::kDeepseek4Q4kBytes;
+                const float wv =
+                    k::deepseek4_dense_bf16r(k::deepseek4_q4k_element(blk, i % k::kDeepseek4Q4kBlock));
+                const float xv = k::deepseek4_dense_bf16r(x[static_cast<size_t>(t) * in_dim + i]);
+                acc += static_cast<double>(wv) * static_cast<double>(xv);
+            }
+            out[static_cast<size_t>(t) * out_dim + o] = static_cast<float>(acc);
+        }
+}
+
+void matmul_q4k_grouped_bf16op_host(std::vector<float>& out, const std::vector<uint8_t>& w,
+                                    const std::vector<float>& x, uint32_t n_groups, uint32_t group_dim,
+                                    uint32_t rank, uint32_t n_tok) {
+    namespace k = strata::kernels;
+    const uint32_t blocks = group_dim / k::kDeepseek4Q4kBlock;
+    const size_t row_bytes = static_cast<size_t>(blocks) * k::kDeepseek4Q4kBytes;
+    const size_t group_bytes = static_cast<size_t>(rank) * row_bytes;
+    out.assign(static_cast<size_t>(n_tok) * n_groups * rank, 0.f);
+    for (uint32_t t = 0; t < n_tok; t++)
+        for (uint32_t g = 0; g < n_groups; g++)
+            for (uint32_t o = 0; o < rank; o++) {
+                const uint8_t* row = w.data() + static_cast<size_t>(g) * group_bytes +
+                                     static_cast<size_t>(o) * row_bytes;
+                const float* xg = x.data() + (static_cast<size_t>(t) * n_groups + g) * group_dim;
+                double acc = 0.0;
+                for (uint32_t i = 0; i < group_dim; i++) {
+                    const uint8_t* blk =
+                        row + static_cast<size_t>(i / k::kDeepseek4Q4kBlock) * k::kDeepseek4Q4kBytes;
+                    const float wv =
+                        k::deepseek4_dense_bf16r(k::deepseek4_q4k_element(blk, i % k::kDeepseek4Q4kBlock));
+                    const float xv = k::deepseek4_dense_bf16r(xg[i]);
+                    acc += static_cast<double>(wv) * static_cast<double>(xv);
+                }
+                out[(static_cast<size_t>(t) * n_groups + g) * rank + o] = static_cast<float>(acc);
+            }
+}
+
+void matmul_bf16op_host(std::vector<float>& out, const std::vector<uint16_t>& w, const std::vector<float>& x,
+                        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    namespace k = strata::kernels;
+    out.assign(static_cast<size_t>(n_tok) * out_dim, 0.f);
+    for (uint32_t t = 0; t < n_tok; t++)
+        for (uint32_t o = 0; o < out_dim; o++) {
+            double acc = 0.0;
+            for (uint32_t i = 0; i < in_dim; i++) {
+                const float wv = k::f32_from_bf16(w[static_cast<size_t>(o) * in_dim + i]);   // already bf16
+                const float xv = k::deepseek4_dense_bf16r(x[static_cast<size_t>(t) * in_dim + i]);
+                acc += static_cast<double>(wv) * static_cast<double>(xv);
+            }
+            out[static_cast<size_t>(t) * out_dim + o] = static_cast<float>(acc);
+        }
+}
+
 // The shared decoder against the tree's validated one, through the GPU.  `dequant_bf16` writes bf16 bits.
 void check_decoder_against_dequant_bf16() {
     std::printf("q4_K decoder vs dequant_bf16\n");
@@ -524,6 +593,159 @@ void run_guards() {
 
 }  // namespace
 
+// The token-batched tiles (--dense-batch): 40 tokens and 192 output rows cross both a full and a partial
+// tile in each direction, and in_dim 512 gives two k blocks.  The tiles sum in a different order, so the
+// unrounded bound is the corpus's reordering tolerance and the rounded one is the bf16 ulp.
+void run_matmul_tiles() {
+    std::printf("matmul tiles (--dense-batch)\n");
+    strata::kernels::deepseek4_dense_set_batched(true);
+    const uint32_t in_dim = 512, out_dim = 192, n_tok = 40;
+    {
+        const std::vector<uint8_t> w = make_q4k(out_dim, in_dim, true);
+        std::vector<float> x(static_cast<size_t>(n_tok) * in_dim);
+        for (float& v : x) v = urand();
+        uint8_t* d_w = dev_u8(w);
+        float* d_x = dev_up(x);
+        float* d_out = dev_f(static_cast<size_t>(n_tok) * out_dim);
+        std::vector<float> want(static_cast<size_t>(n_tok) * out_dim);
+        strata::kernels::deepseek4_matmul_q4k_host(want.data(), w.data(), x.data(), in_dim, out_dim, n_tok, false);
+        CHECK(strata::kernels::deepseek4_matmul_q4k(d_out, d_w, d_x, in_dim, out_dim, n_tok, false, nullptr));
+        check_close("q4k tile", dev_down(d_out, want.size()), want, 3e-5, 3e-4);   // the four k-quarters sum as a tree
+        strata::kernels::deepseek4_matmul_q4k_host(want.data(), w.data(), x.data(), in_dim, out_dim, n_tok, true);
+        CHECK(strata::kernels::deepseek4_matmul_q4k(d_out, d_w, d_x, in_dim, out_dim, n_tok, true, nullptr));
+        const std::vector<float> got = dev_down(d_out, want.size());
+        check_close("q4k tile round", got, want, 2e-2, 1e-6);
+        check_bf16_grid("q4k tile round grid", got);
+        cudaFree(d_w);
+        cudaFree(d_x);
+        cudaFree(d_out);
+    }
+    {
+        const uint32_t n_groups = 2, group_dim = 512, rank = 64;
+        const std::vector<uint8_t> w = make_q4k(n_groups * rank, group_dim, true);
+        std::vector<float> x(static_cast<size_t>(n_tok) * n_groups * group_dim);
+        for (float& v : x) v = urand();
+        uint8_t* d_w = dev_u8(w);
+        float* d_x = dev_up(x);
+        float* d_out = dev_f(static_cast<size_t>(n_tok) * n_groups * rank);
+        std::vector<float> want(static_cast<size_t>(n_tok) * n_groups * rank);
+        strata::kernels::deepseek4_matmul_q4k_grouped_host(want.data(), w.data(), x.data(), n_groups, group_dim,
+                                                           rank, n_tok, false);
+        CHECK(strata::kernels::deepseek4_matmul_q4k_grouped(d_out, d_w, d_x, n_groups, group_dim, rank, n_tok,
+                                                            false, nullptr));
+        check_close("grouped tile", dev_down(d_out, want.size()), want, 3e-5, 3e-4);   // the four k-quarters sum as a tree
+        strata::kernels::deepseek4_matmul_q4k_grouped_host(want.data(), w.data(), x.data(), n_groups, group_dim,
+                                                           rank, n_tok, true);
+        CHECK(strata::kernels::deepseek4_matmul_q4k_grouped(d_out, d_w, d_x, n_groups, group_dim, rank, n_tok,
+                                                            true, nullptr));
+        const std::vector<float> got = dev_down(d_out, want.size());
+        check_close("grouped tile round", got, want, 2e-2, 1e-6);
+        check_bf16_grid("grouped tile round grid", got);
+        cudaFree(d_w);
+        cudaFree(d_x);
+        cudaFree(d_out);
+    }
+    {
+        std::vector<float> wf(static_cast<size_t>(in_dim) * out_dim), x(static_cast<size_t>(n_tok) * in_dim);
+        for (float& v : wf) v = urand();
+        for (float& v : x) v = urand();
+        std::vector<uint16_t> w(wf.size());
+        for (size_t i = 0; i < wf.size(); i++) w[i] = strata::kernels::bf16_from_f32(wf[i]);
+        uint16_t* d_w = dev_u16(w);
+        float* d_x = dev_up(x);
+        float* d_out = dev_f(static_cast<size_t>(n_tok) * out_dim);
+        std::vector<float> want(static_cast<size_t>(n_tok) * out_dim);
+        strata::kernels::deepseek4_matmul_bf16_host(want.data(), w.data(), x.data(), in_dim, out_dim, n_tok, false);
+        CHECK(strata::kernels::deepseek4_matmul_bf16(d_out, d_w, d_x, in_dim, out_dim, n_tok, false, nullptr));
+        check_close("bf16 tile", dev_down(d_out, want.size()), want, 3e-5, 1e-5);
+        strata::kernels::deepseek4_matmul_bf16_host(want.data(), w.data(), x.data(), in_dim, out_dim, n_tok, true);
+        CHECK(strata::kernels::deepseek4_matmul_bf16(d_out, d_w, d_x, in_dim, out_dim, n_tok, true, nullptr));
+        const std::vector<float> got = dev_down(d_out, want.size());
+        check_close("bf16 tile round", got, want, 2e-2, 1e-6);
+        check_bf16_grid("bf16 tile round grid", got);
+        cudaFree(d_w);
+        cudaFree(d_x);
+        cudaFree(d_out);
+    }
+    strata::kernels::deepseek4_dense_set_batched(false);
+}
+
+// The tensor-core tiles (--tc-gemm) against the operand-rounded oracles: the mma takes bf16 operands, so both
+// sides of the comparison round the q4_K decode and the activations to bf16 first, and what is left is the
+// tile's own accumulation and epilogue.  Round_out still lands on the bf16 grid (checked separately), and the
+// shape is the same ragged one (40 tokens, 192 rows) the batched tiles use.
+void run_matmul_tc() {
+    std::printf("matmul tc tiles (--tc-gemm)\n");
+    strata::kernels::deepseek4_dense_set_tc(true);
+    const uint32_t in_dim = 512, out_dim = 192, n_tok = 40;
+    {
+        const std::vector<uint8_t> w = make_q4k(out_dim, in_dim, true);
+        std::vector<float> x(static_cast<size_t>(n_tok) * in_dim);
+        for (float& v : x) v = urand();
+        uint8_t* d_w = dev_u8(w);
+        float* d_x = dev_up(x);
+        float* d_out = dev_f(static_cast<size_t>(n_tok) * out_dim);
+        std::vector<float> want;
+        matmul_q4k_bf16op_host(want, w, x, in_dim, out_dim, n_tok);
+        CHECK(strata::kernels::deepseek4_matmul_q4k(d_out, d_w, d_x, in_dim, out_dim, n_tok, false, nullptr));
+        check_close("q4k tc", dev_down(d_out, want.size()), want, 1e-5, 5e-4);
+        for (float& v : want) v = strata::kernels::deepseek4_dense_bf16r(v);
+        CHECK(strata::kernels::deepseek4_matmul_q4k(d_out, d_w, d_x, in_dim, out_dim, n_tok, true, nullptr));
+        const std::vector<float> got = dev_down(d_out, want.size());
+        check_close("q4k tc round", got, want, 2e-2, 5e-4);
+        check_bf16_grid("q4k tc round grid", got);
+        cudaFree(d_w);
+        cudaFree(d_x);
+        cudaFree(d_out);
+    }
+    {
+        const uint32_t n_groups = 2, group_dim = 512, rank = 64;
+        const std::vector<uint8_t> w = make_q4k(n_groups * rank, group_dim, true);
+        std::vector<float> x(static_cast<size_t>(n_tok) * n_groups * group_dim);
+        for (float& v : x) v = urand();
+        uint8_t* d_w = dev_u8(w);
+        float* d_x = dev_up(x);
+        float* d_out = dev_f(static_cast<size_t>(n_tok) * n_groups * rank);
+        std::vector<float> want;
+        matmul_q4k_grouped_bf16op_host(want, w, x, n_groups, group_dim, rank, n_tok);
+        CHECK(strata::kernels::deepseek4_matmul_q4k_grouped(d_out, d_w, d_x, n_groups, group_dim, rank, n_tok,
+                                                            false, nullptr));
+        check_close("grouped tc", dev_down(d_out, want.size()), want, 1e-5, 5e-4);
+        for (float& v : want) v = strata::kernels::deepseek4_dense_bf16r(v);
+        CHECK(strata::kernels::deepseek4_matmul_q4k_grouped(d_out, d_w, d_x, n_groups, group_dim, rank, n_tok,
+                                                            true, nullptr));
+        const std::vector<float> got = dev_down(d_out, want.size());
+        check_close("grouped tc round", got, want, 2e-2, 5e-4);
+        check_bf16_grid("grouped tc round grid", got);
+        cudaFree(d_w);
+        cudaFree(d_x);
+        cudaFree(d_out);
+    }
+    {
+        std::vector<float> wf(static_cast<size_t>(in_dim) * out_dim), x(static_cast<size_t>(n_tok) * in_dim);
+        for (float& v : wf) v = urand();
+        for (float& v : x) v = urand();
+        std::vector<uint16_t> w(wf.size());
+        for (size_t i = 0; i < wf.size(); i++) w[i] = strata::kernels::bf16_from_f32(wf[i]);
+        uint16_t* d_w = dev_u16(w);
+        float* d_x = dev_up(x);
+        float* d_out = dev_f(static_cast<size_t>(n_tok) * out_dim);
+        std::vector<float> want;
+        matmul_bf16op_host(want, w, x, in_dim, out_dim, n_tok);
+        CHECK(strata::kernels::deepseek4_matmul_bf16(d_out, d_w, d_x, in_dim, out_dim, n_tok, false, nullptr));
+        check_close("bf16 tc", dev_down(d_out, want.size()), want, 1e-5, 5e-4);
+        for (float& v : want) v = strata::kernels::deepseek4_dense_bf16r(v);
+        CHECK(strata::kernels::deepseek4_matmul_bf16(d_out, d_w, d_x, in_dim, out_dim, n_tok, true, nullptr));
+        const std::vector<float> got = dev_down(d_out, want.size());
+        check_close("bf16 tc round", got, want, 2e-2, 5e-4);
+        check_bf16_grid("bf16 tc round grid", got);
+        cudaFree(d_w);
+        cudaFree(d_x);
+        cudaFree(d_out);
+    }
+    strata::kernels::deepseek4_dense_set_tc(false);
+}
+
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
@@ -543,6 +765,8 @@ int main() {
     run_matmul_q4k();
     run_matmul_q4k_live_width();
     run_matmul_q4k_grouped();
+    run_matmul_tiles();
+    run_matmul_tc();
     run_guards();
 
     if (g_failures != 0) {

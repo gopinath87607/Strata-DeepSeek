@@ -1,3 +1,5 @@
+// Set by deepseek4_dense_set_tc (--tc-gemm): the batched matmuls call the tensor-core tiles in
+// deepseek4_dense_tc.cu (--tc-gemm is opt-in; the default path keeps the kernels above).
 // src/kernels/cuda/deepseek4_dense.cu - P3: DeepSeek-V4.1-Flash's dense primitives on the GPU.
 //
 // The semantics are stated in include/strata/kernels/deepseek4_dense.hpp and implemented twice: by the host
@@ -15,6 +17,7 @@
 // shape the layout cannot express before launching, and reports a launch or execution failure by returning
 // false rather than leaving the caller with silent garbage.
 #include "strata/kernels/deepseek4_dense.hpp"
+#include "strata/kernels/deepseek4_dense_tc.hpp"
 
 #include <cuda_runtime.h>
 
@@ -183,6 +186,186 @@ __global__ void dense_matmul_q4k_grouped_kernel(float* out, const uint8_t* w, co
     }
 }
 
+// ---- token-batched tiles --------------------------------------------------
+//
+// The kernels above give one block to one (output row, token) pair, so a prefill-width matmul reads the whole
+// activation matrix once per output row: out_dim x n_tok x in_dim floats of traffic where the arithmetic needs
+// n_tok x in_dim.  At 5120x8192x1412 that is 236 GB for one matmul, and the block time was going to memory.
+//
+// A tile here is 64 output rows by 32 tokens, 256 threads as 4 (rows) x 2 (tokens) warps of 16 x 16.  Each lane
+// holds 2 rows and all 16 of its warp's tokens, and one quarter of the k block, so a decoded weight scales 16
+// tokens and no lane decodes a weight another lane also decodes; the four k quarters meet in two shuffles at the
+// end.  The 32 activation rows are staged in shared once per k block (32 KiB) and read by every warp.
+constexpr uint32_t kTileN = 64;   // output rows per block
+constexpr uint32_t kTileT = 32;   // tokens per block
+constexpr uint32_t kTileThreads = 256;
+
+// GROUPED selects the wo_a layout: weight g is a [rank][group_dim] matrix of its own, token rows are n_groups
+// apart in both x and out, and blockIdx.z picks the group.  The plain matmul is the same kernel with zero
+// offsets and in_dim / out_dim strides.
+template <bool GROUPED>
+__global__ void dense_matmul_q4k_tile_kernel(float* __restrict__ out, const uint8_t* __restrict__ w,
+                                             const float* __restrict__ x, uint32_t blocks, uint32_t out_dim,
+                                             uint32_t n_tok, bool round_out) {
+    __shared__ float xsh[kTileT][kDeepseek4Q4kBlock];
+    const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
+    const uint32_t ow = warp & 3u, tw = warp >> 2;             // 4 row warps x 2 token warps
+    const uint32_t rr = lane >> 2, cc = lane & 3u;             // 8 row pairs x 4 k quarters
+    const uint32_t in_dim = blocks * kDeepseek4Q4kBlock;
+    const uint32_t g = GROUPED ? blockIdx.z : 0u;
+    const float* xg = GROUPED ? x + (size_t) g * in_dim : x;
+    float* yg = GROUPED ? out + (size_t) g * out_dim : out;
+    const size_t xr = GROUPED ? (size_t) in_dim * gridDim.z : (size_t) in_dim;
+    const size_t yr = GROUPED ? (size_t) out_dim * gridDim.z : (size_t) out_dim;
+    w += (size_t) g * out_dim * blocks * kDeepseek4Q4kBytes;
+    const uint32_t o0 = blockIdx.x * kTileN + ow * 16u + rr;
+    const uint32_t t0 = blockIdx.y * kTileT + tw * 16u;
+    const uint32_t r0 = o0 < out_dim ? o0 : out_dim - 1u;
+    const uint32_t r1 = o0 + 8u < out_dim ? o0 + 8u : out_dim - 1u;
+    const uint8_t* w0 = w + (size_t) r0 * blocks * kDeepseek4Q4kBytes;
+    const uint8_t* w1 = w + (size_t) r1 * blocks * kDeepseek4Q4kBytes;
+    const uint32_t g0 = cc * 64u;                              // this lane's 64 elements: groups 2cc and 2cc+1
+    float acc[2][16];
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++)
+#pragma unroll
+        for (uint32_t t = 0; t < 16; t++) acc[i][t] = 0.f;
+    for (uint32_t b = 0; b < blocks; b++) {
+        __syncthreads();
+        for (uint32_t i = tid; i < kTileT * kDeepseek4Q4kBlock; i += kTileThreads) {
+            const uint32_t tt = i >> 8, e = i & 255u;
+            const uint32_t row = blockIdx.y * kTileT + tt;
+            xsh[tt][e] = row < n_tok ? xg[(size_t) row * xr + b * kDeepseek4Q4kBlock + e] : 0.f;
+        }
+        __syncthreads();
+        const uint8_t* b0 = w0 + (size_t) b * kDeepseek4Q4kBytes;
+        const uint8_t* b1 = w1 + (size_t) b * kDeepseek4Q4kBytes;
+        const float d0 = f32_from_f16((uint16_t) (b0[0] | (b0[1] << 8)));
+        const float dm0 = f32_from_f16((uint16_t) (b0[2] | (b0[3] << 8)));
+        const float d1 = f32_from_f16((uint16_t) (b1[0] | (b1[1] << 8)));
+        const float dm1 = f32_from_f16((uint16_t) (b1[2] | (b1[3] << 8)));
+        uint32_t s0 = 0, m0 = 0, s1 = 0, m1 = 0;
+        deepseek4_q4k_scale_min(2u * cc, b0 + 4, s0, m0);
+        deepseek4_q4k_scale_min(2u * cc + 1u, b0 + 4, s1, m1);
+        uint32_t s0b = 0, m0b = 0, s1b = 0, m1b = 0;
+        deepseek4_q4k_scale_min(2u * cc, b1 + 4, s0b, m0b);
+        deepseek4_q4k_scale_min(2u * cc + 1u, b1 + 4, s1b, m1b);
+        const float a00 = d0 * (float) s0, b00 = dm0 * (float) m0;
+        const float a01 = d0 * (float) s1, b01 = dm0 * (float) m1;
+        const float a10 = d1 * (float) s0b, b10 = dm1 * (float) m0b;
+        const float a11 = d1 * (float) s1b, b11 = dm1 * (float) m1b;
+        const uint8_t* p0 = b0 + 16u + 32u * cc;
+        const uint8_t* p1 = b1 + 16u + 32u * cc;
+#pragma unroll
+        for (uint32_t l = 0; l < 32; l++) {
+            const uint8_t y0 = p0[l], y1 = p1[l];
+            const float q00 = a00 * (float) (y0 & 15u) - b00;
+            const float q01 = a01 * (float) (y0 >> 4) - b01;
+            const float q10 = a10 * (float) (y1 & 15u) - b10;
+            const float q11 = a11 * (float) (y1 >> 4) - b11;
+#pragma unroll
+            for (uint32_t t = 0; t < 16; t++) {
+                const float xa = xsh[tw * 16u + t][g0 + l];
+                const float xb = xsh[tw * 16u + t][g0 + 32u + l];
+                acc[0][t] = fmaf(q00, xa, acc[0][t]);
+                acc[0][t] = fmaf(q01, xb, acc[0][t]);
+                acc[1][t] = fmaf(q10, xa, acc[1][t]);
+                acc[1][t] = fmaf(q11, xb, acc[1][t]);
+            }
+        }
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++)
+#pragma unroll
+        for (uint32_t t = 0; t < 16; t++) {
+            acc[i][t] += __shfl_xor_sync(0xffffffffu, acc[i][t], 1u);
+            acc[i][t] += __shfl_xor_sync(0xffffffffu, acc[i][t], 2u);
+        }
+    if (cc != 0) return;
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++) {
+        const uint32_t row = i == 0 ? o0 : o0 + 8u;
+        if (row >= out_dim) continue;
+#pragma unroll
+        for (uint32_t t = 0; t < 16; t++) {
+            const uint32_t col = t0 + t;
+            if (col >= n_tok) continue;
+            const float v = round_out ? engram_bf16r(acc[i][t]) : acc[i][t];
+            yg[(size_t) col * yr + row] = v;
+        }
+    }
+}
+
+// The bf16 twin of the same tile: a weight element is one half, so a lane reads 64 halves of each of its 2 rows
+// per 256-element k block and scales 16 tokens with each.
+__global__ void dense_matmul_bf16_tile_kernel(float* __restrict__ out, const uint16_t* __restrict__ w,
+                                              const float* __restrict__ x, uint32_t in_dim, uint32_t out_dim,
+                                              uint32_t n_tok, bool round_out) {
+    __shared__ float xsh[kTileT][256];
+    const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
+    const uint32_t ow = warp & 3u, tw = warp >> 2;
+    const uint32_t rr = lane >> 2, cc = lane & 3u;
+    const uint32_t o0 = blockIdx.x * kTileN + ow * 16u + rr;
+    const uint32_t t0 = blockIdx.y * kTileT + tw * 16u;
+    const uint32_t g0 = cc * 64u;
+    const uint32_t r0 = o0 < out_dim ? o0 : out_dim - 1u;
+    const uint32_t r1 = o0 + 8u < out_dim ? o0 + 8u : out_dim - 1u;
+    const uint16_t* w0 = w + (size_t) r0 * in_dim;
+    const uint16_t* w1 = w + (size_t) r1 * in_dim;
+    float acc[2][16];
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++)
+#pragma unroll
+        for (uint32_t t = 0; t < 16; t++) acc[i][t] = 0.f;
+    for (uint32_t kb = 0; kb < in_dim; kb += 256u) {
+        __syncthreads();
+        for (uint32_t i = tid; i < kTileT * 256u; i += kTileThreads) {
+            const uint32_t tt = i >> 8, e = i & 255u;
+            const uint32_t row = blockIdx.y * kTileT + tt;
+            xsh[tt][e] = row < n_tok ? x[(size_t) row * in_dim + kb + e] : 0.f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (uint32_t l = 0; l < 64; l++) {
+            const uint32_t k = kb + g0 + l;
+            const float q0 = f32_from_bf16(w0[k]);
+            const float q1 = f32_from_bf16(w1[k]);
+#pragma unroll
+            for (uint32_t t = 0; t < 16; t++) {
+                const float xv = xsh[tw * 16u + t][g0 + l];
+                acc[0][t] = fmaf(q0, xv, acc[0][t]);
+                acc[1][t] = fmaf(q1, xv, acc[1][t]);
+            }
+        }
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++)
+#pragma unroll
+        for (uint32_t t = 0; t < 16; t++) {
+            acc[i][t] += __shfl_xor_sync(0xffffffffu, acc[i][t], 1u);
+            acc[i][t] += __shfl_xor_sync(0xffffffffu, acc[i][t], 2u);
+        }
+    if (cc != 0) return;
+#pragma unroll
+    for (uint32_t i = 0; i < 2; i++) {
+        const uint32_t row = i == 0 ? o0 : o0 + 8u;
+        if (row >= out_dim) continue;
+#pragma unroll
+        for (uint32_t t = 0; t < 16; t++) {
+            const uint32_t col = t0 + t;
+            if (col >= n_tok) continue;
+            const float v = round_out ? engram_bf16r(acc[i][t]) : acc[i][t];
+            out[(size_t) col * out_dim + row] = v;
+        }
+    }
+}
+
+
+// Set by deepseek4_dense_set_batched; the default path keeps the per-(row, token) kernels.
+bool dense_batched = false;
+bool dense_tc = false;
+constexpr uint32_t kTileMinTok = 8;   // below this the per-row kernel is cheaper and the tile wastes lanes
+
 unsigned grid_for(uint64_t n) {
     uint64_t g = (n + kThreads - 1) / kThreads;
     if (g == 0) g = 1;
@@ -206,6 +389,10 @@ bool finish(cudaStream_t stream, const char* what) {
 }
 
 }  // namespace
+
+void deepseek4_dense_set_batched(bool on) { dense_batched = on; }
+
+void deepseek4_dense_set_tc(bool on) { dense_tc = on; }
 
 bool deepseek4_rms_norm(float* d_out, const float* d_x, const float* d_w, uint32_t dim, uint32_t n_tok, float eps,
                         void* stream) {
@@ -267,6 +454,15 @@ bool deepseek4_matmul_f32(float* d_out, const float* d_w, const float* d_x, uint
 bool deepseek4_matmul_bf16(float* d_out, const uint16_t* d_w, const float* d_x, uint32_t in_dim, uint32_t out_dim,
                            uint32_t n_tok, bool round_out, void* stream) {
     if (!d_out || !d_w || !d_x || in_dim == 0 || out_dim == 0 || n_tok == 0) return false;
+    if (dense_tc && n_tok >= kTileMinTok && (in_dim % 256u) == 0 &&
+        deepseek4_matmul_tc_bf16(d_out, d_w, d_x, in_dim, out_dim, n_tok, round_out, stream))
+        return true;
+    if (dense_batched && n_tok >= kTileMinTok && (in_dim % 256u) == 0) {
+        dense_matmul_bf16_tile_kernel<<<dim3((out_dim + kTileN - 1) / kTileN, (n_tok + kTileT - 1) / kTileT),
+                                        kTileThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            d_out, d_w, d_x, in_dim, out_dim, n_tok, round_out);
+        return finish(static_cast<cudaStream_t>(stream), "matmul_bf16 tile");
+    }
     dense_matmul_bf16_kernel<<<dim3(out_dim, n_tok), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         d_out, d_w, d_x, in_dim, out_dim, round_out);
     return finish(static_cast<cudaStream_t>(stream), "matmul_bf16");
@@ -276,6 +472,16 @@ bool deepseek4_matmul_q4k(float* d_out, const void* d_w, const float* d_x, uint3
                           uint32_t n_tok, bool round_out, void* stream) {
     if (!d_out || !d_w || !d_x || in_dim == 0 || in_dim % kDeepseek4Q4kBlock != 0 || out_dim == 0 || n_tok == 0)
         return false;
+    if (dense_tc && n_tok >= kTileMinTok &&
+        deepseek4_matmul_tc_q4k(d_out, d_w, d_x, in_dim, out_dim, n_tok, round_out, stream))
+        return true;
+    if (dense_batched && n_tok >= kTileMinTok) {
+        dense_matmul_q4k_tile_kernel<false>
+            <<<dim3((out_dim + kTileN - 1) / kTileN, (n_tok + kTileT - 1) / kTileT), kTileThreads, 0,
+               static_cast<cudaStream_t>(stream)>>>(d_out, static_cast<const uint8_t*>(d_w), d_x,
+                                                    in_dim / kDeepseek4Q4kBlock, out_dim, n_tok, round_out);
+        return finish(static_cast<cudaStream_t>(stream), "matmul_q4k tile");
+    }
     dense_matmul_q4k_kernel<<<dim3(out_dim, n_tok), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
         d_out, static_cast<const uint8_t*>(d_w), d_x, in_dim / kDeepseek4Q4kBlock, out_dim, round_out);
     return finish(static_cast<cudaStream_t>(stream), "matmul_q4k");
@@ -286,6 +492,16 @@ bool deepseek4_matmul_q4k_grouped(float* d_out, const void* d_w, const float* d_
     if (!d_out || !d_w || !d_x || n_groups == 0 || group_dim == 0 || group_dim % kDeepseek4Q4kBlock != 0 ||
         rank == 0 || n_tok == 0)
         return false;
+    if (dense_tc && n_tok >= kTileMinTok &&
+        deepseek4_matmul_tc_q4k_grouped(d_out, d_w, d_x, n_groups, group_dim, rank, n_tok, round_out, stream))
+        return true;
+    if (dense_batched && n_tok >= kTileMinTok) {
+        dense_matmul_q4k_tile_kernel<true>
+            <<<dim3((rank + kTileN - 1) / kTileN, (n_tok + kTileT - 1) / kTileT, n_groups), kTileThreads, 0,
+               static_cast<cudaStream_t>(stream)>>>(d_out, static_cast<const uint8_t*>(d_w), d_x, group_dim / 256u,
+                                                    rank, n_tok, round_out);
+        return finish(static_cast<cudaStream_t>(stream), "matmul_q4k_grouped tile");
+    }
     dense_matmul_q4k_grouped_kernel<<<dim3(rank, n_tok, n_groups), kThreads, 0,
                                       static_cast<cudaStream_t>(stream)>>>(
         d_out, static_cast<const uint8_t*>(d_w), d_x, group_dim / kDeepseek4Q4kBlock, group_dim, rank, n_groups,

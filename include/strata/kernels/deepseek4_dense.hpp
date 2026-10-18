@@ -122,4 +122,15 @@ bool deepseek4_matmul_q4k(float* d_out, const void* d_w, const float* d_x, uint3
 bool deepseek4_matmul_q4k_grouped(float* d_out, const void* d_w, const float* d_x, uint32_t n_groups,
                                   uint32_t group_dim, uint32_t rank, uint32_t n_tok, bool round_out, void* stream);
 
+/// Process-wide opt-in to the token-batched matmul tiles (q4_K, its grouped wo_a form, and bf16) for prompt
+/// widths (n_tok >= 8).  Off by default: the per-(row, token) kernels below are unchanged, and the tiles sum in
+/// a different order, so outputs match to a bf16 ulp but not byte for byte.
+void deepseek4_dense_set_batched(bool on);
+
+/// Process-wide opt-in on top of set_batched: the batched matmuls run the bf16 tensor-core tiles (ldmatrix +
+/// m16n8k16, 128 rows x 128 tokens a block).  The products are bf16 tensor-core FMAs into an f32 accumulator, so
+/// outputs stay on the bf16 grid but differ from the SIMT tiles by small f32 rounding; a run's rounded ids are
+/// expected to be unchanged.  Off by default and the batched SIMT tiles remain the opt-in default.
+void deepseek4_dense_set_tc(bool on);
+
 }  // namespace strata::kernels
