@@ -10,6 +10,7 @@ the id stream onto one of two wire contracts:
   POST /v1/messages           Anthropic Messages: message or message_start .. message_stop SSE
   GET  /v1/models             the single served model
   GET  /health                liveness
+  GET  /                      the Strata chat page (serve/web), open it in a browser
 
 The engine is resident by default: one driver process is started with --serve, loads the weights once, and then
 answers one request per stdin line.  The first request pays the model load; later ones pay only the prefill and
@@ -559,12 +560,52 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- routing ----------------------------------------------------------------------------------------------
 
+    _STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+                     ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".json": "application/json",
+                     ".png": "image/png", ".ico": "image/x-icon", ".woff": "font/woff",
+                     ".woff2": "font/woff2", ".ttf": "font/ttf"}
+
+    def _static(self, path):
+        """Serve the Strata web app (the clone's serve/web): / is index.html, web/<file> is the asset."""
+        root = self.server.web_dir
+        if root is None:
+            return False
+        rel = path.lstrip("/") or "index.html"
+        if rel.startswith("web/"):
+            rel = rel[len("web/"):]
+        elif rel not in ("index.html", "monitor.html"):
+            return False
+        target = (root / rel).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            return False
+        if not target.is_file():
+            return False
+        data = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", self._STATIC_TYPES.get(target.suffix.lower(), "application/octet-stream"))
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+        return True
+
     def do_GET(self):
-        if self.path == "/health":
-            self._json({"status": "ok"})
-        elif self.path == "/v1/models":
+        path = self.path.split("?", 1)[0]
+        if path == "/health":
+            # The web app reads these; the engine is text-only and has no image generator.
+            self._json({"status": "ok", "model": self.server.args.model_id, "images": False,
+                        "image_generation": False, "max_context": self.server.args.ctx})
+        elif path == "/metrics":
+            self._json({})       # the page's Monitor tab polls this; an empty report is an idle server
+        elif path in ("/config", "/settings", "/mcp"):
+            self._error(ApiError(404, "no such endpoint", "not_found_error"), anthropic=False)
+        elif path == "/v1/models":
             self._json({"object": "list", "data": [{"id": self.server.args.model_id, "object": "model",
                                                     "owned_by": "strata"}]})
+        elif self._static(path):
+            pass
         else:
             self._error(ApiError(404, "no such endpoint", "not_found_error"), anthropic=False)
 
@@ -812,6 +853,9 @@ class Server(ThreadingHTTPServer):
         super().__init__(addr, handler)
         self.args, self.tok, self.engine = args, tok, engine
         self.args.model_id = args.model_id or DEFAULT_MODEL
+        # The chat page is the clone's own serve/web; --web-dir points it elsewhere, a missing dir leaves the API only.
+        root = pathlib.Path(args.web_dir).expanduser() if args.web_dir else HERE.parent.parent / "serve" / "web"
+        self.web_dir = root.resolve() if root.is_dir() else None
         # Warm the resident driver while the port opens; the first generate() waits on the same lock.
         if not getattr(args, "no_resident", False):
             threading.Thread(target=engine.warm, daemon=True).start()
@@ -844,6 +888,8 @@ def main(argv):
                     help="one driver process per request (the P6 path); the default keeps the model resident")
     ap.add_argument("--serve-ctx", type=int, default=16384,
                     help="resident mode: the driver's token budget (default 16384; a longer request is refused)")
+    ap.add_argument("--web-dir", default=None,
+                    help="the chat page's files (default: the clone's serve/web; a missing dir serves the API only)")
     args = ap.parse_args(argv[1:])
 
     if args.serve_ctx < 1:
