@@ -273,7 +273,7 @@ Each phase has a gate that is a comparison, not an inspection.
 | P0 (done) | artifact opened; types, geometry and both hard formats read; VQ decoder written and checked | fixtures bit-exact; real layer-0 slot arithmetic closes; expert 0 decodes finite |
 | P1 (loader, tokenizer and template landed) | family loader in Strata: `deepseek4` metadata, tensor types 42/44, inventory, tokenizer and chat template | the loader reports the 1,000-tensor inventory and every rejected tensor by name; malformed blobs are refused with a named error; the tokenizer's ids match the reference oracle; the template's bytes match the reference renderer. Met for metadata, types, inventory and blob containers on the real header, for `encode` and rendered-chat ids on the tokenizer corpus, and for the V4.1 DSML template on the official and differential vectors; the 43 blob payloads await the full file |
 | P2 (CUDA done; HIP waits for AMD hardware) | VQ decode on CUDA, then HIP: row-dot kernels that read the bit stream directly | GPU output bit-identical to the CPU decoder on the fixtures and on real expert 0. Met on CUDA: 0 mismatching bytes on both v2 fixtures (also against the engine's own dumps) and on all 35.4M decoded values of the real layer-0 expert 0, whose three matrices are v3 13-bit; the row dot agrees with a float64 reference to 9.1e-9 of the term scale. The same source is HIP-translated by the gfx906 build, but no ROCm device exists here to run it |
-| P3 | trunk forward: MLA q/kv LoRAs, compressors, sparse indexer, sinks, sliding window, hyper-connections, RoPE both bases, MoE 384/top-6 + shared, fused VQ MoE | temperature-0 token ids and logits match the reference engine per position |
+| P3 (hyper-connections landed and gated) | trunk forward: MLA q/kv LoRAs, compressors, sparse indexer, sinks, sliding window, hyper-connections, RoPE both bases, MoE 384/top-6 + shared, fused VQ MoE | temperature-0 token ids and logits match the reference engine per position. Met for hyper-connections: mix, the Sinkhorn split, hc_pre + the RMS norm and hc_post match the host oracle within summation-order tolerances on 5120x4 at one and five tokens, 300x2 and 128x8; every bf16 output is on the bf16 grid; fused and unfused agree bitwise (364 checks, RTX 3060) |
 | P4 (hash, reader, projections and their GPU gates done; wiring and the on/off gate await P3) | Engram: hash, O_DIRECT row reader, q/k/wkv projections, io_uring overlap if prefill needs it | hash rows match the reference implementation on its fixture, then on rows captured from the same checkpoint; output matches with engram on and off. Met for the hash and the row decode: 0 differing rows or values on the reference's hash fixture and on the captured golden positions through all four read paths, and 0 bit-diffs on the GPU row decode of the real shards. The gate and wkv meet their float64 bounds on the fixtures and the real weights. The on/off output gate needs the forward pass |
 | P5 | three DSpark towers and verify/rollback | greedy output byte-identical with drafting on and off; cache frontier exact |
 | P6 | serving: OpenAI and Anthropic surfaces, sampling defaults, thinking toggle | one served request per contract |
@@ -338,6 +338,10 @@ tools/dsv4/test_dsml_render.py          14 tests: the reference's own golden vec
 include/strata/kernels/deepseek4_vq.hpp  host/device payload parser and the two GPU entries
 src/kernels/cuda/deepseek4_vq.cu         P2: whole-matrix VQ decode and the packed-stream row dot
 tests/core/deepseek4_vq_cuda_test.cpp    the P2 gate: GPU decode vs the CPU decoder, bitwise; row dot vs f64
+include/strata/kernels/deepseek4_hc.hpp  P3: hyper-connection semantics, host oracle and device entries
+src/kernels/deepseek4_hc_host.cpp        P3 host oracle: mix, Sinkhorn split, hc_pre + norm, hc_post
+src/kernels/cuda/deepseek4_hc.cu         P3 device half: the five kernels incl. the fused split/pre/norm
+tests/core/deepseek4_hc_cuda_test.cpp    the P3 gate: GPU vs oracle on four shapes, bf16 grid, fused bitwise
 
 include/strata/artifact/deepseek4_engram.hpp       P4 host half: hash, O_DIRECT row reader, gate emulation
 include/strata/artifact/deepseek4_engram_bits.hpp  the fp8/bf16 conversions, host and device, shared by both
@@ -372,6 +376,10 @@ cmake --build /tmp/dsv4-build --target deepseek4_engram_test
 /usr/local/cuda-13.2/bin/nvcc -O2 -std=c++20 -Iinclude \
   tests/core/deepseek4_engram_cuda_test.cpp src/kernels/cuda/deepseek4_engram.cu -o /tmp/dsv4_engram_cuda_test
 /tmp/dsv4_engram_cuda_test reference /mnt/nvme
+cmake -S . -B /tmp/dsv4-build -DSTRATA_BUILD_TESTS=ON -DSTRATA_ENABLE_CUDA=ON \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.2/bin/nvcc
+cmake --build /tmp/dsv4-build --target deepseek4_hc_cuda_test
+/tmp/dsv4-build/deepseek4_hc_cuda_test
 ```
 
 Expected: `89 checks, 0 failures`, two fixture lines with 0 mismatches, three
