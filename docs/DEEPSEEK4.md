@@ -277,7 +277,8 @@ overlap if prefill wants it.
 | Engram | 203.1 GB (189.2 GiB) |
 
 All of the base model fits in RAM with roughly 100 GiB to spare for the OS and
-page cache, so expert payloads can be read from RAM rather than disk. The
+page cache, so expert payloads can be read from RAM rather than disk;
+`--ram-image` is that tier (see "The RAM image, measured" below). The
 non-expert trunk, the three towers and the embeddings together are 8.36 GB;
 on the 40 GB of VRAM that leaves about 31.6 GB for a compressed expert cache,
 or roughly 4,600 of the 15,360 routed expert payloads (30%) at 6.7-7.2 MB each.
@@ -1020,8 +1021,51 @@ drop is the whole price of serving the full context resident.
 
 ```
 python3 tools/dsv4/dsv4_server.py --port 8080 --devices 0,1,2,3 --chunk 0 \
-    --engram-feed --expert-cache-mib 1024,1024,4096,4096 --serve-ctx 1048576
+    --engram-feed --ram-image --expert-cache-mib 1100,1950,5000,4096 --serve-ctx 1048576
 ```
+
+### The RAM image, measured (`--ram-image`)
+
+`--ram-image` (opt-in; off by default) reads the whole assembled image into one
+host buffer at start and serves every read from it.  The buffer is pinned with
+`cudaHostAlloc` when the driver allows it - on this machine it did - which makes
+it a direct DMA source: an expert-cache miss is copied straight into the layer's
+device container with one `cudaMemcpyAsync` per slot, instead of the old path's
+disk read into the pageable staging vector followed by the driver's bounce copy.
+Without the flag every read still goes to the parts and the path is unchanged.
+
+Measured on 2026-10-18 on the four-card rig (gen 2, prompt ids 1,2,3): 105.8 GiB
+pinned in 141.50 s (803 MB/s; the load is disk-bound - a direct read of part 1
+measured 785 MB/s).  The same run without the flag returned the same ids:
+`generated=11992,3` both ways (with the image 1.48 s prefill and 0.34 s for 2
+tokens, without it 2.30 s and 0.66 s - a tiny run whose first pass includes the
+driver's own loads, so it is a correctness pair, not a speed claim).  The load
+is one-time: after it no expert read touches the disk.  The two engram shards
+are not in it - 203.1 GB does not fit beside 105.8 GiB in 247 GiB - so they
+stay O_DIRECT on NVMe.
+
+The resident server warms the driver in the background while the port opens, so
+a request sent before the load finishes waits on the engine lock; with the RAM
+image that wait is about 2.5 minutes on first start, and the log's
+`[v41] ram image: ... pinned in ... s` line says when it is done.
+
+The 1100/1950/5000/4096 MiB cache is the most the fit takes without pulling
+stage 3's cap below the other stages': each budget is solved from its stage's
+own fit (`cap * row + 384 * slot + fixed + cache <= 0.9 * free`).  On the
+server start of 2026-10-18 the budgets were 5405/6049/9425/8169 MiB and the
+caps 1484/1492/1627/1412 rows, so the run's chunk was stage 3's 1412.  Stage
+3's cap follows the VRAM free when the driver starts - it had been 1663 in a
+run earlier the same day - and the caches above leave stage 3 at its old 4096
+MiB, so the 1412 was that start's free VRAM, not these caches.  Against the
+earlier 1/1/4/4 GiB plan the caches add +76/+926/+904/+0 MiB and +12/+135/+132/+0
+slots (1,765 in all, against 1,486).
+
+The documented request (11 tokens in, 8 greedily, through the server) on this
+plan took 5.31 s end to end: 3.32 s to first token and 2.00 s for the 8 tokens
+(4.0 tok/s in the driver's log; 3.5 tok/s over the 7 inter-token intervals the
+metrics count).  The same request under the older plan (no RAM image, 1/1/4/4
+cache, chunk 1663) took 8.13 s on its second request earlier the same day.
+Two things changed with the plan, so that pair is not an A/B.
 
 ## 9. Downloads for the next phases
 
