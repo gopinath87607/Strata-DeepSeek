@@ -1301,14 +1301,14 @@ bool Runner::layer(uint32_t il, std::string& err) {
     if (opt_.trace) probe(("L" + std::to_string(il) + " hc_in").c_str(), hc_, uint64_t(cur_n_) * HC_ * E_);
     if (!hc_half(il, true, err)) return false;
     if (!attn(il, err)) return false;
-    if (!k::deepseek4_hc_post(hc2_, attn_out_, hc_, post_, comb_, E_, HC_, cur_n_, stream_)) {
+    if (!k::deepseek4_hc_post(attn_out_, hc_, post_, comb_, hc2_, E_, HC_, cur_n_, stream_)) {
         err = "hc_post (attn) failed";
         return false;
     }
     std::swap(hc_, hc2_);
     if (!hc_half(il, false, err)) return false;
     if (!moe(il, err)) return false;
-    if (!k::deepseek4_hc_post(hc2_, y_, hc_, post_, comb_, E_, HC_, cur_n_, stream_)) {
+    if (!k::deepseek4_hc_post(y_, hc_, post_, comb_, hc2_, E_, HC_, cur_n_, stream_)) {
         err = "hc_post (ffn) failed";
         return false;
     }
