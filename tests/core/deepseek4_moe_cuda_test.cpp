@@ -36,6 +36,7 @@
 
 #include "strata/kernels/deepseek4_dense.hpp"
 #include "strata/kernels/deepseek4_moe.hpp"
+#include "strata/kernels/deepseek4_prefill.hpp"
 #include "vq_decode.hpp"
 
 namespace {
@@ -601,6 +602,119 @@ void test_moe_fixture() {
         }
     }
 
+    // ---- the batched prefill arm on the same fixture (13-bit, CB=0: the codebook read from global) ----
+    // 19 tokens of the K=6 case - more than kGemvMaxTok and enough pairs that the busiest expert's run spans
+    // more than one 128-token item - with each token scaled so the rows differ.  The per-pair entry is the
+    // reference; the batched arm only changes the K accumulation order, so the criterion is the fixture's own
+    // 1e-3 of the vector's scale.
+    {
+        const MoeCase& b = cases[6];
+        CHECK(b.k == 6u);
+        const uint32_t n_tok = 19, nexp = static_cast<uint32_t>(dsv4::blob_nexp(blob.data(), blob.size()));
+        std::vector<float> xb, wb;
+        std::vector<int32_t> selb;
+        for (uint32_t t = 0; t < n_tok; t++) {
+            const float s = 1.0f + 0.07f * static_cast<float>(t);
+            for (float v : b.x) xb.push_back(v * s);
+            for (float v : b.w) wb.push_back(v);
+            for (int32_t e : b.sel) selb.push_back(e);
+        }
+        strata::kernels::Deepseek4MoePrefillSizes sz;
+        CHECK(strata::kernels::deepseek4_moe_prefill_sizes(n_tok * b.k, nexp, in_dim, mid_dim, nc, &sz));
+        auto dev_bytes = [](uint64_t n) -> void* {
+            void* p = nullptr;
+            if (n == 0 || cudaMalloc(&p, static_cast<size_t>(n)) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return nullptr;
+            }
+            return p;
+        };
+        strata::kernels::Deepseek4MoePrefillScratch pf;
+        pf.xs = static_cast<uint16_t*>(dev_bytes(sz.xs));
+        pf.g16 = static_cast<uint16_t*>(dev_bytes(sz.g16));
+        pf.h16 = static_cast<uint16_t*>(dev_bytes(sz.h16));
+        pf.cb16 = static_cast<uint16_t*>(dev_bytes(sz.cb16));
+        pf.perm = static_cast<int32_t*>(dev_bytes(sz.perm));
+        pf.inv = static_cast<int32_t*>(dev_bytes(sz.inv));
+        pf.off = static_cast<uint32_t*>(dev_bytes(sz.off));
+        pf.items = static_cast<strata::kernels::Deepseek4MoePrefillItem*>(dev_bytes(sz.items));
+        pf.pairs_cap = n_tok * b.k;
+        pf.experts_cap = nexp;
+        pf.mid_cap = mid_dim;
+        pf.cb_cap = nc * 8u;
+        uint8_t* d_blob3 = static_cast<uint8_t*>(dev_bytes(blob.size() + 8u));   // the arm's 8-byte window pad
+        float* d_x = dev_new(xb);
+        int32_t* d_sel = dev_new(selb);
+        float* d_w = dev_new(wb);
+        const std::vector<float> zero(static_cast<size_t>(n_tok) * out_dim, 0.0f);
+        float* d_ref = dev_new(zero);
+        float* d_pf = dev_new(zero);
+        float* d_part = dev_new(std::vector<float>(static_cast<size_t>(n_tok) * b.k * out_dim, 0.0f));
+        bool ok = d_blob3 != nullptr && d_x != nullptr && d_sel != nullptr && d_w != nullptr && d_ref != nullptr &&
+                  d_pf != nullptr && d_part != nullptr && pf.xs != nullptr && pf.g16 != nullptr &&
+                  pf.h16 != nullptr && pf.cb16 != nullptr && pf.perm != nullptr && pf.inv != nullptr &&
+                  pf.off != nullptr && pf.items != nullptr;
+        CHECK(ok);
+        if (ok) ok = cudaMemcpy(d_blob3, blob.data(), blob.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+        CHECK(ok);
+        if (ok)
+            ok = strata::kernels::deepseek4_routed_moe(d_ref, d_part, d_blob3, blob.size(), in_dim, mid_dim,
+                                                       out_dim, d_sel, d_w, b.k, 10.0f, d_x, n_tok, nc, blob_v3,
+                                                       nullptr, nullptr);
+        CHECK(ok);
+        if (ok)
+            ok = strata::kernels::deepseek4_routed_moe_prefill(d_pf, d_part, d_blob3, blob.size(), in_dim,
+                                                               mid_dim, out_dim, selb.data(), d_w, b.k, 10.0f,
+                                                               d_x, n_tok, nexp, nc, blob_v3, &pf, nullptr);
+        CHECK(ok);
+        std::vector<float> ref, got;
+        if (ok) CHECK(dev_read(d_ref, zero.size(), &ref));
+        if (ok) CHECK(dev_read(d_pf, zero.size(), &got));
+        // The reference's own measurement of this arm against the per-pair arithmetic: the K accumulation order
+        // is the only difference, at one bf16 ulp on 0.5% of outputs and relative L2 1.7e-4.  This fixture's
+        // scale reaches 1.7e6, where ONE bf16 ulp is already 4e-3 of it, so a max-abs fraction is not the
+        // measure; take the reference's numbers with room: rel L2 <= 1e-3 and <= 1% of outputs differing.
+        double sed = 0.0, sref = 0.0;
+        size_t ndiff = 0;
+        if (ref.size() == zero.size() && got.size() == zero.size())
+            for (size_t i = 0; i < zero.size(); i++) {
+                const double d = static_cast<double>(got[i]) - ref[i];
+                sed += d * d;
+                sref += static_cast<double>(ref[i]) * ref[i];
+                if (!(got[i] == ref[i])) ndiff++;
+            }
+        const double rel_l2 = std::sqrt(sed / std::max(1e-30, sref));
+        const bool pass = ref.size() == zero.size() && got.size() == zero.size() && rel_l2 <= 1e-3 &&
+                          ndiff * 100u <= zero.size();
+        std::printf("moe prefill (13-bit, %u tokens): %s (rel L2 %.3e, %zu of %zu outputs differ)\n", n_tok,
+                    pass ? "PASS" : "FAIL", rel_l2, ndiff, zero.size());
+        CHECK(pass);
+        // The arm declines before launching anything: a v2 container, or a scratch that cannot hold the batch.
+        CHECK(!strata::kernels::deepseek4_routed_moe_prefill(d_pf, d_part, d_blob3, blob.size(), in_dim, mid_dim,
+                                                             out_dim, selb.data(), d_w, b.k, 10.0f, d_x, n_tok,
+                                                             nexp, nc, 0u, &pf, nullptr));
+        strata::kernels::Deepseek4MoePrefillScratch small = pf;
+        small.pairs_cap = 1;
+        CHECK(!strata::kernels::deepseek4_routed_moe_prefill(d_pf, d_part, d_blob3, blob.size(), in_dim, mid_dim,
+                                                             out_dim, selb.data(), d_w, b.k, 10.0f, d_x, n_tok,
+                                                             nexp, nc, blob_v3, &small, nullptr));
+        (void) cudaFree(d_blob3);
+        (void) cudaFree(d_x);
+        (void) cudaFree(d_sel);
+        (void) cudaFree(d_w);
+        (void) cudaFree(d_ref);
+        (void) cudaFree(d_pf);
+        (void) cudaFree(d_part);
+        (void) cudaFree(pf.xs);
+        (void) cudaFree(pf.g16);
+        (void) cudaFree(pf.h16);
+        (void) cudaFree(pf.cb16);
+        (void) cudaFree(pf.perm);
+        (void) cudaFree(pf.inv);
+        (void) cudaFree(pf.off);
+        (void) cudaFree(pf.items);
+    }
+
     std::printf("routed MoE: %s (%zu cases, worst %.3e of scale vs the reference emulation, %.3e vs the "
                 "oracle; %d case failures)\n",
                 case_fail == 0 ? "PASS" : "FAIL", cases.size(), static_cast<double>(worst_rel),
@@ -650,6 +764,156 @@ void test_tail() {
     (void) cudaFree(d_y);
 }
 
+// ---- the batched arm on a synthetic v3 12-bit container -------------------------------------------------
+// The fixture above is 13-bit, which is the arm whose codebook is read from global memory.  The model's layers
+// 14-39 are 12-bit with no plane: the same kernel with the 64 KB shared codebook instead (CB=1).  The container
+// is built here (2 experts, 128x128 matrices, nc 4096, E4M3, no plane) and the two arms are compared on 140
+// tokens over both experts - enough pairs that each expert's run spans three items, the last one partial.
+void test_moe_prefill_12bit() {
+    const uint32_t nexp = 2, in_dim = 128, mid_dim = 128, out_dim = 128, nc = 4096, topk = 4, n_tok = 140;
+    std::vector<uint8_t> b;
+    auto app16 = [&](uint16_t v) {
+        b.push_back(static_cast<uint8_t>(v));
+        b.push_back(static_cast<uint8_t>(v >> 8));
+    };
+    auto app32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; i++) b.push_back(static_cast<uint8_t>(v >> (8 * i)));
+    };
+    auto app64 = [&](uint64_t v) {
+        for (int i = 0; i < 8; i++) b.push_back(static_cast<uint8_t>(v >> (8 * i)));
+    };
+    app32(dsv4::kBlobMagic);
+    app32(3);
+    app32(0);
+    app32(nexp);
+    const size_t table = b.size();
+    for (uint32_t i = 0; i < nexp * 3; i++) app64(0);
+    const uint64_t cb_off = b.size();
+    for (uint32_t i = 0; i < nc * 8; i++) b.push_back(static_cast<uint8_t>((i * 37u) % 126u));   // finite E4M3
+
+    std::vector<uint8_t> bytes;
+    for (uint32_t e = 0; e < nexp; e++) {
+        for (uint32_t w = 0; w < 3; w++) {
+            const uint32_t rows = w == 2 ? out_dim : mid_dim;
+            const uint32_t cols = w == 2 ? mid_dim : in_dim;
+            const uint64_t off = b.size();
+            for (int i = 0; i < 8; i++) b[table + (e * 3 + w) * 8 + i] = static_cast<uint8_t>(off >> (8 * i));
+            app32(dsv4::kMat3Magic);
+            app16(8);
+            app16(static_cast<uint16_t>(nc));
+            app32(rows);
+            app32(cols);
+            app32(dsv4::kV3FlagE4M3);
+            app32(dsv4::kV3MainBits);
+            app64(cb_off);
+            for (uint32_t r = 0; r < rows; r++)   // gains 1, 1.125, 1.25, 1.375 cycling
+                app16(static_cast<uint16_t>(0x3C00u + ((r & 3u) << 7)));
+            for (uint32_t r = 0; r < rows; r++) {   // the 12-bit main stream, packed per row
+                uint64_t bits = 0;
+                uint32_t nbits = 0;
+                for (uint32_t i = 0; i < cols / 8u; i++) {
+                    const uint32_t idx = (r * 7u + i * 13u + e * 5u + w * 3u) % nc;
+                    bits |= static_cast<uint64_t>(idx) << nbits;
+                    nbits += 12;
+                    while (nbits >= 8) {
+                        b.push_back(static_cast<uint8_t>(bits & 0xFFu));
+                        bits >>= 8;
+                        nbits -= 8;
+                    }
+                }
+                if (nbits != 0) b.push_back(static_cast<uint8_t>(bits & 0xFFu));
+            }
+            // The parser's guarantee: three bytes past the last window (and the arm's 8-byte read window).
+            for (int i = 0; i < 8; i++) b.push_back(0);
+        }
+    }
+
+    std::vector<float> x(static_cast<size_t>(n_tok) * in_dim);
+    std::vector<int32_t> sel(static_cast<size_t>(n_tok) * topk);
+    std::vector<float> w(static_cast<size_t>(n_tok) * topk);
+    for (auto& v : x) v = frand();
+    for (auto& v : sel) v = static_cast<int32_t>(static_cast<uint32_t>((frand() + 2.0f) * 0.5f * 1e6f) % nexp);
+    for (auto& v : w) v = 0.2f + std::fabs(frand()) * 0.1f;
+
+    strata::kernels::Deepseek4MoePrefillSizes sz;
+    const bool sizes_ok = strata::kernels::deepseek4_moe_prefill_sizes(n_tok * topk, nexp, in_dim, mid_dim, nc, &sz);
+    CHECK(sizes_ok);
+    if (!sizes_ok) return;
+    auto dev_bytes = [](uint64_t n) -> void* {
+        void* p = nullptr;
+        if (n == 0 || cudaMalloc(&p, static_cast<size_t>(n)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return nullptr;
+        }
+        return p;
+    };
+    strata::kernels::Deepseek4MoePrefillScratch pf;
+    pf.xs = static_cast<uint16_t*>(dev_bytes(sz.xs));
+    pf.g16 = static_cast<uint16_t*>(dev_bytes(sz.g16));
+    pf.h16 = static_cast<uint16_t*>(dev_bytes(sz.h16));
+    pf.cb16 = static_cast<uint16_t*>(dev_bytes(sz.cb16));
+    pf.perm = static_cast<int32_t*>(dev_bytes(sz.perm));
+    pf.inv = static_cast<int32_t*>(dev_bytes(sz.inv));
+    pf.off = static_cast<uint32_t*>(dev_bytes(sz.off));
+    pf.items = static_cast<strata::kernels::Deepseek4MoePrefillItem*>(dev_bytes(sz.items));
+    pf.pairs_cap = n_tok * topk;
+    pf.experts_cap = nexp;
+    pf.mid_cap = mid_dim;
+    pf.cb_cap = nc * 8u;
+    uint8_t* d_blob = static_cast<uint8_t*>(dev_bytes(b.size() + 8u));
+    float* d_x = dev_new(x);
+    int32_t* d_sel = dev_new(sel);
+    float* d_w = dev_new(w);
+    const std::vector<float> zero(static_cast<size_t>(n_tok) * out_dim, 0.0f);
+    float* d_ref = dev_new(zero);
+    float* d_pf = dev_new(zero);
+    float* d_part = dev_new(std::vector<float>(static_cast<size_t>(n_tok) * topk * out_dim, 0.0f));
+    bool ok = d_blob != nullptr && d_x != nullptr && d_sel != nullptr && d_w != nullptr && d_ref != nullptr &&
+              d_pf != nullptr && d_part != nullptr && pf.xs != nullptr && pf.g16 != nullptr && pf.h16 != nullptr &&
+              pf.cb16 != nullptr && pf.perm != nullptr && pf.inv != nullptr && pf.off != nullptr &&
+              pf.items != nullptr;
+    CHECK(ok);
+    if (ok) ok = cudaMemcpy(d_blob, b.data(), b.size(), cudaMemcpyHostToDevice) == cudaSuccess;
+    CHECK(ok);
+    if (ok)
+        ok = strata::kernels::deepseek4_routed_moe(d_ref, d_part, d_blob, b.size(), in_dim, mid_dim, out_dim, d_sel,
+                                                   d_w, topk, 10.0f, d_x, n_tok, nc, 1u, nullptr, nullptr);
+    CHECK(ok);
+    if (ok)
+        ok = strata::kernels::deepseek4_routed_moe_prefill(d_pf, d_part, d_blob, b.size(), in_dim, mid_dim,
+                                                           out_dim, sel.data(), d_w, topk, 10.0f, d_x, n_tok, nexp,
+                                                           nc, 1u, &pf, nullptr);
+    CHECK(ok);
+    std::vector<float> ref, got;
+    if (ok) CHECK(dev_read(d_ref, zero.size(), &ref));
+    if (ok) CHECK(dev_read(d_pf, zero.size(), &got));
+    float scale = 0.0f, dmax = 0.0f;
+    if (ref.size() == zero.size() && got.size() == zero.size())
+        for (size_t i = 0; i < zero.size(); i++) {
+            scale = std::max(scale, std::fabs(ref[i]));
+            dmax = std::max(dmax, std::fabs(got[i] - ref[i]));
+        }
+    const bool pass = ref.size() == zero.size() && got.size() == zero.size() && dmax <= 1e-3f * scale;
+    std::printf("moe prefill (12-bit, %u tokens, %u pairs): %s (max abs %.3e of scale %.3e)\n", n_tok,
+                n_tok * topk, pass ? "PASS" : "FAIL", static_cast<double>(dmax), static_cast<double>(scale));
+    CHECK(pass);
+    (void) cudaFree(d_blob);
+    (void) cudaFree(d_x);
+    (void) cudaFree(d_sel);
+    (void) cudaFree(d_w);
+    (void) cudaFree(d_ref);
+    (void) cudaFree(d_pf);
+    (void) cudaFree(d_part);
+    (void) cudaFree(pf.xs);
+    (void) cudaFree(pf.g16);
+    (void) cudaFree(pf.h16);
+    (void) cudaFree(pf.cb16);
+    (void) cudaFree(pf.perm);
+    (void) cudaFree(pf.inv);
+    (void) cudaFree(pf.off);
+    (void) cudaFree(pf.items);
+}
+
 // The routed entry's guards, without a blob: shape and null refusals come before any device read.
 void test_entry_guards() {
     float* d = nullptr;
@@ -680,6 +944,7 @@ int main(int argc, char** argv) {
     test_entry_guards();
     test_tail();
     test_moe_fixture();
+    test_moe_prefill_12bit();
     if (g_failures != 0) {
         std::fprintf(stderr, "FAIL: %d checks, %d failures\n", g_checks, g_failures);
         return 1;
