@@ -216,6 +216,322 @@ __global__ void attn_win_ring_snap_kernel(float* win, float* snap, uint32_t pos0
     }
 }
 
+// ---- the sparse indexer (cuda/ds41_indexer.cuh) ----
+// One warp advances kDeepseek4IdxGroupsPerWarp groups at once (the reference's V41_IDX_G).  The per-(group,
+// head) chain "MACs -> 5-level xor reduce -> round" is a serial dependency; the groups interleave it and each
+// head's query row is read once.  The MAC order, the reduction tree, the bf16 rounding point and the head
+// accumulation order all stay the reference's, so the score is bit-identical to one group per warp.
+__global__ void attn_indexer_score_kernel(float* score, const float* q, const uint8_t* k, const float* w,
+                                          const int32_t* cand, uint32_t pos0, uint32_t ng, uint32_t n_head,
+                                          uint32_t dk, uint32_t ratio, const int32_t* posd, uint32_t cand_bs,
+                                          uint32_t cand_cap) {
+    constexpr uint32_t G = kDeepseek4IdxGroupsPerWarp;
+    const uint32_t i = blockIdx.x, lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
+    if (posd) {   // graph: device position; the host ng is the bucket cap
+        pos0 = (uint32_t) posd[0];
+        ng = (pos0 + gridDim.x) / ratio;
+    }
+    const uint32_t vis = (pos0 + i + 1u) / ratio;   // visible groups at this absolute position
+    const uint32_t per = dk / 32u;                 // dk=128 => 4 dims per lane
+    // C2: with a list only the compact row [ns] is scored, item c maps to group g
+    const int32_t* cl = cand ? cand + (uint64_t) i * (1u + cand_cap) : nullptr;
+    const uint32_t nc = cl ? (uint32_t) cl[0] : 0u;
+    const uint32_t ns = cl ? deepseek4_cand_ns(ng, cand_bs, cand_cap) : ng;
+    const uint32_t gstride = nwarp * gridDim.y * G;
+    for (uint32_t gb = (blockIdx.y * nwarp + warp) * G; gb < ns; gb += gstride) {
+        float kv[G][4], acc[G];
+        bool live[G];
+#pragma unroll
+        for (uint32_t j = 0; j < G; j++) {
+            const uint32_t c = gb + j;
+            uint32_t g = c;
+            if (cl) {
+                const uint32_t b = c / cand_bs;
+                g = b < nc ? (uint32_t) cl[1u + b] * cand_bs + c % cand_bs : ng;   // off-list item = dead group
+            }
+            live[j] = c < ns && g < ng && g < vis;
+            acc[j] = 0.0f;
+            const uint8_t* kg = k + (uint64_t)(live[j] ? g : 0u) * kDeepseek4IdxkBytes;
+#pragma unroll
+            for (uint32_t e = 0; e < 4u; e++)
+                kv[j][e] = (live[j] && e < per) ? deepseek4_idxk_get(kg, lane * per + e) : 0.0f;
+        }
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float* qh = q + ((uint64_t) i * n_head + h) * dk;
+            float qv[4];
+#pragma unroll
+            for (uint32_t e = 0; e < 4u; e++) qv[e] = e < per ? qh[lane * per + e] : 0.0f;
+            const float wh = w[(uint64_t) i * n_head + h];
+            float d[G];
+#pragma unroll
+            for (uint32_t j = 0; j < G; j++) {
+                d[j] = 0.0f;
+#pragma unroll
+                for (uint32_t e = 0; e < 4u; e++)
+                    if (e < per) d[j] += qv[e] * kv[j][e];
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+#pragma unroll
+                for (uint32_t j = 0; j < G; j++) d[j] += __shfl_xor_sync(0xffffffffu, d[j], o);
+            }
+#pragma unroll
+            for (uint32_t j = 0; j < G; j++) {
+                float dd = engram_bf16r(d[j]);   // einsum lands in bf16
+                dd = fmaxf(dd, 0.0f);            // relu_
+                acc[j] += engram_bf16r(dd * wh); // x weights (bf16), then sum
+            }
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (uint32_t j = 0; j < G; j++)
+                if (gb + j < ns)
+                    score[(uint64_t) i * ns + gb + j] = live[j] ? engram_bf16r(acc[j]) : -INFINITY;
+        }
+    }
+}
+
+// Candidate blocks: the block score is the in-block max, the block holding the newest position is pinned +inf,
+// and topk_blocks blocks are kept.  kk >= nb selects every block that is not fully invisible; else a parallel
+// radix select finds the kk-th key, keys above it all win and the tie group fills in ascending block order (the
+// reference's strict `>` scan).  The selection compacts into an ascending list whose header is the block count.
+__global__ void attn_candidate_kernel(int32_t* list, const float* score, uint32_t pos0, uint32_t ng, uint32_t ratio,
+                                      uint32_t topk_blocks, uint32_t bs, const int32_t* posd, float* blk,
+                                      uint32_t nb_cap) {
+    const uint32_t i = blockIdx.x;
+    if (posd) {   // graph: device position; the scratch is sized by the bucket cap
+        pos0 = (uint32_t) posd[0];
+        ng = (pos0 + gridDim.x) / ratio;
+    }
+    const uint32_t nb = (ng + bs - 1u) / bs;
+    float* bsc = blk + (uint64_t) i * nb_cap;
+    uint8_t* sel = (uint8_t*)(blk + (uint64_t) gridDim.x * nb_cap) + (uint64_t) i * nb_cap;
+    __shared__ uint32_t hist[256], sh_bucket, sh_k, cnt[256];
+    const uint32_t vis = (pos0 + i + 1u) / ratio;
+    for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) {
+        float m = -INFINITY;
+        for (uint32_t j = b * bs; j < (b + 1u) * bs && j < ng; j++) m = fmaxf(m, score[(uint64_t) i * ng + j]);
+        if (vis > 0u && b == (vis - 1u) / bs) m = INFINITY;   // pin the block holding the newest position
+        bsc[b] = m;
+        sel[b] = 0;
+    }
+    __syncthreads();
+    const uint32_t kk = topk_blocks < nb ? topk_blocks : nb;
+    if (kk >= nb) {   // select all except fully invisible blocks
+        for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) sel[b] = deepseek4_topk_key(bsc[b]) != 0u;
+    } else {          // parallel radix select for the threshold
+        uint32_t prefix = 0, want = kk;
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            for (uint32_t t = threadIdx.x; t < 256u; t += blockDim.x) hist[t] = 0;
+            __syncthreads();
+            for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) {
+                const uint32_t key = deepseek4_topk_key(bsc[b]);
+                if (key == 0u || (shift < 24 && (key >> (shift + 8)) != (prefix >> (shift + 8)))) continue;
+                atomicAdd(&hist[(key >> shift) & 0xffu], 1u);
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {   // accumulate from the top bucket down to the one holding the want-th key
+                uint32_t acc = 0;
+                int t = 255;
+                for (; t > 0; t--) {
+                    if (acc + hist[t] >= want) break;
+                    acc += hist[t];
+                }
+                sh_bucket = (uint32_t) t;
+                sh_k = want - acc;
+            }
+            __syncthreads();
+            prefix |= sh_bucket << shift;
+            want = sh_k;
+            __syncthreads();
+        }
+        for (uint32_t b = threadIdx.x; b < nb; b += blockDim.x) sel[b] = deepseek4_topk_key(bsc[b]) > prefix;
+        __syncthreads();
+        if (threadIdx.x == 0) {   // keys == threshold fill in ascending block order (ties take the smaller block)
+            uint32_t eq = want;
+            for (uint32_t b = 0; b < nb && eq; b++)
+                if (deepseek4_topk_key(bsc[b]) == prefix) {
+                    sel[b] = 1;
+                    eq--;
+                }
+        }
+    }
+    __syncthreads();
+    // Compact the selection into an ascending list: each thread owns one contiguous block span, span counts ->
+    // exclusive prefix -> spans written in order.
+    const uint32_t chunk = (nb + blockDim.x - 1u) / blockDim.x;
+    const uint32_t c0 = threadIdx.x * chunk, c1 = (c0 + chunk) < nb ? (c0 + chunk) : nb;
+    uint32_t mine = 0;
+    for (uint32_t b = c0; b < c1; b++) mine += sel[b];
+    cnt[threadIdx.x] = mine;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint32_t run = 0;
+        for (uint32_t t = 0; t < blockDim.x; t++) {
+            const uint32_t v = cnt[t];
+            cnt[t] = run;
+            run += v;
+        }
+        list[(uint64_t) i * (1u + topk_blocks)] = (int32_t) run;   // <= kk <= topk_blocks: the list always fits
+    }
+    __syncthreads();
+    uint32_t wr = cnt[threadIdx.x];
+    for (uint32_t b = c0; b < c1; b++)
+        if (sel[b]) list[(uint64_t) i * (1u + topk_blocks) + 1u + wr++] = (int32_t) b;
+}
+
+// The topk selector: topk over min(index_topk, visible), output in position order, unreachable slots -1.
+// Parallel radix select (8 bits per round, 1024 threads, reads batched) then a segmented write-out; the set,
+// the order and the "ties take the smaller index" rule are the reference's serial scan's.
+__device__ __forceinline__ int32_t attn_cand_map(const int32_t* cl, uint32_t c, uint32_t bs) {
+    return cl ? cl[1u + c / bs] * (int32_t) bs + (int32_t)(c % bs) : (int32_t) c;
+}
+
+__global__ void __launch_bounds__(kDeepseek4TopkThreads) attn_topk_kernel(
+    int32_t* idx, const float* score, uint32_t ng, uint32_t topk, uint32_t ratio, const int32_t* posd,
+    const int32_t* cand, uint32_t cand_bs, uint32_t cand_cap) {
+    constexpr uint32_t B = kDeepseek4TopkBatch;
+    const uint32_t i = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+    if (posd) {   // graph: ng and topk recomputed from the device position (same formula as the host's min)
+        ng = ((uint32_t) posd[0] + gridDim.x) / ratio;
+        if (ng < topk) topk = ng;
+    }
+    // C2: with a list the scan covers the compact row [ns]; writes map back; the topk cap still uses ng
+    const int32_t* cl = cand ? cand + (uint64_t) i * (1u + cand_cap) : nullptr;
+    const uint32_t ns = cl ? deepseek4_cand_ns(ng, cand_bs, cand_cap) : ng;
+    const float* s = score + (uint64_t) i * ns;
+    __shared__ uint32_t hist[256], suf[257], sh_bucket;
+    __shared__ uint32_t cgt[kDeepseek4TopkThreads], ceq[kDeepseek4TopkThreads], sh_tgt, sh_teq;
+    uint32_t prefix = 0, kk = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (uint32_t b = tid; b < 256u; b += nt) hist[b] = 0;
+        __syncthreads();
+        for (uint32_t gb = tid; gb < ns; gb += B * nt) {
+            float v[B];
+#pragma unroll
+            for (uint32_t j = 0; j < B; j++) {
+                const uint32_t g = gb + j * nt;
+                v[j] = g < ns ? s[g] : -INFINITY;
+            }
+#pragma unroll
+            for (uint32_t j = 0; j < B; j++) {
+                const uint32_t key = deepseek4_topk_key(v[j]);   // out-of-range -inf => key 0: not counted
+                // shift=24 has no higher bits to compare; everything counts
+                if (key == 0u || (shift < 24 && (key >> (shift + 8)) != (prefix >> (shift + 8)))) continue;
+                atomicAdd(&hist[(key >> shift) & 0xffu], 1u);
+            }
+        }
+        __syncthreads();
+        if (tid < 32u) {   // suffix sums suf[b] = sum_{b' >= b} hist[b']; lane l owns buckets [8l, 8l+8)
+            uint32_t loc = 0;
+            for (uint32_t b = 0; b < 8u; b++) loc += hist[tid * 8u + b];
+            uint32_t inc = loc;
+            for (int o = 1; o < 32; o <<= 1) {
+                const uint32_t t = __shfl_down_sync(0xffffffffu, inc, o);
+                if (tid + (uint32_t) o < 32u) inc += t;
+            }
+            uint32_t run = inc - loc;   // buckets above this lane
+            for (int b = 7; b >= 0; b--) {
+                run += hist[tid * 8u + (uint32_t) b];
+                suf[tid * 8u + (uint32_t) b] = run;
+            }
+            if (tid == 0u) {
+                suf[256] = 0u;
+                sh_bucket = 0u;
+            }
+        }
+        __syncthreads();
+        if (shift == 24) {   // round 1's histogram covers every valid key => suf[0] = nvalid
+            const uint32_t nval = suf[0];
+            kk = topk < nval ? topk : nval;
+            if (kk == 0u) break;   // original: kk == 0 never enters radix, prefix stays 0 (block-uniform branch)
+        }
+        for (uint32_t b = 1u + tid; b < 256u; b += nt)
+            if (suf[b] >= kk) atomicMax(&sh_bucket, b);
+        __syncthreads();
+        const uint32_t bucket = sh_bucket;
+        prefix |= bucket << shift;
+        kk -= suf[bucket + 1u];   // how many more to take inside this bucket
+        __syncthreads();          // everyone must finish reading hist/suf before the next round clears them
+    }
+    // Write-out segments: position = (count of > threshold before g) + min(count of == threshold before g, eq).
+    if (tid == 0) {
+        sh_tgt = 0;
+        sh_teq = 0;
+    }
+    __syncthreads();
+    const uint32_t chunk = (ns + nt - 1u) / nt;
+    const uint32_t g0 = tid * chunk, g1 = (g0 + chunk) < ns ? (g0 + chunk) : ns;
+    {   // (1) each span counts its own > threshold / == threshold (reads batched)
+        uint32_t ngt = 0, neq = 0;
+        for (uint32_t gb = g0; gb < g1; gb += B) {
+            float v[B];
+#pragma unroll
+            for (uint32_t j = 0; j < B; j++) v[j] = gb + j < g1 ? s[gb + j] : -INFINITY;
+#pragma unroll
+            for (uint32_t j = 0; j < B; j++) {
+                const uint32_t key = deepseek4_topk_key(v[j]);
+                if (key == 0u) continue;
+                if (key > prefix) ngt++;
+                else if (key == prefix) neq++;
+            }
+        }
+        cgt[tid] = ngt;
+        ceq[tid] = neq;
+        atomicAdd(&sh_tgt, ngt);   // totals: (4) uses them to fill the tail
+        atomicAdd(&sh_teq, neq);
+    }
+    __syncthreads();
+    {   // (2) two exclusive prefix sums (Hillis-Steele in place; every level needs its syncthreads, all outside branches)
+        const uint32_t vg = tid ? cgt[tid - 1u] : 0u;
+        const uint32_t ve = tid ? ceq[tid - 1u] : 0u;
+        __syncthreads();
+        cgt[tid] = vg;
+        ceq[tid] = ve;
+        __syncthreads();
+        for (uint32_t off = 1u; off < nt; off <<= 1) {
+            const uint32_t ag = tid >= off ? cgt[tid - off] : 0u;
+            const uint32_t ae = tid >= off ? ceq[tid - off] : 0u;
+            __syncthreads();
+            cgt[tid] += ag;
+            ceq[tid] += ae;
+            __syncthreads();
+        }
+    }
+    {   // (3) spans written ascending; eq = how many == threshold still to take, from the radix tail
+        const uint32_t eq = kk;
+        uint32_t wgt = cgt[tid], weq = ceq[tid];
+        for (uint32_t gb = g0; gb < g1; gb += B) {
+            float v[B];
+#pragma unroll
+            for (uint32_t j = 0; j < B; j++) v[j] = gb + j < g1 ? s[gb + j] : -INFINITY;
+#pragma unroll
+            for (uint32_t j = 0; j < B; j++) {
+                const uint32_t g = gb + j;
+                const uint32_t key = deepseek4_topk_key(v[j]);
+                if (key == 0u) continue;
+                if (key > prefix) {
+                    const uint32_t pos = wgt + (weq < eq ? weq : eq);
+                    if (pos < topk) idx[(uint64_t) i * topk + pos] = attn_cand_map(cl, g, cand_bs);
+                    wgt++;
+                } else if (key == prefix) {
+                    if (weq < eq) {
+                        const uint32_t pos = wgt + weq;
+                        if (pos < topk) idx[(uint64_t) i * topk + pos] = attn_cand_map(cl, g, cand_bs);
+                    }
+                    weq++;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    {   // (4) fill the tail with -1; total = all > threshold + min(all == threshold, eq), same as the original
+        uint32_t total = sh_tgt + (sh_teq < kk ? sh_teq : kk);
+        if (total > topk) total = topk;
+        for (uint32_t w = total + tid; w < topk; w += nt) idx[(uint64_t) i * topk + w] = -1;
+    }
+}
+
 bool finish(cudaStream_t stream, const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -339,6 +655,50 @@ bool deepseek4_win_ring_snap(float* d_win, float* d_snap, uint32_t pos0, uint32_
     attn_win_ring_snap_kernel<<<n - i0, 256, 0, static_cast<cudaStream_t>(stream)>>>(
         d_win, d_snap, pos0, i0, window, head_dim, back ? 1u : 0u, d_pos);
     return finish(static_cast<cudaStream_t>(stream), back ? "win ring restore" : "win ring save");
+}
+
+bool deepseek4_indexer_score(float* d_score, const float* d_q, const uint8_t* d_idxk, const float* d_w,
+                             const int32_t* d_cand, uint32_t pos0, uint32_t ng, uint32_t n_tok, uint32_t n_head,
+                             uint32_t dk, uint32_t ratio, uint32_t cand_bs, uint32_t cand_cap,
+                             const int32_t* d_pos, void* stream) {
+    if (!d_score || !d_q || !d_idxk || !d_w || n_tok == 0 || ratio == 0 || (dk % 32u) != 0) return false;
+    if (dk / 32u > 4u) return false;   // the reference refuses dk > 128: at most 4 dims per lane
+    if (d_pos && n_tok > 8u) return false;   // the graph route takes only decode-sized batches
+    if (ng == 0) return true;
+    if (d_cand && (cand_bs == 0u || cand_cap == 0u)) return false;
+    // One block = 8 warps x kDeepseek4IdxGroupsPerWarp groups; with a list the grid is sized by the compact width.
+    const uint32_t ns = d_cand ? deepseek4_cand_ns(ng, cand_bs, cand_cap) : ng;
+    uint32_t gblocks = (ns + 8u * kDeepseek4IdxGroupsPerWarp - 1u) / (8u * kDeepseek4IdxGroupsPerWarp);
+    if (gblocks > 65535u) gblocks = 65535u;   // CUDA's grid.y cap; the kernel wraps by grid stride
+    attn_indexer_score_kernel<<<dim3(n_tok, gblocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        d_score, d_q, d_idxk, d_w, d_cand, pos0, ng, n_head, dk, ratio, d_pos, cand_bs, cand_cap);
+    return finish(static_cast<cudaStream_t>(stream), "indexer score");
+}
+
+bool deepseek4_candidate_blocks(int32_t* d_list, const float* d_score, float* d_scratch, uint32_t n_tok,
+                                uint32_t pos0, uint32_t ng, uint32_t ratio, uint32_t topk_blocks,
+                                uint32_t block_size, uint32_t nb_cap, const int32_t* d_pos, void* stream) {
+    if (!d_list || !d_score || !d_scratch || n_tok == 0 || block_size == 0 || ratio == 0 || topk_blocks == 0)
+        return false;
+    if (d_pos && n_tok > 8u) return false;
+    if (ng == 0) return true;
+    const uint32_t nb = (ng + block_size - 1u) / block_size;
+    if (nb > nb_cap) return false;   // the caller's scratch row stride
+    attn_candidate_kernel<<<n_tok, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        d_list, d_score, pos0, ng, ratio, topk_blocks, block_size, d_pos, d_scratch, nb_cap);
+    return finish(static_cast<cudaStream_t>(stream), "indexer candidate blocks");
+}
+
+bool deepseek4_indexer_topk(int32_t* d_idx, const float* d_score, uint32_t n_tok, uint32_t ng, uint32_t topk,
+                            uint32_t ratio, const int32_t* d_cand, uint32_t cand_bs, uint32_t cand_cap,
+                            const int32_t* d_pos, void* stream) {
+    if (!d_idx || !d_score || n_tok == 0 || topk == 0) return false;
+    if (d_pos && (n_tok > 8u || ratio == 0u)) return false;
+    if (d_cand && (cand_bs == 0u || cand_cap == 0u)) return false;
+    if (ng == 0) return true;
+    attn_topk_kernel<<<n_tok, kDeepseek4TopkThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        d_idx, d_score, ng, topk, ratio, d_pos, d_cand, cand_bs, cand_cap);
+    return finish(static_cast<cudaStream_t>(stream), "indexer topk");
 }
 
 }  // namespace strata::kernels

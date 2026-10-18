@@ -10,7 +10,9 @@
 // written with the header's shared inline conversions, so only the pool's expf can differ between the sides.
 #include "strata/kernels/deepseek4_attn.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <functional>
 #include <vector>
 
 namespace strata::kernels {
@@ -18,6 +20,12 @@ namespace strata::kernels {
 namespace {
 
 float attn_bf16r(float x) { return strata::deepseek4::engram_bf16r(x); }
+
+// The k-th largest key (k >= 1), over the reference's order-preserving u32 keys.
+uint32_t kth_largest(std::vector<uint32_t>& v, uint32_t k) {
+    std::nth_element(v.begin(), v.begin() + (k - 1u), v.end(), std::greater<uint32_t>());
+    return v[k - 1u];
+}
 
 void kv_pack_rows(uint8_t* cache, uint32_t g0, const float* rows, uint32_t n_rows, uint32_t dim, uint32_t blk,
                   uint32_t nib_bytes, uint32_t row_bytes, int mode) {
@@ -239,6 +247,172 @@ void deepseek4_win_ring_snap_host(float* win, float* snap, uint32_t pos0, uint32
         } else {
             for (uint32_t d = 0; d < head_dim; d++) sp[d] = ring[d];
         }
+    }
+}
+
+void deepseek4_indexer_score_host(float* score, const float* q, const uint8_t* idxk, const float* w,
+                                  const int32_t* cand, uint32_t pos0, uint32_t ng, uint32_t n_tok, uint32_t n_head,
+                                  uint32_t dk, uint32_t ratio, uint32_t cand_bs, uint32_t cand_cap,
+                                  const int32_t* pos) {
+    if (!score || !q || !idxk || !w || n_tok == 0 || ratio == 0 || (dk % 32u) != 0 || dk / 32u > 4u) return;
+    if (pos && n_tok > 8u) return;
+    if (ng == 0) return;   // the entry returns before the device kernel's own recompute
+    if (cand && (cand_bs == 0u || cand_cap == 0u)) return;
+    if (pos) {
+        pos0 = (uint32_t) pos[0];
+        ng = (pos0 + n_tok) / ratio;
+        if (ng == 0) return;   // the kernel's loop is empty: nothing is written
+    }
+    const uint32_t per = dk / 32u;
+    for (uint32_t i = 0; i < n_tok; i++) {
+        const uint32_t vis = (pos0 + i + 1u) / ratio;
+        const int32_t* cl = cand ? cand + (uint64_t) i * (1u + cand_cap) : nullptr;
+        const uint32_t nc = cl ? (uint32_t) cl[0] : 0u;
+        const uint32_t ns = cl ? deepseek4_cand_ns(ng, cand_bs, cand_cap) : ng;
+        for (uint32_t c = 0; c < ns; c++) {
+            uint32_t g = c;
+            if (cl) {
+                const uint32_t b = c / cand_bs;
+                g = b < nc ? (uint32_t) cl[1u + b] * cand_bs + c % cand_bs : ng;
+            }
+            const bool live = g < ng && g < vis;
+            const uint8_t* kg = idxk + (uint64_t)(live ? g : 0u) * kDeepseek4IdxkBytes;
+            float kv[32][4];
+            for (uint32_t l = 0; l < 32u; l++)
+                for (uint32_t e = 0; e < 4u; e++)
+                    kv[l][e] = (live && e < per) ? deepseek4_idxk_get(kg, l * per + e) : 0.0f;
+            float acc = 0.0f;
+            for (uint32_t h = 0; h < n_head; h++) {
+                const float* qh = q + ((size_t) i * n_head + h) * dk;
+                const float wh = w[(size_t) i * n_head + h];
+                float part[32], next[32];
+                for (uint32_t l = 0; l < 32u; l++) {
+                    float d = 0.0f;
+                    for (uint32_t e = 0; e < per; e++) d += qh[l * per + e] * kv[l][e];
+                    part[l] = d;
+                }
+                for (int off = 16; off > 0; off >>= 1) {
+                    for (uint32_t l = 0; l < 32u; l++) next[l] = part[l] + part[l ^ (uint32_t) off];
+                    for (uint32_t l = 0; l < 32u; l++) part[l] = next[l];
+                }
+                float d = attn_bf16r(part[0]);
+                d = fmaxf(d, 0.0f);          // relu_
+                acc += attn_bf16r(d * wh);   // x weights (bf16), then sum
+            }
+            score[(size_t) i * ns + c] = live ? attn_bf16r(acc) : -INFINITY;
+        }
+    }
+}
+
+void deepseek4_candidate_blocks_host(int32_t* list, const float* score, uint32_t n_tok, uint32_t pos0, uint32_t ng,
+                                     uint32_t ratio, uint32_t topk_blocks, uint32_t block_size,
+                                     const int32_t* pos) {
+    if (!list || !score || n_tok == 0 || block_size == 0 || ratio == 0 || topk_blocks == 0) return;
+    if (pos && n_tok > 8u) return;
+    if (ng == 0) return;   // the entry returns before the device kernel's own recompute
+    if (pos) {
+        pos0 = (uint32_t) pos[0];
+        ng = (pos0 + n_tok) / ratio;
+        if (ng == 0) {   // the kernel's compaction still writes an empty list header per row
+            for (uint32_t i = 0; i < n_tok; i++) list[(size_t) i * (1u + topk_blocks)] = 0;
+            return;
+        }
+    }
+    const uint32_t nb = (ng + block_size - 1u) / block_size;
+    std::vector<float> bsc(nb);
+    std::vector<uint32_t> keys(nb), picks;
+    for (uint32_t i = 0; i < n_tok; i++) {
+        const uint32_t vis = (pos0 + i + 1u) / ratio;
+        for (uint32_t b = 0; b < nb; b++) {
+            float m = -INFINITY;
+            for (uint32_t j = b * block_size; j < (b + 1u) * block_size && j < ng; j++)
+                m = fmaxf(m, score[(size_t) i * ng + j]);
+            if (vis > 0u && b == (vis - 1u) / block_size) m = INFINITY;   // pin the newest position's block
+            bsc[b] = m;
+            keys[b] = deepseek4_topk_key(m);
+        }
+        const uint32_t kk = topk_blocks < nb ? topk_blocks : nb;
+        std::vector<uint8_t> sel(nb, 0);
+        if (kk >= nb) {   // all except fully invisible blocks
+            for (uint32_t b = 0; b < nb; b++) sel[b] = keys[b] != 0u;
+        } else {
+            uint32_t nz = 0;
+            for (uint32_t b = 0; b < nb; b++) nz += keys[b] != 0u;
+            uint32_t t = 0, ngt = 0;
+            if (nz >= kk) {
+                picks.clear();
+                for (uint32_t b = 0; b < nb; b++)
+                    if (keys[b] != 0u) picks.push_back(keys[b]);
+                t = kth_largest(picks, kk);
+                for (uint32_t b = 0; b < nb; b++)
+                    if (keys[b] > t) ngt++;
+            } else {
+                ngt = nz;   // fewer than kk visible blocks: threshold 0 and the remainder filled below
+            }
+            uint32_t eq = kk - ngt;
+            for (uint32_t b = 0; b < nb; b++)
+                if (keys[b] > t) sel[b] = 1;
+            for (uint32_t b = 0; b < nb && eq; b++)
+                if (keys[b] == t) {
+                    sel[b] = 1;
+                    eq--;
+                }
+        }
+        int32_t nc = 0;
+        for (uint32_t b = 0; b < nb; b++)
+            if (sel[b]) list[(size_t) i * (1u + topk_blocks) + 1u + (uint32_t) nc++] = (int32_t) b;
+        list[(size_t) i * (1u + topk_blocks)] = nc;
+    }
+}
+
+void deepseek4_indexer_topk_host(int32_t* idx, const float* score, uint32_t n_tok, uint32_t ng, uint32_t topk,
+                                 uint32_t ratio, const int32_t* cand, uint32_t cand_bs, uint32_t cand_cap,
+                                 const int32_t* pos) {
+    if (!idx || !score || n_tok == 0 || topk == 0) return;
+    if (pos && (n_tok > 8u || ratio == 0u)) return;
+    if (cand && (cand_bs == 0u || cand_cap == 0u)) return;
+    if (ng == 0) return;   // the entry returns before the device kernel's own recompute
+    if (pos) {
+        ng = ((uint32_t) pos[0] + n_tok) / ratio;
+        if (ng < topk) topk = ng;
+        if (topk == 0) return;   // no row is written: the kernel's stride is the recomputed topk
+    }
+    std::vector<uint32_t> keys, picks;
+    for (uint32_t i = 0; i < n_tok; i++) {
+        const int32_t* cl = cand ? cand + (uint64_t) i * (1u + cand_cap) : nullptr;
+        const uint32_t ns = cl ? deepseek4_cand_ns(ng, cand_bs, cand_cap) : ng;
+        const float* s = score + (size_t) i * ns;
+        keys.resize(ns);
+        uint32_t nval = 0;   // keys that are not -inf/NaN
+        for (uint32_t c = 0; c < ns; c++) {
+            keys[c] = deepseek4_topk_key(s[c]);
+            nval += keys[c] != 0u;
+        }
+        const uint32_t kk = topk < nval ? topk : nval;
+        uint32_t t = 0, ngt = 0;
+        if (kk == 0) {
+            for (uint32_t w = 0; w < topk; w++) idx[(size_t) i * topk + w] = -1;
+            continue;
+        }
+        if (nval >= kk) {
+            picks.clear();
+            for (uint32_t c = 0; c < ns; c++)
+                if (keys[c] != 0u) picks.push_back(keys[c]);
+            t = kth_largest(picks, kk);
+            for (uint32_t c = 0; c < ns; c++)
+                if (keys[c] > t) ngt++;
+        } else {
+            ngt = nval;
+        }
+        uint32_t eq = kk - ngt, wr = 0;
+        for (uint32_t c = 0; c < ns && wr < topk; c++) {
+            const bool take = keys[c] > t || (keys[c] == t && eq != 0u);
+            if (!take) continue;
+            if (keys[c] == t) eq--;
+            idx[(size_t) i * topk + wr++] =
+                cl ? (int32_t) cl[1u + c / cand_bs] * (int32_t) cand_bs + (int32_t)(c % cand_bs) : (int32_t) c;
+        }
+        for (uint32_t w = wr; w < topk; w++) idx[(size_t) i * topk + w] = -1;
     }
 }
 

@@ -326,4 +326,68 @@ void deepseek4_win_ring_snap_host(float* win, float* snap, uint32_t pos0, uint32
 bool deepseek4_win_ring_snap(float* d_win, float* d_snap, uint32_t pos0, uint32_t i0, uint32_t n, uint32_t window,
                              uint32_t head_dim, bool back, const int32_t* d_pos, void* stream);
 
+// ---- sparse indexer ----
+//
+// Three pieces from cuda/ds41_indexer.cuh: the score, the candidate-block list and the topk.  The score is
+// score[i][g] = bf16(sum_h bf16(relu(bf16(q_h . k_g)) * w[i][h])) with invisible groups at -inf, a warp
+// advancing four groups at once (one group per warp would be bit-identical: the MAC order, the xor tree, the
+// bf16 rounding points and the head order are the same).  The candidate selector keeps the block holding the
+// query's newest position (score +inf) and the top-scoring blocks; the topk selects min(index_topk, visible)
+// keys in position order with ties taking the smaller index and unreachable slots -1.
+//
+// The optional candidate list is the C2 contract (ds4_gpu_v41.h): row i is [count][ascending block numbers],
+// stride 1 + cand_cap; with a list the score kernel writes a compact row of
+// deepseek4_cand_ns(ng, bs, cap) = min(cap * bs, ng) entries whose item c maps back to block cl[1 + c/bs]
+// times bs plus c % bs, and items past the list are dead (score -inf).  The list is ascending, so compact
+// order is position order and the tie rule is unchanged.
+//
+// The float -> key mapping is the reference's order-preserving u32 (`-inf` and NaN map to 0, so they are
+// never selected; positives set the top bit, negatives are complemented).
+
+inline constexpr uint32_t kDeepseek4IdxGroupsPerWarp = 4;  // cuda/ds41_indexer.cuh:36
+inline constexpr uint32_t kDeepseek4TopkThreads = 1024;    // the reference's topk block size
+inline constexpr uint32_t kDeepseek4TopkBatch = 8;         // scores read per thread per pass
+
+STRATA_DSV4_HD inline uint32_t deepseek4_cand_ns(uint32_t ng, uint32_t cand_bs, uint32_t cand_cap) {
+    const uint64_t full = (uint64_t) cand_cap * cand_bs;
+    return full < ng ? (uint32_t) full : ng;
+}
+
+STRATA_DSV4_HD inline uint32_t deepseek4_topk_key(float f) {
+    if (!(f > -INFINITY)) return 0u;
+    const uint32_t u = strata::deepseek4::engram_f32_to_bits(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+/// score[i][g] over the whole key cache (cand null) or the compact row (cand present); `dk` a multiple of 32
+/// and at most 128, the packed index keys are the header's 72 B rows.  `pos`, when non-null, replaces pos0 with
+/// pos[0] and recomputes ng = (pos0 + n_tok) / ratio (the captured-graph convention, n_tok <= 8); ng == 0
+/// succeeds without touching the output.
+void deepseek4_indexer_score_host(float* score, const float* q, const uint8_t* idxk, const float* w,
+                                  const int32_t* cand, uint32_t pos0, uint32_t ng, uint32_t n_tok, uint32_t n_head,
+                                  uint32_t dk, uint32_t ratio, uint32_t cand_bs, uint32_t cand_cap,
+                                  const int32_t* pos);
+bool deepseek4_indexer_score(float* d_score, const float* d_q, const uint8_t* d_idxk, const float* d_w,
+                             const int32_t* d_cand, uint32_t pos0, uint32_t ng, uint32_t n_tok, uint32_t n_head,
+                             uint32_t dk, uint32_t ratio, uint32_t cand_bs, uint32_t cand_cap, const int32_t* d_pos,
+                             void* stream);
+
+/// The candidate list, rows of 1 + topk_blocks int32.  `scratch` holds n_tok * nb_cap floats followed by
+/// n_tok * nb_cap bytes (the block scores and the flags), nb_cap >= ceil(ng / block_size).
+void deepseek4_candidate_blocks_host(int32_t* list, const float* score, uint32_t n_tok, uint32_t pos0, uint32_t ng,
+                                     uint32_t ratio, uint32_t topk_blocks, uint32_t block_size,
+                                     const int32_t* pos);
+bool deepseek4_candidate_blocks(int32_t* d_list, const float* d_score, float* d_scratch, uint32_t n_tok,
+                                uint32_t pos0, uint32_t ng, uint32_t ratio, uint32_t topk_blocks,
+                                uint32_t block_size, uint32_t nb_cap, const int32_t* d_pos, void* stream);
+
+/// The selected groups, rows of `topk` int32 (the row stride is the topk the call actually uses, which the
+/// device position may shrink in the graph convention).  With a list the scan covers the compact row.
+void deepseek4_indexer_topk_host(int32_t* idx, const float* score, uint32_t n_tok, uint32_t ng, uint32_t topk,
+                                 uint32_t ratio, const int32_t* cand, uint32_t cand_bs, uint32_t cand_cap,
+                                 const int32_t* pos);
+bool deepseek4_indexer_topk(int32_t* d_idx, const float* d_score, uint32_t n_tok, uint32_t ng, uint32_t topk,
+                            uint32_t ratio, const int32_t* d_cand, uint32_t cand_bs, uint32_t cand_cap,
+                            const int32_t* d_pos, void* stream);
+
 }  // namespace strata::kernels
