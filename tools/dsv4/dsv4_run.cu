@@ -36,6 +36,7 @@
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <sys/stat.h>
@@ -306,6 +307,11 @@ struct Options {
     bool stop_eos = false;   // stop after emitting the model's EOS (id 1 here); off keeps every gate run's ids
     bool stream_ids = false; // print each generated id as a line as it is produced, before the final generated=
     bool ledger = false;     // print the per-stage time/bytes ledger (P7); changes nothing else
+    // Resident serving (P8, opt-in): load the weights once, size the state for --serve-ctx, then read requests
+    // from stdin, one per line, and answer each with the same code path as a one-shot run.  Off by default; a
+    // one-shot run is unchanged.  The expert cache (when asked for) also lives across requests here.
+    bool serve = false;
+    uint32_t serve_ctx = 16384;   // tokens the resident state is sized for (requests above it are refused by name)
     // Expert cache (P7, opt-in): device slots that keep each staged expert payload, keyed by (layer, expert).
     // A hit copies the payload from its slot into the container instead of reading it back from the parts.  One
     // number applies to every stage; a comma list gives one budget per stage (see --devices).  Empty is off and
@@ -322,6 +328,12 @@ public:
     bool load_weights(std::string& err);
     bool load_engram(std::string& err);
     bool run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& err);
+    // ---- Resident serving (--serve) ----
+    // warm() sizes the state once; each request then resets the per-request state instead of reallocating it.
+    bool warm(std::string& err);
+    bool set_request_sampling(float temperature, float top_p, float min_p, uint32_t top_k, uint64_t seed,
+                              bool stop_eos, std::string& err);
+    uint32_t context_tokens() const { return ctx_; }
 
     d4::Geometry geo;
     std::string last_error;
@@ -365,6 +377,8 @@ private:
     void* load_tensor(const std::string& name, uint32_t type, const char* what);
 
     bool alloc_state(uint32_t total, std::string& err);
+    bool prepare_request(uint32_t total, std::string& err);
+    void reseed();
     bool ensure_index_scratch(uint32_t rows, uint32_t ng, std::string& err);
     bool load_blob(uint32_t il, std::string& err);
     bool load_blob_named(const std::string& name, bool tower, std::string& err, Blob& b);
@@ -427,6 +441,8 @@ private:
     int cand_owner_ = -1, idx_owner_ = -1;
     uint32_t idx_topk_ = 0;
     uint32_t n_past_ = 0;
+    bool state_ready_ = false;    // --serve: the one state allocation is in place (see prepare_request)
+    uint32_t state_total_ = 0;    // the token count it was sized for
 
     LayerW L_[64];
     void* tok_embd_ = nullptr;
@@ -951,12 +967,7 @@ bool Runner::open(const Options& o, std::string& err) {
         err = "--dspark verifies by argmax; drafting and sampling cannot be combined yet";
         return false;
     }
-    {
-        uint64_t seedsrc = opt_.seed;   // splitmix64 advances its argument
-        rng_s0_ = splitmix64(seedsrc);
-        rng_s1_ = splitmix64(seedsrc);
-        if (rng_s0_ == 0 && rng_s1_ == 0) rng_s0_ = 1;   // xorshift128+ cannot start all-zero
-    }
+    reseed();
     if (const strata::MetaValue* e = gguf_->get("tokenizer.ggml.eos_token_id")) {
         if (e->is_num() && e->num() >= 0.0 && e->num() < static_cast<double>(V_))
             eos_ = static_cast<uint32_t>(e->num());
@@ -2852,6 +2863,13 @@ bool Runner::layer(uint32_t il, std::string& err) {
     return true;
 }
 
+void Runner::reseed() {
+    uint64_t seedsrc = opt_.seed;   // splitmix64 advances its argument
+    rng_s0_ = splitmix64(seedsrc);
+    rng_s1_ = splitmix64(seedsrc);
+    if (rng_s0_ == 0 && rng_s1_ == 0) rng_s0_ = 1;   // xorshift128+ cannot start all-zero
+}
+
 int32_t Runner::pick_token(std::string& err) {
     const cudaError_t ce = cudaMemcpyAsync(logits_host_.data(), logits_, uint64_t(V_) * 4, cudaMemcpyDeviceToHost,
                                            stream_);
@@ -3041,6 +3059,72 @@ bool Runner::block(const int32_t* ids, uint32_t n, bool head, bool head_all, std
     return true;
 }
 
+// One allocation for a resident process, a fresh per-request state for every run.  The one-shot path allocates
+// exactly as before; --serve sizes the state once (see warm) and refuses a request above --serve-ctx.
+bool Runner::prepare_request(uint32_t total, std::string& err) {
+    if (opt_.serve) {
+        if (!state_ready_) {
+            const uint32_t want = std::min<uint32_t>(ctx_, opt_.serve_ctx);
+            if (total > want) {
+                err = "a " + std::to_string(total) + "-token request does not fit the resident state (" +
+                      std::to_string(want) + " tokens; --serve-ctx)";
+                return false;
+            }
+            if (!alloc_state(want, err)) return false;
+            state_ready_ = true;
+            state_total_ = want;
+        } else if (total > state_total_) {
+            err = "a " + std::to_string(total) + "-token request does not fit the resident state (" +
+                  std::to_string(state_total_) + " tokens; --serve-ctx)";
+            return false;
+        }
+    } else if (!alloc_state(total, err)) {
+        return false;
+    }
+    // The KV rows are addressed from position 0 again, and the engram history is this request's tokens only:
+    // a longer previous prompt must not leak into the n-gram window.
+    n_past_ = 0;
+    in_decode_ = false;
+    for (uint32_t i = 0; i < 64; ++i) {
+        ng_src_[i] = 0;
+        cpend_[i] = 0;
+        snap_cpend_[i] = 0;
+    }
+    snap_n_ = 0;
+    snap_past_ = 0;
+    hist_.clear();
+    for (auto& jobs : efeed_)   // normal completion joins every read; a failed request may not have
+        for (auto& j : jobs)
+            if (j.running) {
+                j.th.join();
+                j.running = false;
+            }
+    for (auto& c : efeed_cur_) c = -1;
+    return true;
+}
+
+bool Runner::warm(std::string& err) {
+    if (!opt_.serve) return true;
+    if (!prepare_request(0, err)) return false;
+    std::fprintf(stderr, "[v41] resident: state sized for %u token(s)\n", state_total_);
+    return true;
+}
+
+bool Runner::set_request_sampling(float temperature, float top_p, float min_p, uint32_t top_k, uint64_t seed,
+                                  bool stop_eos, std::string& err) {
+    if (!std::isfinite(temperature) || temperature < 0.0f) { err = "temperature is negative or not finite"; return false; }
+    if (!std::isfinite(top_p) || !(top_p > 0.0f && top_p <= 1.0f)) { err = "top-p is outside (0, 1]"; return false; }
+    if (!std::isfinite(min_p) || !(min_p >= 0.0f && min_p < 1.0f)) { err = "min-p is outside [0, 1)"; return false; }
+    opt_.temperature = temperature;
+    opt_.top_p = top_p;
+    opt_.min_p = min_p;
+    opt_.top_k = std::min<uint32_t>(top_k, V_);
+    opt_.seed = seed;
+    opt_.stop_eos = stop_eos;
+    reseed();
+    return true;
+}
+
 bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& err) {
     if (prompt.empty()) { err = "the prompt is empty"; return false; }
     const uint64_t total = uint64_t(prompt.size()) + gen;
@@ -3048,9 +3132,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
         err = "prompt + generation (" + std::to_string(total) + ") exceeds the context (" + std::to_string(ctx_) + ")";
         return false;
     }
-    if (!alloc_state(static_cast<uint32_t>(total), err)) return false;
-    n_past_ = 0;
-    in_decode_ = false;
+    if (!prepare_request(static_cast<uint32_t>(total), err)) return false;
 
     const uint32_t np = static_cast<uint32_t>(prompt.size());
     const double t0 = now_sec();
@@ -3242,6 +3324,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
     std::printf("generated=");
     for (size_t i = 0; i < generated.size(); ++i) std::printf("%s%d", i ? "," : "", generated[i]);
     std::printf("\n");
+    if (opt_.serve) std::printf("done\n");   // the resident protocol's per-request end marker
     std::fflush(stdout);
     return true;
 }
@@ -3344,6 +3427,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "--no-engram") o.engram = false;
         else if (a == "--engram-feed") o.engram_feed = true;
+        else if (a == "--serve") o.serve = true;
+        else if (a == "--serve-ctx") o.serve_ctx = static_cast<uint32_t>(std::strtoul(next("--serve-ctx"), nullptr, 10));
         else if (a == "--no-check") o.check = false;
         else if (a == "--help" || a == "-h") {
             std::fprintf(stderr,
@@ -3354,6 +3439,7 @@ int main(int argc, char** argv) {
                          "               [--temperature T] [--top-p P] [--min-p M] [--top-k K] [--seed S]\n"
                          "               [--stop-eos] [--stream-ids] [--ledger] [--engram-feed]\n"
                          "               [--expert-cache-mib N[,N...]]\n"
+                         "               [--serve --serve-ctx N]\n"
                          "  --devices        split the layers over these gpus, one stage each, layers in order;\n"
                          "                   the split only cuts at a compressed-cache seam and must return the\n"
                          "                   same ids as the one-gpu run (--dspark is one device only)\n"
@@ -3377,7 +3463,13 @@ int main(int argc, char** argv) {
                          "  --stream-ids     print each generated id as a line as it is produced\n"
                          "  --engram-feed    read the next block's engram rows while the current block computes\n"
                          "                   (the reference's prepare/wait/prefetch_next); off by default, and\n"
-                         "                   the ids must not move\n");
+                         "                   the ids must not move\n"
+                         "  --serve          resident: load the weights once, size the state for --serve-ctx, print\n"
+                         "                   ready, then answer one request per stdin line: ids=1,2,3 gen=16\n"
+                         "                   temperature=1 top_p=1 min_p=0.05 top_k=0 seed=1 stop_eos=1.  Each\n"
+                         "                   answer streams ids, prints generated=..., then done.  Off by default;\n"
+                         "                   a failed forward exits 1 so the supervisor starts a clean process\n"
+                         "  --serve-ctx      the resident state's token budget (default 16384)\n");
             return 0;
         } else {
             std::fprintf(stderr, "dsv4_run: unknown argument '%s'\n", a.c_str());
@@ -3397,8 +3489,12 @@ int main(int argc, char** argv) {
         std::fclose(f);
         o.ids = parse_ids(text);
     }
-    if (o.ids.empty()) {
+    if (o.ids.empty() && !o.serve) {
         std::fprintf(stderr, "dsv4_run: a prompt is required (--ids or --ids-file)\n");
+        return 2;
+    }
+    if (o.serve && o.serve_ctx == 0) {
+        std::fprintf(stderr, "dsv4_run: --serve-ctx must be at least 1\n");
         return 2;
     }
 
@@ -3415,6 +3511,102 @@ int main(int argc, char** argv) {
     if (!r.load_engram(err)) {
         std::fprintf(stderr, "dsv4_run: %s\n", err.c_str());
         return 2;
+    }
+    if (o.serve) {
+        if (o.dspark) {
+            std::fprintf(stderr, "dsv4_run: --serve and --dspark cannot be combined\n");
+            return 2;
+        }
+        if (!r.warm(err)) {
+            std::fprintf(stderr, "dsv4_run: %s\n", err.c_str());
+            return 2;
+        }
+        std::printf("ready\n");
+        std::fflush(stdout);
+        auto digits = [](const std::string& s) {
+            if (s.empty()) return false;
+            for (char c : s)
+                if (c < '0' || c > '9') return false;
+            return true;
+        };
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            if (line.empty()) continue;
+            std::vector<int32_t> ids;
+            bool have_ids = false, bad = false, stop_eos = true;
+            uint32_t gen = o.gen, top_k = o.top_k;
+            float temperature = o.temperature, top_p = o.top_p, min_p = o.min_p;
+            uint64_t seed = o.seed;
+            std::string perr;
+            size_t p = 0;
+            while (p < line.size() && !bad) {
+                while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) ++p;
+                if (p >= line.size()) break;
+                size_t q = p;
+                while (q < line.size() && line[q] != ' ' && line[q] != '\t') ++q;
+                const std::string kv = line.substr(p, q - p);
+                p = q;
+                const size_t eq = kv.find('=');
+                if (eq == std::string::npos) {
+                    perr = "malformed request field '" + kv + "'";
+                    bad = true;
+                    break;
+                }
+                const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+                char* end = nullptr;
+                if (k == "ids") {
+                    ids = parse_ids(v);
+                    have_ids = true;
+                } else if (k == "gen" && digits(v)) {
+                    gen = static_cast<uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+                } else if (k == "top_k" && digits(v)) {
+                    top_k = static_cast<uint32_t>(std::strtoul(v.c_str(), nullptr, 10));
+                } else if (k == "seed" && digits(v)) {
+                    seed = std::strtoull(v.c_str(), nullptr, 10);
+                } else if (k == "stop_eos" && digits(v)) {
+                    stop_eos = v != "0";
+                } else if (k == "temperature" && !v.empty()) {
+                    temperature = std::strtof(v.c_str(), &end);
+                    if (end == v.c_str() || *end != '\0') { perr = "temperature is not a number"; bad = true; }
+                } else if (k == "top_p" && !v.empty()) {
+                    top_p = std::strtof(v.c_str(), &end);
+                    if (end == v.c_str() || *end != '\0') { perr = "top_p is not a number"; bad = true; }
+                } else if (k == "min_p" && !v.empty()) {
+                    min_p = std::strtof(v.c_str(), &end);
+                    if (end == v.c_str() || *end != '\0') { perr = "min_p is not a number"; bad = true; }
+                } else {
+                    perr = "unknown or malformed request field '" + k + "'";
+                    bad = true;
+                }
+            }
+            if (!bad && (!have_ids || ids.empty())) {
+                perr = "the request has no ids";
+                bad = true;
+            }
+            if (!bad && !r.set_request_sampling(temperature, top_p, min_p, top_k, seed, stop_eos, perr)) bad = true;
+            if (!bad) {
+                const uint64_t req_total = uint64_t(ids.size()) + gen;
+                if (req_total > r.context_tokens()) {
+                    perr = "prompt + generation (" + std::to_string(req_total) + ") exceeds the context (" +
+                           std::to_string(r.context_tokens()) + ")";
+                    bad = true;
+                }
+            }
+            if (bad) {
+                // A rejected request changes no model state: say why and keep serving.
+                std::printf("error=%s\ndone\n", perr.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            err.clear();
+            if (!r.run(ids, gen, err)) {
+                // A forward that failed may have left CUDA state unsafe to reuse; the supervisor restarts.
+                std::printf("error=%s\ndone\n", err.c_str());
+                std::fflush(stdout);
+                return 1;
+            }
+        }
+        return 0;
     }
     if (!r.run(o.ids, o.gen, err)) {
         std::fprintf(stderr, "dsv4_run: %s\n", err.c_str());

@@ -11,8 +11,10 @@ the id stream onto one of two wire contracts:
   GET  /v1/models             the single served model
   GET  /health                liveness
 
-The engine is process-per-request: the driver's ~4 s model open and a cold prefill are paid on every request.
-Residency, prefix reuse and continuous batching are P7; this server is the correctness surface.
+The engine is resident by default: one driver process is started with --serve, loads the weights once, and then
+answers one request per stdin line.  The first request pays the model load; later ones pay only the prefill and
+the decode, and the driver's expert cache survives between requests.  --no-resident restores the P6
+one-process-per-request path.  Prefix reuse and continuous batching are still open.
 
 Defaults are the reference host's wire defaults (crates/ds4-server/src/parse.rs:18-20): temperature 1.0,
 top_p 1.0, min_p 0.05, top_k off.  A request's temperature 0 is the engine's greedy path.  The thinking toggle
@@ -35,6 +37,7 @@ import codecs
 import json
 import os
 import pathlib
+import queue
 import secrets
 import subprocess
 import sys
@@ -118,14 +121,178 @@ def text_content(content, where):
 
 
 class Engine:
-    """One driver process per request; the lock is the GPU's."""
+    """The driver; the handler's lock is the GPU's.
+
+    Resident by default: one driver with --serve loads the weights once, prints ready, and answers one request
+    per stdin line.  --no-resident keeps the P6 one-process-per-request path.
+    """
 
     def __init__(self, args):
         self.args = args
         self.binary = find_binary(args.binary)
         self.lock = threading.Lock()
+        self.proc = None
+        self.proc_ready = False
+        self.q = None       # the current driver's stdout lines, fed by a reader thread
+
+    # ---- resident mode (the default) ----
+
+    def _serve_cmd(self):
+        cmd = [self.binary, "--serve", "--serve-ctx", str(self.args.serve_ctx),
+               "--model", self.args.model, "--engram-dir", self.args.engram_dir,
+               "--gen", "0", "--chunk", str(self.args.chunk if self.args.chunk is not None else 0),
+               "--ctx", str(self.args.ctx), "--stream-ids"]
+        if self.args.devices:
+            cmd += ["--devices", self.args.devices]
+        if self.args.expert_cache_mib:
+            cmd += ["--expert-cache-mib", self.args.expert_cache_mib]
+        if self.args.gpu is not None:
+            cmd += ["--gpu", str(self.args.gpu)]
+        if self.args.no_engram:
+            cmd.append("--no-engram")
+        if self.args.engram_feed:
+            cmd.append("--engram-feed")
+        return cmd
+
+    def _kill(self):
+        proc = self.proc
+        self.proc = None
+        self.proc_ready = False
+        self.q = None
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except OSError:
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+
+    def _read_lines(self, proc, q):
+        """Feed the driver's stdout lines to a queue; None marks EOF.  One daemon thread per driver."""
+        try:
+            for line in proc.stdout:
+                q.put(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            q.put(None)
+
+    def _await_line(self, deadline, what):
+        """The next stdout line, or a 504 once the deadline passes; EOF is None.  Called with the lock held."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self._kill()
+            raise ApiError(504, "the engine did not %s in time" % what, "timeout_error")
+        try:
+            return self.q.get(timeout=remaining)
+        except queue.Empty:
+            self._kill()
+            raise ApiError(504, "the engine did not %s in time" % what, "timeout_error")
+
+    def _ensure(self):
+        """Start the resident driver if it is not up, and wait for its ready line.  Called with the lock held."""
+        if self.proc is not None and self.proc_ready and self.proc.poll() is None:
+            return
+        self._kill()
+        proc = subprocess.Popen(self._serve_cmd(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                text=True, bufsize=1)
+        q = queue.Queue()
+        threading.Thread(target=self._read_lines, args=(proc, q), daemon=True).start()
+        self.q = q
+        deadline = time.monotonic() + max(600.0, self.args.timeout)
+        try:
+            while True:
+                line = self._await_line(deadline, "become ready")
+                if line is None:
+                    break
+                s = line.strip()
+                if s == "ready":
+                    self.proc, self.proc_ready = proc, True
+                    return
+                if s.startswith("error="):
+                    raise ApiError(500, s[len("error="):], "engine_error")
+        finally:
+            if self.proc is not proc:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                if proc.stdout is not None:
+                    try:
+                        proc.stdout.close()
+                    except OSError:
+                        pass
+        raise ApiError(500, "the engine exited before it was ready", "engine_error")
+
+    def warm(self):
+        """Load the model before the first request.  The handler's lock serializes it with generate()."""
+        with self.lock:
+            try:
+                self._ensure()
+            except Exception:
+                pass
+
+    def close(self):
+        with self.lock:
+            self._kill()
 
     def generate(self, ids, gen, sampling, on_token):
+        """Run `gen` tokens; on_token(id) per id.  Resident unless --no-resident was given."""
+        if getattr(self.args, "no_resident", False):
+            return self._generate_once(ids, gen, sampling, on_token)
+        self._ensure()
+        req = ("ids=%s gen=%d temperature=%r top_p=%r min_p=%r top_k=%d seed=%d stop_eos=1\n"
+               % (",".join(str(i) for i in ids), gen, float(sampling["temperature"]),
+                  float(sampling["top_p"]), float(sampling["min_p"]), int(sampling["top_k"]),
+                  int(sampling["seed"])))
+        try:
+            self.proc.stdin.write(req)
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self._kill()
+            raise ApiError(500, "the engine stopped accepting requests", "engine_error")
+        deadline = time.monotonic() + self.args.timeout
+        err = None
+        done = False
+        while True:
+            line = self._await_line(deadline, "answer")
+            if line is None:
+                break
+            s = line.strip()
+            if not s:
+                continue
+            if s == "done":
+                done = True
+                break
+            if s.startswith("error="):
+                err = s[len("error="):]
+                continue
+            if s.startswith("generated="):
+                continue
+            if s.lstrip("-").isdigit():
+                on_token(int(s))
+        if not done:
+            self._kill()
+            raise ApiError(500, "the engine stopped answering", "engine_error")
+        if err:
+            raise ApiError(500, err, "engine_error")
+
+    def _generate_once(self, ids, gen, sampling, on_token):
         """Run `gen` tokens; on_token(id) per id.  Returns when the driver exits at EOS, the cap, or a failure."""
         fd, path = tempfile.mkstemp(prefix="dsv4_srv_", suffix=".txt")
         try:
@@ -645,6 +812,9 @@ class Server(ThreadingHTTPServer):
         super().__init__(addr, handler)
         self.args, self.tok, self.engine = args, tok, engine
         self.args.model_id = args.model_id or DEFAULT_MODEL
+        # Warm the resident driver while the port opens; the first generate() waits on the same lock.
+        if not getattr(args, "no_resident", False):
+            threading.Thread(target=engine.warm, daemon=True).start()
 
 
 def main(argv):
@@ -670,7 +840,14 @@ def main(argv):
     ap.add_argument("--no-engram", action="store_true")
     ap.add_argument("--engram-feed", action="store_true",
                     help="P7 engram feed: read the next block's engram rows while the current block computes")
+    ap.add_argument("--no-resident", action="store_true",
+                    help="one driver process per request (the P6 path); the default keeps the model resident")
+    ap.add_argument("--serve-ctx", type=int, default=16384,
+                    help="resident mode: the driver's token budget (default 16384; a longer request is refused)")
     args = ap.parse_args(argv[1:])
+
+    if args.serve_ctx < 1:
+        sys.exit("dsv4_server: --serve-ctx must be at least 1")
 
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.api_key:
         sys.exit("dsv4_server: refusing a non-loopback --host without --api-key")
@@ -685,6 +862,7 @@ def main(argv):
     except KeyboardInterrupt:
         pass
     finally:
+        engine.close()
         srv.server_close()
     return 0
 
