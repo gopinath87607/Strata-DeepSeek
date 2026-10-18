@@ -1,10 +1,10 @@
 // tools/dsv4/dsv4_run.cu - DeepSeek-V4.1-Flash forward driver (docs/DEEPSEEK4.md, P3 onward).
 //
-// One process, one GPU, greedy decode.  It reads the 40-part GGUF through a parts-aware reader (the header comes
-// from part 1's map; every payload read is an offset into the assembled image), keeps the q4_K/BF16/F32 skeleton
-// and the two engram wkv matrices resident, and streams each layer's selected routed experts from its DQVL blob
-// into a compact device container per block (P7's cache/ring machinery is not built here; this is the
-// correctness driver).
+// One process, one or more GPUs (P7's layer split), greedy decode.  It reads the 40-part GGUF through a
+// parts-aware reader (the header comes from part 1's map; every payload read is an offset into the assembled
+// image), keeps the q4_K/BF16/F32 skeleton and the two engram wkv matrices resident, and streams each layer's
+// selected routed experts from its DQVL blob into a compact device container per block (P7's layer split, auto
+// chunk and opt-in expert cache are here; the loan and ring are not built yet; this is the correctness driver).
 //
 // The layer body is the reference's, call for call (reference/ds4-dfm-rs/ds4_ds41_forward.inc): engram ->
 // hc_half(attn) -> attn_in -> attn_cache (compress/index source, sparse attention, ring commit) -> attn_out ->
@@ -15,8 +15,10 @@
 //
 // Usage:
 //   dsv4_run --ids 1,2,3 [--gen 32] [--model BASE] [--engram-dir DIR] [--chunk 8] [--ctx N] [--gpu 0]
+//            [--devices 0,1,2,3] [--ledger] [--expert-cache-mib N[,N...]]
 //            [--dspark [--dspark-verify K] [--dspark-trace]]
 //            [--temperature T] [--top-p P] [--min-p M] [--top-k K] [--seed S] [--stop-eos] [--stream-ids]
+//            [--engram-feed]
 //
 // The runner takes token ids, not text: the tokenizer is Python (tools/strata_tokenizer.py); see
 // tools/dsv4/dsv4_prompt.py for the text wrapper.
@@ -24,6 +26,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cinttypes>
 #include <cmath>
@@ -36,7 +39,9 @@
 #include <memory>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -273,8 +278,16 @@ struct Options {
     uint32_t chunk = 8;
     uint32_t ctx = 0;   // 0: the model's own context (no reduction)
     int gpu = 0;
+    // Layer split (P7): one gpu per stage, layers in order.  Empty keeps the single-device path on --gpu.  The
+    // split only cuts at a legal cache seam (see open()); the run must return the same ids as the one-device run.
+    std::vector<int> devices;
     bool trace = false;
     bool engram = true;
+    // Engram feed (P7, opt-in): the reference's prepare/wait/prefetch_next (ds4_ds41_forward.inc).  The row ids
+    // depend only on token ids and positions, so a worker thread reads the next block's rows from the shards
+    // while the current block computes, and each engram layer then only waits for its buffer and uploads it.
+    // Off by default: the synchronous path is unchanged and the default run stays byte-identical.
+    bool engram_feed = false;
     bool check = true;   // the inventory check (header only)
     std::string logits_out;
     // DSpark: the MTP towers draft, the main forward verifies, the cache rolls back.  Off unless asked, and the
@@ -292,12 +305,19 @@ struct Options {
     uint64_t seed = 0;
     bool stop_eos = false;   // stop after emitting the model's EOS (id 1 here); off keeps every gate run's ids
     bool stream_ids = false; // print each generated id as a line as it is produced, before the final generated=
+    bool ledger = false;     // print the per-stage time/bytes ledger (P7); changes nothing else
+    // Expert cache (P7, opt-in): device slots that keep each staged expert payload, keyed by (layer, expert).
+    // A hit copies the payload from its slot into the container instead of reading it back from the parts.  One
+    // number applies to every stage; a comma list gives one budget per stage (see --devices).  Empty is off and
+    // changes nothing: the default path stays byte-identical to the run without this switch.
+    std::vector<uint32_t> expert_cache_mib;
 };
 
 // ---- The runner -----------------------------------------------------------------------------------------------
 
 class Runner {
 public:
+    ~Runner();
     bool open(const Options& o, std::string& err);
     bool load_weights(std::string& err);
     bool load_engram(std::string& err);
@@ -307,6 +327,38 @@ public:
     std::string last_error;
 
 private:
+    // One stage of the layer split (P7).  Every shared forward buffer is allocated once per stage: the kernels
+    // of stage s run on stage s's device and only touch that stage's copy.  The weights of a stage's layers and
+    // their window/compressed-KV buffers live here too, bound per layer by load_weights and alloc_state.
+    struct Stage {
+        int dev = 0;
+        cudaStream_t stream = nullptr;
+        int32_t *d_tok = nullptr, *d_pos = nullptr;
+        float* d_prem = nullptr;
+        float *x = nullptr, *hc = nullptr, *hc2 = nullptr, *xn = nullptr, *mix = nullptr, *pre = nullptr;
+        float *post = nullptr, *comb = nullptr, *qr = nullptr, *qrn = nullptr, *q = nullptr, *kvv = nullptr;
+        float *kvn = nullptr, *o = nullptr, *low = nullptr, *attn_out = nullptr, *glog = nullptr, *rw = nullptr;
+        float *partial = nullptr, *sg = nullptr, *su = nullptr, *sh = nullptr, *so = nullptr, *y = nullptr;
+        float *logits = nullptr, *pooled = nullptr, *latent = nullptr, *ktmp = nullptr, *cke = nullptr;
+        float *ckv = nullptr, *csc = nullptr, *iq = nullptr, *iw = nullptr, *iscore = nullptr, *iscratch = nullptr;
+        int32_t *sel = nullptr, *idx = nullptr, *cand = nullptr, *posg = nullptr;
+        uint32_t iscap = 0, isrows = 0, nbc = 0;
+        uint8_t* eraw = nullptr;
+        float* erows = nullptr;
+        uint16_t* x16 = nullptr;
+        float* ekv = nullptr;
+        uint64_t blob_dcap = 0;
+        void* blob_dev = nullptr;
+        uint64_t stage_used = 0;
+    };
+    void bind_stage(uint32_t s);
+    void save_stage();
+    uint32_t stage_of(uint32_t il) const {
+        uint32_t s = 0;
+        while (s + 1 < nstages_ && il >= stage_first_[s + 1]) ++s;
+        return s;
+    }
+
     // device memory
     void* dev(uint64_t bytes, const char* what);
     void* upload(const void* host, uint64_t bytes, const char* what);
@@ -327,6 +379,13 @@ private:
     bool index_source(uint32_t il, uint32_t ratio, std::string& err);
     bool moe(uint32_t il, std::string& err);
     bool engram_layer(uint32_t il, std::string& err);
+    // ---- Engram feed (P7, opt-in): the reference's prepare / wait / prefetch_next ----
+    bool engram_feed_prepare(uint32_t pos0, const int32_t* ids, uint32_t n, std::string& err);
+    void engram_feed_prefetch(uint32_t pos0, const int32_t* hist, const int32_t* ids, uint32_t n);
+    bool engram_feed_wait(uint32_t ei, std::string& err);
+    bool engram_feed_start(uint32_t ei, int slot, uint32_t pos0, const int32_t* hist, size_t hist_len,
+                           const int32_t* ids, uint32_t n);
+    void engram_feed_close();
     int32_t pick_token(std::string& err);
     int32_t sample_host(std::string& err);
     // ---- DSpark (P5): the draft towers, the verify batch and its rollback ----
@@ -482,7 +541,27 @@ private:
     std::vector<float> probe_host_;
     std::vector<int64_t> erow_ids_;
     std::vector<uint8_t> eraw_host_;
+    // The feed's two host buffers per engram layer, the row ids computed on the main thread (the hash is
+    // stateful and stays there), and the payload the worker reads.  One job per (layer, slot); an event per
+    // (layer, slot), recorded after the slot's upload, keeps a worker from overwriting a buffer whose H2D may
+    // still be reading it.  `cur` is the slot the block in hand uses, -1 until the first prepare.
+    struct FeedJob {
+        std::thread th;
+        bool running = false;
+        bool done = false;   // `pos0`/`n` rows are in the slot
+        uint32_t pos0 = 0, n = 0;
+        bool ok = true;
+        std::string err;
+    };
+    std::vector<std::array<FeedJob, 2>> efeed_;
+    std::vector<std::array<std::vector<uint8_t>, 2>> efeed_raw_;
+    std::vector<std::array<std::vector<int64_t>, 2>> efeed_ids_;
+    std::vector<std::array<cudaEvent_t, 2>> efeed_ev_;
+    std::vector<std::array<bool, 2>> efeed_ev_set_;
+    std::vector<int> efeed_cur_;
+    std::vector<int> efeed_dev_;
     std::vector<int32_t> pos_host_;
+    std::vector<int32_t> dpos_host_;   // the block's positions, kept apart from pos_host_ (compress_source's scratch)
     std::vector<int32_t> sel_host_;
     std::vector<uint32_t> uniq_;
     std::vector<float> logits_host_;
@@ -500,6 +579,34 @@ private:
     double rng_uniform() { return static_cast<double>(rng_next() >> 11) * 0x1.0p-53; }
 
     cudaStream_t stream_ = nullptr;
+
+    // ---- P7 layer split ----
+    std::vector<Stage> st_;
+    uint32_t nstages_ = 1;
+    uint32_t stage_cur_ = 0;
+    std::vector<uint32_t> stage_first_;   // stage s owns layers [stage_first_[s], stage_first_[s + 1])
+    std::vector<float> handoff_hc_;       // the stage boundary's host staging (hidden state)
+    std::vector<float> handoff_prem_;     // ... and the evolved premix
+    // --ledger (P7): prefill and decode seconds per stage, the hand-off, and what each stage staged.
+    double st_pre_sec_[8] {}, st_dec_sec_[8] {}, st_hand_sec_[8] {};
+    uint64_t st_bytes_[8] {}, st_experts_[8] {}, st_slots_[8] {}, st_new_[8] {};
+    std::vector<uint8_t> seen_exp_;   // (layer, expert) slots staged at least once (--ledger's repeat count)
+    uint64_t st_blocks_pre_ = 0, st_blocks_dec_ = 0;
+    bool in_decode_ = false;
+
+    // ---- P7 expert cache (opt-in) ----
+    // Fixed-size slots per stage, one slot per cached expert payload.  `exp_cache_.size() == nstages_`; an empty
+    // map is a stage with the cache off.  A miss that does not fit evicts the least recently used slot that this
+    // container does not already point at.  Key is layer * NE_ + expert.
+    struct CacheEnt { uint64_t len = 0, stamp = 0; uint32_t slot = 0; };
+    std::vector<std::unordered_map<uint64_t, CacheEnt>> exp_cache_;
+    std::vector<uint8_t*> exp_cache_dev_;      // slot base per stage
+    std::vector<uint64_t> exp_cache_slots_;    // slots allocated per stage
+    std::vector<uint64_t> exp_cache_next_;     // bump cursor per stage
+    uint64_t exp_cache_stride_ = 0;            // bytes per slot (the largest expert payload)
+    uint64_t cache_tick_ = 0;
+    // --ledger: what the cache answered, and the bytes those hits did not have to read.
+    uint64_t st_cache_hit_[8] {}, st_cache_miss_[8] {}, st_cache_bytes_[8] {};
 };
 
 void* Runner::dev(uint64_t bytes, const char* what) {
@@ -568,6 +675,126 @@ void Runner::probe(const char* tag, void* d, uint64_t n_floats) {
         if (a > mx) mx = a;
     }
     std::fprintf(stderr, "  [trace] %s max %.6g nonfinite %" PRIu64 "\n", tag, static_cast<double>(mx), nf);
+}
+
+// Point every shared forward buffer at stage s's copies and make s's device current.  The swap-carrying members
+// (hc_/hc2_, pre_/d_prem_) always come back to their stage's saved roles between stages: a layer swaps each pair
+// twice, and alloc_state lays each stage out in the same roles.
+void Runner::bind_stage(uint32_t s) {
+    const Stage& g = st_[s];
+    stage_cur_ = s;
+    cudaSetDevice(g.dev);
+    stream_ = g.stream;
+    d_tok_ = g.d_tok;
+    d_pos_ = g.d_pos;
+    d_prem_ = g.d_prem;
+    x_ = g.x;
+    hc_ = g.hc;
+    hc2_ = g.hc2;
+    xn_ = g.xn;
+    mix_ = g.mix;
+    pre_ = g.pre;
+    post_ = g.post;
+    comb_ = g.comb;
+    qr_ = g.qr;
+    qrn_ = g.qrn;
+    q_ = g.q;
+    kvv_ = g.kvv;
+    kvn_ = g.kvn;
+    o_ = g.o;
+    low_ = g.low;
+    attn_out_ = g.attn_out;
+    glog_ = g.glog;
+    sel_ = g.sel;
+    rw_ = g.rw;
+    partial_ = g.partial;
+    sg_ = g.sg;
+    su_ = g.su;
+    sh_ = g.sh;
+    so_ = g.so;
+    y_ = g.y;
+    logits_ = g.logits;
+    pooled_ = g.pooled;
+    latent_ = g.latent;
+    ktmp_ = g.ktmp;
+    cke_ = g.cke;
+    ckv_ = g.ckv;
+    csc_ = g.csc;
+    iq_ = g.iq;
+    iw_ = g.iw;
+    iscore_ = g.iscore;
+    iscratch_ = g.iscratch;
+    idx_ = g.idx;
+    cand_ = g.cand;
+    posg_ = g.posg;
+    iscap_ = g.iscap;
+    isrows_ = g.isrows;
+    nbc_ = g.nbc;
+    eraw_ = g.eraw;
+    erows_ = g.erows;
+    x16_ = g.x16;
+    ekv_ = g.ekv;
+    blob_dcap_ = g.blob_dcap;
+    blob_dev_ = g.blob_dev;
+    stage_used_ = g.stage_used;
+}
+
+// The inverse: stage_cur_'s record takes the members' current values (buffer growth, index scratch sizing, the
+// expert container).  Called on the way out of a stage, so the next entry reuses instead of reallocating.
+void Runner::save_stage() {
+    Stage& g = st_[stage_cur_];
+    g.d_tok = d_tok_;
+    g.d_pos = d_pos_;
+    g.d_prem = d_prem_;
+    g.x = x_;
+    g.hc = hc_;
+    g.hc2 = hc2_;
+    g.xn = xn_;
+    g.mix = mix_;
+    g.pre = pre_;
+    g.post = post_;
+    g.comb = comb_;
+    g.qr = qr_;
+    g.qrn = qrn_;
+    g.q = q_;
+    g.kvv = kvv_;
+    g.kvn = kvn_;
+    g.o = o_;
+    g.low = low_;
+    g.attn_out = attn_out_;
+    g.glog = glog_;
+    g.sel = sel_;
+    g.rw = rw_;
+    g.partial = partial_;
+    g.sg = sg_;
+    g.su = su_;
+    g.sh = sh_;
+    g.so = so_;
+    g.y = y_;
+    g.logits = logits_;
+    g.pooled = pooled_;
+    g.latent = latent_;
+    g.ktmp = ktmp_;
+    g.cke = cke_;
+    g.ckv = ckv_;
+    g.csc = csc_;
+    g.iq = iq_;
+    g.iw = iw_;
+    g.iscore = iscore_;
+    g.iscratch = iscratch_;
+    g.idx = idx_;
+    g.cand = cand_;
+    g.posg = posg_;
+    g.iscap = iscap_;
+    g.isrows = isrows_;
+    g.nbc = nbc_;
+    g.eraw = eraw_;
+    g.erows = erows_;
+    g.x16 = x16_;
+    g.ekv = ekv_;
+    g.blob_dcap = blob_dcap_;
+    g.blob_dev = blob_dev_;
+    g.stage_used = stage_used_;
 }
 
 bool Runner::open(const Options& o, std::string& err) {
@@ -667,6 +894,9 @@ bool Runner::open(const Options& o, std::string& err) {
     ctx_ = opt_.ctx == 0 ? static_cast<uint32_t>(geo.context_length) : opt_.ctx;
     if (ctx_ > geo.context_length) ctx_ = static_cast<uint32_t>(geo.context_length);
     cap_ = std::max(1u, opt_.chunk);
+    // `--chunk 0` is auto: the block is picked in alloc_state, after the weights and the engram are resident and
+    // each stage's free memory is known.  Until then cap_ stays 1; only prod_cap_ (max(cap_, SWA_)) is read before
+    // then, and it is SWA either way.
     if (cap_ > ctx_) cap_ = ctx_;
 
     // DSpark: the draft towers' metadata.  The path is opt-in; without --dspark the run is the plain one.
@@ -746,18 +976,108 @@ bool Runner::open(const Options& o, std::string& err) {
     std::fprintf(stderr, " (ratios");
     for (size_t i = 0; i < geo.kv_source_layers.size(); ++i)
         std::fprintf(stderr, " %" PRIu64, geo.compress_ratios[geo.kv_source_layers[i]]);
+    char chunk_txt[24];
+    if (opt_.chunk == 0) std::snprintf(chunk_txt, sizeof chunk_txt, "auto");
+    else std::snprintf(chunk_txt, sizeof chunk_txt, "%u", cap_);
     std::fprintf(stderr, "), candidate L%u x %u blocks of %u,\n      ctx %u (model %" PRIu64
-                         "), chunk %u, engram %s\n",
-                 cand_src_layer_, kcap_, cand_bs_, ctx_, geo.context_length, cap_, opt_.engram ? "on" : "off");
+                         "), chunk %s, engram %s\n",
+                 cand_src_layer_, kcap_, cand_bs_, ctx_, geo.context_length, chunk_txt,
+                 opt_.engram ? "on" : "off");
 
-    const cudaError_t ce = cudaSetDevice(opt_.gpu);
-    if (ce != cudaSuccess) { err = std::string("cudaSetDevice: ") + cudaGetErrorString(ce); return false; }
-    if (cudaStreamCreate(&stream_) != cudaSuccess) { err = "cudaStreamCreate failed"; return false; }
+    // ---- The stage plan (P7) -------------------------------------------------------------------------------
+    // A boundary is legal only at a cache seam: no layer at or after it may take its compressed-KV or index
+    // source from before it, and the candidate block's owner must sit in the same stage as its users.  On this
+    // model the legal boundaries are 2, 8, 14 and 20 (each kv source starts a stage).  Among the legal sets we
+    // take the one with the smallest largest stage, so no card carries more layers than it must.
+    if (opt_.devices.empty()) opt_.devices.push_back(opt_.gpu);
+    nstages_ = static_cast<uint32_t>(opt_.devices.size());
+    if (nstages_ > 8) { err = "--devices: more than 8 stages"; return false; }
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess) { err = "cudaGetDeviceCount failed"; return false; }
+    for (uint32_t s = 0; s < nstages_; ++s) {
+        if (opt_.devices[s] < 0 || opt_.devices[s] >= ndev) {
+            err = "--devices: gpu " + std::to_string(opt_.devices[s]) + " is outside 0.." +
+                  std::to_string(ndev - 1);
+            return false;
+        }
+        for (uint32_t q = 0; q < s; ++q)
+            if (opt_.devices[q] == opt_.devices[s]) {
+                err = "--devices repeats gpu " + std::to_string(opt_.devices[s]);
+                return false;
+            }
+    }
+    if (opt_.dspark && nstages_ > 1) {
+        err = "--dspark runs on one device: its capture and rollback span every layer";
+        return false;
+    }
+    stage_first_.assign(nstages_ + 1, 0);
+    stage_first_[nstages_] = nlayers_;
+    if (nstages_ > 1) {
+        std::vector<uint32_t> legal;
+        for (uint32_t b = 1; b < nlayers_; ++b) {
+            bool ok = true;
+            for (uint32_t il = b; il < nlayers_ && ok; ++il) {
+                if (kv_src_[il] < b || idx_src_[il] < b) ok = false;
+                else if (il > cand_src_layer_ && cand_src_layer_ < b) ok = false;
+            }
+            if (ok) legal.push_back(b);
+        }
+        const uint32_t K = nstages_ - 1;
+        if (legal.size() < K) {
+            err = "--devices: the model's compressed-cache layout allows at most " +
+                  std::to_string(legal.size() + 1) + " stage(s)";
+            return false;
+        }
+        // dp[j][i]: the smallest largest stage when j boundaries are placed and legal[i] is the last of them.
+        const uint64_t kInf = ~0ull;
+        std::vector<std::vector<uint64_t>> dp(K + 1, std::vector<uint64_t>(legal.size(), kInf));
+        std::vector<std::vector<int>> par(K + 1, std::vector<int>(legal.size(), -1));
+        for (size_t i = 0; i < legal.size(); ++i) dp[1][i] = legal[i];
+        for (uint32_t j = 2; j <= K; ++j)
+            for (size_t i = 0; i < legal.size(); ++i)
+                for (size_t p = 0; p < i; ++p) {
+                    if (dp[j - 1][p] == kInf) continue;
+                    const uint64_t m = std::max(dp[j - 1][p], static_cast<uint64_t>(legal[i] - legal[p]));
+                    if (m < dp[j][i]) { dp[j][i] = m; par[j][i] = static_cast<int>(p); }
+                }
+        uint64_t best = kInf;
+        int bi = -1;
+        for (size_t i = 0; i < legal.size(); ++i) {
+            if (dp[K][i] == kInf) continue;
+            const uint64_t m = std::max(dp[K][i], static_cast<uint64_t>(nlayers_) - legal[i]);
+            if (m < best) { best = m; bi = static_cast<int>(i); }
+        }
+        if (bi < 0) { err = "--devices: no legal layer split for this stage count"; return false; }
+        for (uint32_t j = K; j >= 1; --j) {
+            stage_first_[j] = legal[static_cast<size_t>(bi)];
+            bi = par[j][bi];
+        }
+    }
+
+    st_.assign(nstages_, Stage{});
+    for (uint32_t s = 0; s < nstages_; ++s) {
+        st_[s].dev = opt_.devices[s];
+        const cudaError_t ce = cudaSetDevice(st_[s].dev);
+        if (ce != cudaSuccess) {
+            err = "cudaSetDevice " + std::to_string(st_[s].dev) + ": " + cudaGetErrorString(ce);
+            return false;
+        }
+        if (cudaStreamCreate(&st_[s].stream) != cudaSuccess) { err = "cudaStreamCreate failed"; return false; }
+    }
+    if (nstages_ > 1) {
+        std::string map;
+        for (uint32_t s = 0; s < nstages_; ++s)
+            map += (s ? ", " : "") + std::to_string(stage_first_[s]) + ".." +
+                   std::to_string(stage_first_[s + 1] - 1) + " on gpu " + std::to_string(st_[s].dev);
+        std::fprintf(stderr, "[v41] stages: %s\n", map.c_str());
+    }
+    bind_stage(0);
     return true;
 }
 
 bool Runner::load_weights(std::string& err) {
     for (uint32_t il = 0; il < nlayers_; ++il) {
+        bind_stage(stage_of(il));
         const std::string p = "blk." + std::to_string(il) + ".";
         LayerW& l = L_[il];
         auto need = [&](const char* suffix, uint32_t type) -> void* {
@@ -825,7 +1145,10 @@ bool Runner::load_weights(std::string& err) {
             }
         }
     }
+    // The embedding runs at the start of stage 0; the head closes the last stage.
+    bind_stage(0);
     tok_embd_ = load_tensor("token_embd.weight", kQ4K, "token_embd");
+    bind_stage(nstages_ - 1);
     out_w_ = load_tensor("output.weight", kQ4K, "output");
     out_norm_ = load_tensor("output_norm.weight", kF32, "output_norm");
     if (!tok_embd_ || !out_w_ || !out_norm_) { err = last_error; return false; }
@@ -840,10 +1163,24 @@ bool Runner::load_weights(std::string& err) {
         if (!draft_alloc(err)) return false;
     }
 
-    size_t free_b = 0, total_b = 0;
-    cudaMemGetInfo(&free_b, &total_b);
-    std::fprintf(stderr, "[v41] weights resident; device %.1f GiB used, %.1f GiB free\n",
-                 static_cast<double>(total_b - free_b) / 1073741824.0, static_cast<double>(free_b) / 1073741824.0);
+    if (nstages_ == 1) {
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        std::fprintf(stderr, "[v41] weights resident; device %.1f GiB used, %.1f GiB free\n",
+                     static_cast<double>(total_b - free_b) / 1073741824.0,
+                     static_cast<double>(free_b) / 1073741824.0);
+    } else {
+        for (uint32_t s = 0; s < nstages_; ++s) {
+            bind_stage(s);
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            std::fprintf(stderr,
+                         "[v41] stage %u (gpu %d) layers %u..%u: weights %.1f GiB used, %.1f GiB free\n", s,
+                         st_[s].dev, stage_first_[s], stage_first_[s + 1] - 1,
+                         static_cast<double>(total_b - free_b) / 1073741824.0,
+                         static_cast<double>(free_b) / 1073741824.0);
+        }
+    }
     return true;
 }
 
@@ -940,6 +1277,18 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
     uniq_.clear();
     for (uint32_t e = 0; e < b.experts; ++e)
         if (used[e]) uniq_.push_back(e);
+    if (opt_.ledger && b.experts == NE_ && layer_id < nlayers_) {
+        // Repeat accounting for a possible expert cache: how many of this container's slots were staged by an
+        // earlier block.  New slots are the bytes a cache would still have to read.
+        for (uint32_t e : uniq_) {
+            const size_t k = static_cast<size_t>(layer_id) * NE_ + e;
+            if (k < seen_exp_.size() && !seen_exp_[k]) {
+                seen_exp_[k] = 1;
+                ++st_new_[stage_cur_];
+            }
+            ++st_slots_[stage_cur_];
+        }
+    }
 
     const uint64_t table_end = 16 + static_cast<uint64_t>(b.experts) * 24;
     uint64_t need = table_end + b.cb_len;
@@ -954,22 +1303,83 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
     wr32(p + 12, b.experts);
     if (b.cb_len != 0 && !parts_.read(b.abs + b.cb_off, p + table_end, b.cb_len, err)) return false;
 
+    // ---- the expert cache (opt-in): a hit skips the parts read and is copied from its slot after the upload ----
+    const bool caching = !opt_.expert_cache_mib.empty() && b.experts == NE_ && layer_id < nlayers_ &&
+                         stage_cur_ < exp_cache_dev_.size() && exp_cache_dev_[stage_cur_] != nullptr &&
+                         exp_cache_slots_[stage_cur_] != 0;
+    uint8_t* const cbase = caching ? exp_cache_dev_[stage_cur_] : nullptr;
+    auto& cmap = exp_cache_[stage_cur_];
+    std::vector<uint64_t> pinned;   // slots this container points at: never evicted by its own misses
+    struct Move { uint64_t dst = 0, src = 0, len = 0; bool to_cache = false; };
+    std::vector<Move> moves;
+    // Least recently used slot the container does not point at; -1 when every slot is pinned.
+    auto evict_one = [&]() -> int64_t {
+        uint64_t victim = 0, best = ~uint64_t{0};
+        int64_t slot = -1;
+        for (const auto& kv : cmap) {
+            if (kv.second.stamp >= best) continue;
+            bool keep = false;
+            for (uint64_t k : pinned)
+                if (k == kv.first) { keep = true; break; }
+            if (keep) continue;
+            best = kv.second.stamp;
+            victim = kv.first;
+            slot = static_cast<int64_t>(kv.second.slot);
+        }
+        if (slot >= 0) cmap.erase(victim);
+        return slot;
+    };
+
     uint64_t cur = table_end + b.cb_len;
     uint32_t holes = 0;
     for (uint32_t e : uniq_) {
+        const size_t i0 = static_cast<size_t>(e) * 3;
+        const uint64_t len = b.span[i0] + b.span[i0 + 1] + b.span[i0 + 2];
+        uint64_t at = cur;
         for (uint32_t w = 0; w < 3; ++w) {
-            const size_t i = static_cast<size_t>(e) * 3 + w;
-            const uint64_t len = b.span[i];
-            if (len == 0) {
+            const uint64_t sl = b.span[i0 + w];
+            if (sl == 0) {
                 err = "expert " + std::to_string(e) + " slot " + std::to_string(w) + " is absent";
                 return false;
             }
-            wr64(p + 16 + i * 8, cur);   // slot table entry i is at 16 + i*8
-            if (!parts_.read(b.abs + b.slot[i], p + cur, len, err)) return false;
-            const uint32_t magic = rd32(p + cur);
-            if (magic != d4::kMatV3Magic && magic != d4::kMatV2Magic) ++holes;
-            cur += len;
+            wr64(p + 16 + (i0 + w) * 8, at);   // slot table entry i is at 16 + i*8
+            at += sl;
         }
+        const uint64_t key = static_cast<uint64_t>(layer_id) * NE_ + e;
+        auto it = caching ? cmap.find(key) : cmap.end();
+        const bool hit = it != cmap.end() && it->second.len == len;
+        if (hit) {
+            pinned.push_back(key);
+            moves.push_back({cur, it->second.slot * exp_cache_stride_, len, false});
+            it->second.stamp = ++cache_tick_;
+            if (opt_.ledger) {
+                ++st_cache_hit_[stage_cur_];
+                st_cache_bytes_[stage_cur_] += len;
+            }
+        } else {
+            uint64_t rd = cur;
+            bool payload_ok = true;
+            for (uint32_t w = 0; w < 3; ++w) {
+                const size_t i = i0 + w;
+                if (!parts_.read(b.abs + b.slot[i], p + rd, b.span[i], err)) return false;
+                const uint32_t magic = rd32(p + rd);
+                if (magic != d4::kMatV3Magic && magic != d4::kMatV2Magic) { ++holes; payload_ok = false; }
+                rd += b.span[i];
+            }
+            if (opt_.ledger) ++st_cache_miss_[stage_cur_];
+            if (caching && payload_ok) {
+                int64_t slot = -1;
+                if (exp_cache_next_[stage_cur_] < exp_cache_slots_[stage_cur_])
+                    slot = static_cast<int64_t>(exp_cache_next_[stage_cur_]++);
+                else
+                    slot = evict_one();
+                if (slot >= 0) {
+                    cmap[key] = CacheEnt{len, ++cache_tick_, static_cast<uint32_t>(slot)};
+                    moves.push_back({static_cast<uint64_t>(slot) * exp_cache_stride_, cur, len, true});
+                }
+            }
+        }
+        cur += len;
     }
     if (holes != 0)
         std::fprintf(stderr, "[v41] L%02u: %u of %u selected expert payloads are unreadable (a holey part); "
@@ -982,7 +1392,19 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
     }
     const cudaError_t ce = cudaMemcpyAsync(blob_dev_, p, cur, cudaMemcpyHostToDevice, stream_);
     if (ce != cudaSuccess) { err = std::string("expert container upload: ") + cudaGetErrorString(ce); return false; }
+    // The moves ride the container's stream after the upload, so a hit's bytes land before the MoE reads them and
+    // a fresh slot copies the payload that was just uploaded.
+    for (const Move& m : moves) {
+        uint8_t* dst = m.to_cache ? cbase + m.dst : static_cast<uint8_t*>(blob_dev_) + m.dst;
+        const uint8_t* src = m.to_cache ? static_cast<const uint8_t*>(blob_dev_) + m.src : cbase + m.src;
+        const cudaError_t me = cudaMemcpyAsync(dst, src, m.len, cudaMemcpyDeviceToDevice, stream_);
+        if (me != cudaSuccess) { err = std::string("expert cache move: ") + cudaGetErrorString(me); return false; }
+    }
     stage_used_ = cur;
+    if (opt_.ledger) {
+        st_bytes_[stage_cur_] += cur;
+        st_experts_[stage_cur_] += uniq_.size();
+    }
     return true;
 }
 
@@ -1029,14 +1451,9 @@ bool Runner::load_engram(std::string& err) {
             return false;
         }
     }
-    const uint64_t stride = eng_hd_ + eng_hd_ / 32;
-    eraw_ = static_cast<uint8_t*>(dev(static_cast<uint64_t>(cap_) * eng_cols_ * stride, "eraw"));
-    erows_ = static_cast<float*>(dev(static_cast<uint64_t>(cap_) * eng_in_dim_ * 4, "erows"));
-    x16_ = static_cast<uint16_t*>(dev(static_cast<uint64_t>(cap_) * eng_in_dim_ * 2, "engram x bf16"));
-    ekv_ = static_cast<float*>(dev(static_cast<uint64_t>(cap_) * eng_out_dim_ * 4, "engram kv"));
-    if (eraw_ == nullptr || erows_ == nullptr || x16_ == nullptr || ekv_ == nullptr) { err = last_error; return false; }
-    eraw_host_.resize(static_cast<size_t>(cap_) * eng_cols_ * stride);
-    erow_ids_.resize(static_cast<size_t>(cap_) * eng_cols_);
+    // The four cap-sized row buffers are allocated by alloc_state, once the auto chunk has picked the block: the
+    // engram layers (1 and 14 here) sit in different stages under a split, and only a stage that owns one needs
+    // them.  The hash tables and the shard readers stay on the host, shared.
     engram_on_ = true;
     std::fprintf(stderr, "[v41] engram: %zu table(s), cols %u, head dim %u, in %u out %u\n", layers, eng_cols_,
                  eng_hd_, eng_in_dim_, eng_out_dim_);
@@ -1608,85 +2025,272 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
     topk_cap_ = static_cast<uint32_t>(std::min<uint64_t>(geo.indexer_top_k, ngg));
     if (topk_cap_ == 0) { err = "indexer_top_k is zero"; return false; }
 
-    d_tok_ = static_cast<int32_t*>(dev(uint64_t(cap_) * 4, "tokens"));
-    d_pos_ = static_cast<int32_t*>(dev(uint64_t(cap_) * 4, "positions"));
-    d_prem_ = static_cast<float*>(dev(uint64_t(cap_) * HC_ * 4, "pre_mix"));
-    x_ = static_cast<float*>(dev(uint64_t(cap_) * E_ * 4, "x"));
-    hc_ = static_cast<float*>(dev(uint64_t(cap_) * HC_ * E_ * 4, "hc"));
-    hc2_ = static_cast<float*>(dev(uint64_t(cap_) * HC_ * E_ * 4, "hc2"));
-    xn_ = static_cast<float*>(dev(uint64_t(cap_) * E_ * 4, "xn"));
-    const uint32_t mixd = 2u * HC_ + HC_ * HC_;
-    mix_ = static_cast<float*>(dev(uint64_t(cap_) * mixd * 4, "mix"));
-    pre_ = static_cast<float*>(dev(uint64_t(cap_) * HC_ * 4, "pre"));
-    post_ = static_cast<float*>(dev(uint64_t(cap_) * HC_ * 4, "post"));
-    comb_ = static_cast<float*>(dev(uint64_t(cap_) * HC_ * HC_ * 4, "comb"));
-    qr_ = static_cast<float*>(dev(uint64_t(cap_) * Q_ * 4, "qr"));
-    qrn_ = static_cast<float*>(dev(uint64_t(cap_) * Q_ * 4, "qrn"));
-    q_ = static_cast<float*>(dev(uint64_t(cap_) * H_ * HD_ * 4, "q"));
-    kvv_ = static_cast<float*>(dev(uint64_t(cap_) * HD_ * 4, "kv"));
-    kvn_ = static_cast<float*>(dev(uint64_t(cap_) * HD_ * 4, "kvn"));
-    o_ = static_cast<float*>(dev(uint64_t(cap_) * H_ * HD_ * 4, "o"));
-    low_ = static_cast<float*>(dev(uint64_t(cap_) * NG_ * OL_ * 4, "low"));
-    attn_out_ = static_cast<float*>(dev(uint64_t(cap_) * E_ * 4, "attn_out"));
-    glog_ = static_cast<float*>(dev(uint64_t(cap_) * NE_ * 4, "router logits"));
-    sel_ = static_cast<int32_t*>(dev(uint64_t(cap_) * KU_ * 4, "router sel"));
-    rw_ = static_cast<float*>(dev(uint64_t(cap_) * KU_ * 4, "router w"));
-    partial_ = static_cast<float*>(dev(uint64_t(cap_) * KU_ * E_ * 4, "moe partial"));
-    sg_ = static_cast<float*>(dev(uint64_t(cap_) * FF_ * 4, "shared gate"));
-    su_ = static_cast<float*>(dev(uint64_t(cap_) * FF_ * 4, "shared up"));
-    sh_ = static_cast<float*>(dev(uint64_t(cap_) * FF_ * 4, "shared h"));
-    so_ = static_cast<float*>(dev(uint64_t(cap_) * E_ * 4, "shared out"));
-    y_ = static_cast<float*>(dev(uint64_t(cap_) * E_ * 4, "moe y"));
-    logits_ = static_cast<float*>(dev(uint64_t(V_) * 4, "logits"));
-    pooled_ = static_cast<float*>(dev(uint64_t(cap_) * HD_ * 4, "pooled"));
-    latent_ = static_cast<float*>(dev(uint64_t(cap_) * HD_ * 4, "latent"));
-    ktmp_ = static_cast<float*>(dev(uint64_t(cap_) * IK_ * 4, "ktmp"));
-    cke_ = static_cast<float*>(dev(uint64_t(cap_) * IK_ * 4, "index key"));
-    ckv_ = static_cast<float*>(dev(uint64_t(cap_) * HD_ * 4, "compressor kv"));
-    csc_ = static_cast<float*>(dev(uint64_t(cap_) * HD_ * 4, "compressor score"));
-    iq_ = static_cast<float*>(dev(uint64_t(cap_) * IH_ * IK_ * 4, "indexer q"));
-    iw_ = static_cast<float*>(dev(uint64_t(cap_) * IH_ * 4, "indexer w"));
-    idx_ = static_cast<int32_t*>(dev(uint64_t(cap_) * topk_cap_ * 4, "indexer topk"));
-    posg_ = static_cast<int32_t*>(dev(uint64_t(cap_) * 4, "group positions"));
-
     win_.assign(nlayers_, nullptr);
     comp_kv_.assign(nlayers_, nullptr);
     index_k_.assign(nlayers_, nullptr);
     cpre_kv_.assign(nlayers_, nullptr);
     cpre_sc_.assign(nlayers_, nullptr);
+    // The expert cache's slot size is the largest selected-expert payload in the main layers: the three payload
+    // spans of one expert.  (The container's table and codebook are small and are always read.)
+    exp_cache_stride_ = 0;
     for (uint32_t il = 0; il < nlayers_; ++il) {
-        win_[il] = static_cast<float*>(dev(uint64_t(SWA_ + cap_) * HD_ * 4, "window"));
-        if (is_kv_src_[il]) {
-            comp_kv_[il] = static_cast<uint8_t*>(dev(ngg * k::kDeepseek4CkvBytes, "compressed kv cache"));
-            index_k_[il] = static_cast<uint8_t*>(dev(ngg * k::kDeepseek4IdxkBytes, "index key cache"));
-            const uint32_t ratio = static_cast<uint32_t>(geo.compress_ratios[il]);
-            if (ratio > 1) {
-                cpre_kv_[il] = static_cast<float*>(dev(uint64_t(ratio + cap_) * HD_ * 4, "compressor pending kv"));
-                cpre_sc_[il] = static_cast<float*>(dev(uint64_t(ratio + cap_) * HD_ * 4, "compressor pending score"));
-                if (cpre_kv_[il] == nullptr || cpre_sc_[il] == nullptr) { err = last_error; return false; }
-            }
-            if (comp_kv_[il] == nullptr || index_k_[il] == nullptr) { err = last_error; return false; }
+        const Blob& b = blob_[il];
+        if (b.experts != NE_) continue;
+        for (uint32_t e = 0; e < b.experts; ++e) {
+            const size_t i = static_cast<size_t>(e) * 3;
+            exp_cache_stride_ = std::max(exp_cache_stride_, b.span[i] + b.span[i + 1] + b.span[i + 2]);
         }
-        if (win_[il] == nullptr) { err = last_error; return false; }
     }
-    if (d_tok_ == nullptr || d_pos_ == nullptr || d_prem_ == nullptr || x_ == nullptr || hc_ == nullptr ||
-        hc2_ == nullptr || xn_ == nullptr || mix_ == nullptr || pre_ == nullptr || post_ == nullptr ||
-        comb_ == nullptr || qr_ == nullptr || qrn_ == nullptr || q_ == nullptr || kvv_ == nullptr ||
-        kvn_ == nullptr || o_ == nullptr || low_ == nullptr || attn_out_ == nullptr || glog_ == nullptr ||
-        sel_ == nullptr || rw_ == nullptr || partial_ == nullptr || sg_ == nullptr || su_ == nullptr ||
-        sh_ == nullptr || so_ == nullptr || y_ == nullptr || logits_ == nullptr || pooled_ == nullptr ||
-        latent_ == nullptr || ktmp_ == nullptr || cke_ == nullptr || ckv_ == nullptr || csc_ == nullptr ||
-        iq_ == nullptr ||
-        iw_ == nullptr || idx_ == nullptr || posg_ == nullptr) {
-        err = last_error;
-        return false;
+    exp_cache_.assign(nstages_, {});
+    exp_cache_dev_.assign(nstages_, nullptr);
+    exp_cache_slots_.assign(nstages_, 0);
+    exp_cache_next_.assign(nstages_, 0);
+    for (uint32_t s = 0; s < 8; ++s) st_cache_hit_[s] = st_cache_miss_[s] = st_cache_bytes_[s] = 0;
+
+    // Auto chunk (`--chunk 0`): the largest block that fits on every stage, picked here because the fit needs the
+    // free memory after the weights and the engram are resident.  The ceiling is one block for the whole run: the
+    // MoE kernel's grid allows n_tok * topk <= 65535, and 4096 rows is the widest block measured on the four-card
+    // split.  Per row a stage carries the sum of every cap-scaled buffer allocated below, its layers' windows and
+    // (if it owns one) its engram row buffers; beside that it must hold one layer's expert container -- the union
+    // of the block's selected experts, which the measured runs put near a quarter of the rows and never above all
+    // 384 -- plus the expert cache when one was asked for.  10% of free memory is left over.
+    if (opt_.chunk == 0) {
+        uint64_t limit = std::min<uint64_t>(total, 4096);
+        limit = std::min<uint64_t>(limit, 65535u / std::max(1u, KU_));
+        uint64_t floor_cap = 1;
+        if (opt_.dspark) floor_cap = std::max<uint64_t>(floor_cap, cap2_);   // the verify batch's rows
+        if (limit < floor_cap) limit = floor_cap;
+        limit = std::min<uint64_t>(limit, ctx_);
+        const uint64_t eng_stride = eng_hd_ + eng_hd_ / 32;
+        uint64_t pick = limit;
+        for (uint32_t s = 0; s < nstages_; ++s) {
+            const uint32_t first = stage_first_[s], last = stage_first_[s + 1];
+            uint64_t row = 0;
+            row += 4 + 4;                                             // tokens, positions
+            row += uint64_t(HC_) * 4;                                 // pre_mix
+            row += uint64_t(E_) * 4 * 2;                              // x, xn
+            row += uint64_t(HC_) * E_ * 4 * 2;                        // hc, hc2
+            row += uint64_t(2u * HC_ + HC_ * HC_) * 4;                // mix
+            row += uint64_t(2u * HC_ + HC_ * HC_) * 4;                // pre, post, comb
+            row += uint64_t(Q_) * 4 * 2;                              // qr, qrn
+            row += uint64_t(H_) * HD_ * 4 * 2;                        // q, o
+            row += uint64_t(HD_) * 4 * 2;                             // kv, kvn
+            row += uint64_t(NG_) * OL_ * 4;                           // low
+            row += uint64_t(E_) * 4 * 3;                              // attn_out, shared out, moe y
+            row += uint64_t(NE_) * 4;                                 // router logits
+            row += uint64_t(KU_) * 4 * 2;                             // router sel, w
+            row += uint64_t(KU_) * E_ * 4;                            // moe partial
+            row += uint64_t(FF_) * 4 * 3;                             // shared gate, up, h
+            row += uint64_t(HD_) * 4 * 4;                             // pooled, latent, compressor kv/score
+            row += uint64_t(IK_) * 4 * 2;                             // ktmp, index key
+            row += uint64_t(IH_) * IK_ * 4 + uint64_t(IH_) * 4;       // indexer q, w
+            row += uint64_t(topk_cap_) * 4 + 4;                       // indexer topk, group positions
+            row += uint64_t(last - first) * HD_ * 4;                  // one window a layer
+            for (uint32_t il = first; il < last; ++il)
+                if (is_kv_src_[il] && geo.compress_ratios[il] > 1) row += uint64_t(HD_) * 4 * 2;
+            bool owns_engram = false;
+            for (uint32_t il = first; il < last; ++il)
+                if (engram_of_[il] >= 0 && engram_on_) owns_engram = true;
+            if (owns_engram)   // row bytes + bf16 copy + f32 kv output
+                row += uint64_t(eng_cols_) * eng_stride + uint64_t(eng_in_dim_) * 6 + uint64_t(eng_out_dim_) * 4;
+            uint64_t fixed = uint64_t(V_) * 4;                        // logits
+            for (uint32_t il = first; il < last; ++il)
+                if (is_kv_src_[il]) fixed += ngg * (k::kDeepseek4CkvBytes + k::kDeepseek4IdxkBytes);
+            uint64_t cache_b = 0;
+            if (!opt_.expert_cache_mib.empty() && exp_cache_stride_ != 0) {
+                const size_t pickm = opt_.expert_cache_mib.size() == 1
+                                         ? 0
+                                         : std::min<size_t>(s, opt_.expert_cache_mib.size() - 1);
+                cache_b = static_cast<uint64_t>(opt_.expert_cache_mib[pickm]) << 20;
+            }
+            if (cudaSetDevice(st_[s].dev) != cudaSuccess) { err = last_error; return false; }
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { err = last_error; return false; }
+            const uint64_t budget = static_cast<uint64_t>(static_cast<double>(free_b) * 0.9);
+            auto fits = [&](uint64_t cap) {
+                const uint64_t uniq = std::min<uint64_t>(NE_, 24 + cap / 3);   // the container's experts
+                return cap * row + uniq * exp_cache_stride_ + fixed + cache_b <= budget;
+            };
+            if (!fits(floor_cap)) {
+                std::fprintf(stderr,
+                             "[v41] auto chunk: stage %u cannot hold %" PRIu64 " row(s) beside the weights and "
+                             "the expert container; the run will fail to allocate\n",
+                             s, floor_cap);
+                pick = floor_cap;
+                continue;
+            }
+            uint64_t lo = floor_cap, hi = limit;
+            while (lo < hi) {
+                const uint64_t mid = lo + (hi - lo + 1) / 2;
+                if (fits(mid)) lo = mid; else hi = mid - 1;
+            }
+            std::fprintf(stderr,
+                         "[v41] auto chunk: stage %u caps at %" PRIu64 " row(s) (%" PRIu64 " B/row, %.0f MiB "
+                         "budget, %.0f MiB cache)\n",
+                         s, lo, row, static_cast<double>(budget) / (1024.0 * 1024.0),
+                         static_cast<double>(cache_b) / (1024.0 * 1024.0));
+            pick = std::min(pick, lo);
+        }
+        cap_ = static_cast<uint32_t>(std::max<uint64_t>(1, pick));
+    }
+    // Every stage gets the whole shared scratch set, and the layers it owns get their window and source caches
+    // on its device.  A layer's window is only ever touched by that layer, and a source's compressed-KV cache is
+    // only touched by layers in the same stage (open() cut only at cache seams), so no buffer crosses a device.
+    for (uint32_t s = 0; s < nstages_; ++s) {
+        bind_stage(s);
+        d_tok_ = static_cast<int32_t*>(dev(uint64_t(cap_) * 4, "tokens"));
+        d_pos_ = static_cast<int32_t*>(dev(uint64_t(cap_) * 4, "positions"));
+        d_prem_ = static_cast<float*>(dev(uint64_t(cap_) * HC_ * 4, "pre_mix"));
+        x_ = static_cast<float*>(dev(uint64_t(cap_) * E_ * 4, "x"));
+        hc_ = static_cast<float*>(dev(uint64_t(cap_) * HC_ * E_ * 4, "hc"));
+        hc2_ = static_cast<float*>(dev(uint64_t(cap_) * HC_ * E_ * 4, "hc2"));
+        xn_ = static_cast<float*>(dev(uint64_t(cap_) * E_ * 4, "xn"));
+        const uint32_t mixd = 2u * HC_ + HC_ * HC_;
+        mix_ = static_cast<float*>(dev(uint64_t(cap_) * mixd * 4, "mix"));
+        pre_ = static_cast<float*>(dev(uint64_t(cap_) * HC_ * 4, "pre"));
+        post_ = static_cast<float*>(dev(uint64_t(cap_) * HC_ * 4, "post"));
+        comb_ = static_cast<float*>(dev(uint64_t(cap_) * HC_ * HC_ * 4, "comb"));
+        qr_ = static_cast<float*>(dev(uint64_t(cap_) * Q_ * 4, "qr"));
+        qrn_ = static_cast<float*>(dev(uint64_t(cap_) * Q_ * 4, "qrn"));
+        q_ = static_cast<float*>(dev(uint64_t(cap_) * H_ * HD_ * 4, "q"));
+        kvv_ = static_cast<float*>(dev(uint64_t(cap_) * HD_ * 4, "kv"));
+        kvn_ = static_cast<float*>(dev(uint64_t(cap_) * HD_ * 4, "kvn"));
+        o_ = static_cast<float*>(dev(uint64_t(cap_) * H_ * HD_ * 4, "o"));
+        low_ = static_cast<float*>(dev(uint64_t(cap_) * NG_ * OL_ * 4, "low"));
+        attn_out_ = static_cast<float*>(dev(uint64_t(cap_) * E_ * 4, "attn_out"));
+        glog_ = static_cast<float*>(dev(uint64_t(cap_) * NE_ * 4, "router logits"));
+        sel_ = static_cast<int32_t*>(dev(uint64_t(cap_) * KU_ * 4, "router sel"));
+        rw_ = static_cast<float*>(dev(uint64_t(cap_) * KU_ * 4, "router w"));
+        partial_ = static_cast<float*>(dev(uint64_t(cap_) * KU_ * E_ * 4, "moe partial"));
+        sg_ = static_cast<float*>(dev(uint64_t(cap_) * FF_ * 4, "shared gate"));
+        su_ = static_cast<float*>(dev(uint64_t(cap_) * FF_ * 4, "shared up"));
+        sh_ = static_cast<float*>(dev(uint64_t(cap_) * FF_ * 4, "shared h"));
+        so_ = static_cast<float*>(dev(uint64_t(cap_) * E_ * 4, "shared out"));
+        y_ = static_cast<float*>(dev(uint64_t(cap_) * E_ * 4, "moe y"));
+        logits_ = static_cast<float*>(dev(uint64_t(V_) * 4, "logits"));
+        pooled_ = static_cast<float*>(dev(uint64_t(cap_) * HD_ * 4, "pooled"));
+        latent_ = static_cast<float*>(dev(uint64_t(cap_) * HD_ * 4, "latent"));
+        ktmp_ = static_cast<float*>(dev(uint64_t(cap_) * IK_ * 4, "ktmp"));
+        cke_ = static_cast<float*>(dev(uint64_t(cap_) * IK_ * 4, "index key"));
+        ckv_ = static_cast<float*>(dev(uint64_t(cap_) * HD_ * 4, "compressor kv"));
+        csc_ = static_cast<float*>(dev(uint64_t(cap_) * HD_ * 4, "compressor score"));
+        iq_ = static_cast<float*>(dev(uint64_t(cap_) * IH_ * IK_ * 4, "indexer q"));
+        iw_ = static_cast<float*>(dev(uint64_t(cap_) * IH_ * 4, "indexer w"));
+        idx_ = static_cast<int32_t*>(dev(uint64_t(cap_) * topk_cap_ * 4, "indexer topk"));
+        posg_ = static_cast<int32_t*>(dev(uint64_t(cap_) * 4, "group positions"));
+        // A stage that owns an engram layer (1 and 14 here) holds its four row buffers; no other stage touches
+        // them (see load_engram).
+        eraw_ = nullptr;
+        erows_ = nullptr;
+        x16_ = nullptr;
+        ekv_ = nullptr;
+        bool owns_engram = false;
+        for (uint32_t il = stage_first_[s]; il < stage_first_[s + 1]; ++il)
+            if (engram_of_[il] >= 0 && engram_on_) owns_engram = true;
+        if (owns_engram) {
+            const uint64_t eng_stride = eng_hd_ + eng_hd_ / 32;
+            eraw_ = static_cast<uint8_t*>(dev(uint64_t(cap_) * eng_cols_ * eng_stride, "eraw"));
+            erows_ = static_cast<float*>(dev(uint64_t(cap_) * eng_in_dim_ * 4, "erows"));
+            x16_ = static_cast<uint16_t*>(dev(uint64_t(cap_) * eng_in_dim_ * 2, "engram x bf16"));
+            ekv_ = static_cast<float*>(dev(uint64_t(cap_) * eng_out_dim_ * 4, "engram kv"));
+            if (eraw_ == nullptr || erows_ == nullptr || x16_ == nullptr || ekv_ == nullptr) {
+                err = last_error;
+                return false;
+            }
+        }
+
+        for (uint32_t il = stage_first_[s]; il < stage_first_[s + 1]; ++il) {
+            win_[il] = static_cast<float*>(dev(uint64_t(SWA_ + cap_) * HD_ * 4, "window"));
+            if (is_kv_src_[il]) {
+                comp_kv_[il] = static_cast<uint8_t*>(dev(ngg * k::kDeepseek4CkvBytes, "compressed kv cache"));
+                index_k_[il] = static_cast<uint8_t*>(dev(ngg * k::kDeepseek4IdxkBytes, "index key cache"));
+                const uint32_t ratio = static_cast<uint32_t>(geo.compress_ratios[il]);
+                if (ratio > 1) {
+                    cpre_kv_[il] = static_cast<float*>(dev(uint64_t(ratio + cap_) * HD_ * 4, "compressor pending kv"));
+                    cpre_sc_[il] = static_cast<float*>(dev(uint64_t(ratio + cap_) * HD_ * 4, "compressor pending score"));
+                    if (cpre_kv_[il] == nullptr || cpre_sc_[il] == nullptr) { err = last_error; return false; }
+                }
+                if (comp_kv_[il] == nullptr || index_k_[il] == nullptr) { err = last_error; return false; }
+            }
+            if (win_[il] == nullptr) { err = last_error; return false; }
+        }
+        if (d_tok_ == nullptr || d_pos_ == nullptr || d_prem_ == nullptr || x_ == nullptr || hc_ == nullptr ||
+            hc2_ == nullptr || xn_ == nullptr || mix_ == nullptr || pre_ == nullptr || post_ == nullptr ||
+            comb_ == nullptr || qr_ == nullptr || qrn_ == nullptr || q_ == nullptr || kvv_ == nullptr ||
+            kvn_ == nullptr || o_ == nullptr || low_ == nullptr || attn_out_ == nullptr || glog_ == nullptr ||
+            sel_ == nullptr || rw_ == nullptr || partial_ == nullptr || sg_ == nullptr || su_ == nullptr ||
+            sh_ == nullptr || so_ == nullptr || y_ == nullptr || logits_ == nullptr || pooled_ == nullptr ||
+            latent_ == nullptr || ktmp_ == nullptr || cke_ == nullptr || ckv_ == nullptr || csc_ == nullptr ||
+            iq_ == nullptr ||
+            iw_ == nullptr || idx_ == nullptr || posg_ == nullptr) {
+            err = last_error;
+            return false;
+        }
+        // The expert cache (opt-in) rides on top of the state: whole payload slots, so a hit is one copy.
+        if (!opt_.expert_cache_mib.empty() && exp_cache_stride_ != 0) {
+            const size_t pick = opt_.expert_cache_mib.size() == 1
+                                    ? 0
+                                    : std::min<size_t>(s, opt_.expert_cache_mib.size() - 1);
+            const uint32_t mib = opt_.expert_cache_mib[pick];
+            const uint64_t slots = (static_cast<uint64_t>(mib) << 20) / exp_cache_stride_;
+            if (slots != 0) {
+                exp_cache_dev_[s] = static_cast<uint8_t*>(dev(slots * exp_cache_stride_, "expert cache"));
+                if (exp_cache_dev_[s] == nullptr) { err = last_error; return false; }
+                exp_cache_slots_[s] = slots;
+                std::fprintf(stderr, "[v41] expert cache: stage %u %u MiB = %" PRIu64 " slot(s) of %" PRIu64 " B\n",
+                             s, mib, slots, exp_cache_stride_);
+            }
+        }
+        save_stage();
     }
     pm_host_.resize(static_cast<size_t>(cap_) * HC_);
     pos_host_.resize(cap_);
+    dpos_host_.resize(cap_);
+    if (engram_on_) {
+        const uint64_t eng_stride = eng_hd_ + eng_hd_ / 32;
+        eraw_host_.resize(static_cast<size_t>(uint64_t(cap_) * eng_cols_ * eng_stride));
+        erow_ids_.resize(static_cast<size_t>(uint64_t(cap_) * eng_cols_));
+        if (opt_.engram_feed && efeed_.empty()) {
+            const size_t layers = geo.engram_layer_ids.size();
+            const size_t raw_sz = static_cast<size_t>(uint64_t(cap_) * eng_cols_ * eng_stride);
+            const size_t id_sz = static_cast<size_t>(uint64_t(cap_) * eng_cols_);
+            efeed_.resize(layers);
+            efeed_raw_.resize(layers);
+            efeed_ids_.resize(layers);
+            efeed_ev_.resize(layers);
+            efeed_ev_set_.resize(layers);
+            efeed_cur_.assign(layers, -1);
+            efeed_dev_.resize(layers);
+            for (size_t ei = 0; ei < layers; ++ei) {
+                const uint32_t il = static_cast<uint32_t>(geo.engram_layer_ids[ei]);
+                efeed_dev_[ei] = st_[stage_of(il)].dev;
+                for (int s = 0; s < 2; ++s) {
+                    efeed_raw_[ei][s].resize(raw_sz);
+                    efeed_ids_[ei][s].resize(id_sz);
+                    efeed_ev_set_[ei][s] = false;
+                    cudaSetDevice(efeed_dev_[ei]);
+                    if (cudaEventCreateWithFlags(&efeed_ev_[ei][s], cudaEventDisableTiming) != cudaSuccess) {
+                        err = "engram feed: cannot create the buffer event";
+                        return false;
+                    }
+                }
+            }
+            cudaSetDevice(st_[0].dev);
+            std::fprintf(stderr, "[v41] engram feed: %zu layer(s), two %u-row buffers each, prefetch on\n", layers,
+                         cap_);
+        }
+    }
     sel_host_.resize(static_cast<size_t>(cap_) * KU_);
     logits_host_.resize(V_);
+    if (opt_.ledger) seen_exp_.assign(static_cast<size_t>(nlayers_) * NE_, 0);
+    if (nstages_ > 1) {
+        handoff_hc_.resize(static_cast<size_t>(cap_) * HC_ * E_);
+        handoff_prem_.resize(static_cast<size_t>(cap_) * HC_);
+    }
     std::fprintf(stderr, "[v41] state: chunk %u, groups cap %" PRIu64 ", topk cap %u, window %u\n", cap_, ngg,
                  topk_cap_, SWA_);
+    if (opt_.chunk == 0)
+        std::fprintf(stderr, "[v41] auto chunk: %u row(s) for a %u-row run\n", cap_, total);
     return true;
 }
 
@@ -1715,17 +2319,29 @@ bool Runner::engram_layer(uint32_t il, std::string& err) {
     const uint32_t n = cur_n_;
     const uint32_t cols = eng_cols_;
     const uint32_t stride = eng_hd_ + eng_hd_ / 32;
-    for (uint32_t i = 0; i < n; ++i) {
-        hash_.rows_masked(hist_.data(), hist_.size(), nullptr, 0, static_cast<int64_t>(cur_pos0_ + i), ei,
-                          erow_ids_.data() + static_cast<size_t>(i) * cols);
-    }
-    const d4::EngramTable& t = geo.engram_tables[static_cast<size_t>(ei)];
-    if (!shard_[ei]->rows(t.weight_offset, t.scale_offset, erow_ids_.data(), static_cast<size_t>(n) * cols,
-                          eng_hd_, eraw_host_.data(), err))
-        return false;
     const uint64_t raw_bytes = uint64_t(n) * cols * stride;
-    cudaError_t ce = cudaMemcpyAsync(eraw_, eraw_host_.data(), static_cast<size_t>(raw_bytes), cudaMemcpyHostToDevice,
-                                     stream_);
+    cudaError_t ce = cudaSuccess;
+    if (opt_.engram_feed) {
+        // The rows were read by the feed (prepare started them, or a previous block's prefetch did); this layer
+        // only waits for them and uploads.  The event marks the slot free for the worker's next read.
+        if (!engram_feed_wait(static_cast<uint32_t>(ei), err)) return false;
+        const size_t slot = static_cast<size_t>(efeed_cur_[static_cast<size_t>(ei)]);
+        ce = cudaMemcpyAsync(eraw_, efeed_raw_[static_cast<size_t>(ei)][slot].data(),
+                             static_cast<size_t>(raw_bytes), cudaMemcpyHostToDevice, stream_);
+        if (ce == cudaSuccess) ce = cudaEventRecord(efeed_ev_[static_cast<size_t>(ei)][slot], stream_);
+        efeed_ev_set_[static_cast<size_t>(ei)][slot] = true;
+    } else {
+        for (uint32_t i = 0; i < n; ++i) {
+            hash_.rows_masked(hist_.data(), hist_.size(), nullptr, 0, static_cast<int64_t>(cur_pos0_ + i), ei,
+                              erow_ids_.data() + static_cast<size_t>(i) * cols);
+        }
+        const d4::EngramTable& t = geo.engram_tables[static_cast<size_t>(ei)];
+        if (!shard_[ei]->rows(t.weight_offset, t.scale_offset, erow_ids_.data(), static_cast<size_t>(n) * cols,
+                              eng_hd_, eraw_host_.data(), err))
+            return false;
+        ce = cudaMemcpyAsync(eraw_, eraw_host_.data(), static_cast<size_t>(raw_bytes), cudaMemcpyHostToDevice,
+                             stream_);
+    }
     if (ce != cudaSuccess) { err = std::string("engram rows upload: ") + cudaGetErrorString(ce); return false; }
     if (!k::deepseek4_engram_rows(eraw_, erows_, n * cols, eng_hd_, stream_)) {
         err = "deepseek4_engram_rows failed";
@@ -1744,6 +2360,150 @@ bool Runner::engram_layer(uint32_t il, std::string& err) {
         !k::deepseek4_engram_gate(hc_, ekv_, static_cast<const float*>(L_[il].eng_q),
                                   static_cast<const float*>(L_[il].eng_k), E_, HC_, n, rms_eps_, stream_)) {
         err = "engram gate failed";
+        return false;
+    }
+    return true;
+}
+
+// ---- The engram feed (P7, opt-in) -----------------------------------------------------------------------------
+//
+// The reference's feed (reference/ds4-dfm-rs/ds4_ds41_forward.inc, ds4_v41_feed): a block's engram row ids depend
+// only on token ids and positions, so the reads for the next block can start while the current block computes.
+// The hash is stateful and stays on the main thread; a worker per (engram layer, buffer slot) only reads the
+// shard.  Two buffers per layer alternate: the block in hand reads from one while a prefetch fills the other, so
+// each engram layer is a join plus the H2D instead of a wait for the disk.  The device path is unchanged (the
+// rows land in the same `eraw_` and go through the same kernels), so --engram-feed must return the same ids.
+// Two slots of one layer can read at once (the first block's prepare and its prefetch): EngramShard's Unix
+// path is pread-only, so that is safe; its Windows FILE* path would need a lock and the feed stays off there.
+
+Runner::~Runner() { engram_feed_close(); }
+
+void Runner::engram_feed_close() {
+    for (auto& jobs : efeed_)
+        for (auto& j : jobs) {
+            if (j.running) {
+                j.th.join();
+                j.running = false;
+            }
+        }
+    for (size_t ei = 0; ei < efeed_ev_.size(); ++ei)
+        for (int s = 0; s < 2; ++s) {
+            if (efeed_ev_[ei][s] == nullptr) continue;
+            cudaSetDevice(efeed_dev_[ei]);
+            cudaEventDestroy(efeed_ev_[ei][s]);
+            efeed_ev_[ei][s] = nullptr;
+        }
+    efeed_ev_set_.clear();
+}
+
+bool Runner::engram_feed_start(uint32_t ei, int slot, uint32_t pos0, const int32_t* hist, size_t hist_len,
+                               const int32_t* ids, uint32_t n) {
+    if (n == 0 || pos0 > hist_len) return false;
+    // The hasher reads its history by absolute position; hand it the n-gram window plus this block's tokens at
+    // the positions they will have.  Positions before 0 stay the pad id, exactly as the full-history call has it.
+    const uint32_t cols = eng_cols_;
+    const uint32_t g = hash_.max_ngram;
+    const uint32_t back = std::min<uint32_t>(g > 0 ? g - 1u : 0u, pos0);
+    std::vector<int32_t> win(static_cast<size_t>(back) + n);
+    if (back != 0) std::memcpy(win.data(), hist + (pos0 - back), static_cast<size_t>(back) * 4);
+    std::memcpy(win.data() + back, ids, static_cast<size_t>(n) * 4);
+    int64_t* out = efeed_ids_[ei][static_cast<size_t>(slot)].data();
+    for (uint32_t i = 0; i < n; ++i)
+        hash_.rows_masked(win.data(), win.size(), nullptr, 0, static_cast<int64_t>(back) + i,
+                          static_cast<uint32_t>(ei), out + static_cast<size_t>(i) * cols);
+    FeedJob& j = efeed_[ei][static_cast<size_t>(slot)];
+    j.ok = true;
+    j.err.clear();
+    j.pos0 = pos0;
+    j.n = n;
+    j.done = false;
+    const size_t rows = static_cast<size_t>(n) * cols;
+    j.th = std::thread([this, ei, slot, rows]() {
+        FeedJob& jj = efeed_[ei][static_cast<size_t>(slot)];
+        // The slot may still be the source of an upload recorded a block or two ago.
+        if (efeed_ev_set_[ei][static_cast<size_t>(slot)]) {
+            cudaSetDevice(efeed_dev_[ei]);
+            if (cudaEventSynchronize(efeed_ev_[ei][static_cast<size_t>(slot)]) != cudaSuccess) {
+                jj.ok = false;
+                jj.err = "buffer event: " + std::string(cudaGetErrorString(cudaGetLastError()));
+                return;
+            }
+        }
+        const d4::EngramTable& t = geo.engram_tables[ei];
+        std::string e;
+        if (!shard_[ei]->rows(t.weight_offset, t.scale_offset, efeed_ids_[ei][static_cast<size_t>(slot)].data(),
+                              rows, eng_hd_, efeed_raw_[ei][static_cast<size_t>(slot)].data(), e)) {
+            jj.ok = false;
+            jj.err = e;
+        }
+    });
+    j.running = true;
+    return true;
+}
+
+bool Runner::engram_feed_prepare(uint32_t pos0, const int32_t* ids, uint32_t n, std::string& err) {
+    if (!opt_.engram_feed || !engram_on_) return true;
+    for (size_t ei = 0; ei < efeed_.size(); ++ei) {
+        auto& jobs = efeed_[ei];
+        int slot = -1;
+        for (int s = 0; s < 2; ++s) {
+            const FeedJob& j = jobs[static_cast<size_t>(s)];
+            if ((j.running || j.done) && j.pos0 == pos0 && j.n == n) { slot = s; break; }
+        }
+        if (slot >= 0) {
+            FeedJob& j = jobs[static_cast<size_t>(slot)];
+            if (j.running) {
+                j.th.join();
+                j.running = false;
+                if (!j.ok) { err = "engram feed: " + j.err; return false; }
+            }
+            j.done = true;
+        } else {
+            // No prefetched rows for this block: read them here.  The read overlaps the layers before the
+            // engram layer; wait() joins it there.
+            const int cur = efeed_cur_[ei];
+            slot = cur < 0 ? 0 : 1 - cur;
+            FeedJob& j = jobs[static_cast<size_t>(slot)];
+            if (j.running) {   // a stale read of another block; its rows are not this block's
+                j.th.join();
+                j.running = false;
+            }
+            j.done = false;
+            if (!engram_feed_start(static_cast<uint32_t>(ei), slot, pos0, hist_.data(), hist_.size(), ids, n)) {
+                err = "engram feed: cannot start the read";
+                return false;
+            }
+        }
+        efeed_cur_[ei] = slot;
+    }
+    return true;
+}
+
+void Runner::engram_feed_prefetch(uint32_t pos0, const int32_t* hist, const int32_t* ids, uint32_t n) {
+    if (!opt_.engram_feed || !engram_on_ || n == 0) return;
+    for (size_t ei = 0; ei < efeed_.size(); ++ei) {
+        const int cur = efeed_cur_[ei];
+        if (cur < 0) continue;   // prepare has not run yet
+        const int slot = 1 - cur;
+        FeedJob& j = efeed_[ei][static_cast<size_t>(slot)];
+        if (j.running) continue;   // the other slot is still being read; this block will be read at prepare
+        if (j.done && j.pos0 == pos0 && j.n == n) continue;
+        j.done = false;
+        // A failure leaves the job object clean and the next prepare reads the block synchronously.
+        (void)engram_feed_start(static_cast<uint32_t>(ei), slot, pos0, hist, pos0, ids, n);
+    }
+}
+
+bool Runner::engram_feed_wait(uint32_t ei, std::string& err) {
+    FeedJob& j = efeed_[ei][static_cast<size_t>(efeed_cur_[ei])];
+    if (j.running) {
+        j.th.join();
+        j.running = false;
+        if (j.ok) j.done = true;
+    }
+    if (!j.ok) { err = "engram feed: " + j.err; return false; }
+    if (!j.done || j.pos0 != cur_pos0_ || j.n != cur_n_) {
+        err = "engram feed: the rows in hand are not this block's";
         return false;
     }
     return true;
@@ -2171,16 +2931,17 @@ bool Runner::block(const int32_t* ids, uint32_t n, bool head, bool head_all, std
     cur_pos0_ = pos0;
     mainh_wrote_ = 0;
 
-    for (uint32_t i = 0; i < n; ++i) pos_host_[i] = static_cast<int32_t>(pos0 + i);
+    for (uint32_t i = 0; i < n; ++i) dpos_host_[i] = static_cast<int32_t>(pos0 + i);
     for (uint32_t i = 0; i < n; ++i)
         for (uint32_t c = 0; c < HC_; ++c)
             pm_host_[static_cast<size_t>(i) * HC_ + c] = (c == 0) ? 1.0f : 0.0f;
     if (hist_.size() < size_t(pos0) + n) hist_.resize(size_t(pos0) + n, 0);
     std::memcpy(hist_.data() + pos0, ids, size_t(n) * 4);
 
+    bind_stage(0);
     cudaError_t ce = cudaMemcpyAsync(d_tok_, ids, uint64_t(n) * 4, cudaMemcpyHostToDevice, stream_);
     if (ce == cudaSuccess)
-        ce = cudaMemcpyAsync(d_pos_, pos_host_.data(), uint64_t(n) * 4, cudaMemcpyHostToDevice, stream_);
+        ce = cudaMemcpyAsync(d_pos_, dpos_host_.data(), uint64_t(n) * 4, cudaMemcpyHostToDevice, stream_);
     if (ce == cudaSuccess)
         ce = cudaMemcpyAsync(d_prem_, pm_host_.data(), uint64_t(n) * HC_ * 4, cudaMemcpyHostToDevice, stream_);
     if (ce != cudaSuccess) { err = std::string("block inputs upload: ") + cudaGetErrorString(ce); return false; }
@@ -2193,11 +2954,50 @@ bool Runner::block(const int32_t* ids, uint32_t n, bool head, bool head_all, std
     idx_owner_ = -1;
     cand_owner_ = -1;
     idx_topk_ = 0;
-    for (uint32_t il = 0; il < nlayers_; ++il)
-        if (!layer(il, err)) {
-            err = "L" + std::to_string(il) + ": " + err;
-            return false;
+    double t_stage = now_sec();
+    for (uint32_t s = 0; s < nstages_; ++s) {
+        if (s > 0) {
+            // Stage hand-off (P7).  The hidden state and the evolved premix move to the next stage through the
+            // host: a sync, two reads and two writes.  Stages run in order for now; a later change can overlap
+            // stage s + 1's entry with stage s's tail.
+            if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "stage hand-off sync failed"; return false; }
+            const uint64_t hc_bytes = uint64_t(n) * HC_ * E_ * 4;
+            const uint64_t prem_bytes = uint64_t(n) * HC_ * 4;
+            cudaError_t he = cudaMemcpy(handoff_hc_.data(), hc_, hc_bytes, cudaMemcpyDeviceToHost);
+            if (he == cudaSuccess)
+                he = cudaMemcpy(handoff_prem_.data(), d_prem_, prem_bytes, cudaMemcpyDeviceToHost);
+            if (he != cudaSuccess) {
+                err = std::string("stage hand-off read: ") + cudaGetErrorString(he);
+                return false;
+            }
+            save_stage();
+            bind_stage(s);
+            he = cudaMemcpy(hc_, handoff_hc_.data(), hc_bytes, cudaMemcpyHostToDevice);
+            if (he == cudaSuccess)
+                he = cudaMemcpy(d_prem_, handoff_prem_.data(), prem_bytes, cudaMemcpyHostToDevice);
+            if (he == cudaSuccess)
+                he = cudaMemcpy(d_pos_, dpos_host_.data(), uint64_t(n) * 4, cudaMemcpyHostToDevice);
+            if (he != cudaSuccess) {
+                err = std::string("stage hand-off write: ") + cudaGetErrorString(he);
+                return false;
+            }
+            if (opt_.ledger) {
+                st_hand_sec_[s] += now_sec() - t_stage;
+                t_stage = now_sec();
+            }
         }
+        for (uint32_t il = stage_first_[s]; il < stage_first_[s + 1]; ++il)
+            if (!layer(il, err)) {
+                err = "L" + std::to_string(il) + ": " + err;
+                return false;
+            }
+        if (opt_.ledger) {
+            const double dt = now_sec() - t_stage;
+            if (in_decode_) st_dec_sec_[s] += dt; else st_pre_sec_[s] += dt;
+            t_stage = now_sec();
+        }
+        if (s + 1 < nstages_) save_stage();
+    }
     if (head) {
         // head: hc_pre (fused with the output norm) -> output projection.  The generate path projects the last
         // row only; a spec verify batch projects every row into vlogits_ (the reference's full-GEMM arm).
@@ -2218,7 +3018,15 @@ bool Runner::block(const int32_t* ids, uint32_t n, bool head, bool head_all, std
                 return false;
             }
         }
+        if (opt_.ledger) {
+            const double dt = now_sec() - t_stage;
+            if (in_decode_) st_dec_sec_[nstages_ - 1] += dt; else st_pre_sec_[nstages_ - 1] += dt;
+        }
     }
+    if (in_decode_) ++st_blocks_dec_; else ++st_blocks_pre_;
+    // The last stage's record goes back too: its expert container and index scratch must survive into the next
+    // block instead of being reallocated (and leaked) on every entry.
+    save_stage();
     // The main-hidden ring's accounting (the reference's, core_v41_forward.c:391-400): continue the run when
     // this block touches the previous one, restart it otherwise.  Only the contiguous run ending at mainh_end_
     // is real; the draft window fill may read nothing else.  Must happen before n_past_ advances.
@@ -2242,6 +3050,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
     }
     if (!alloc_state(static_cast<uint32_t>(total), err)) return false;
     n_past_ = 0;
+    in_decode_ = false;
 
     const uint32_t np = static_cast<uint32_t>(prompt.size());
     const double t0 = now_sec();
@@ -2250,6 +3059,16 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
         const uint32_t rest = np - c0 - nc;
         if (rest > 0 && rest < SWA_ && nc > SWA_) nc -= SWA_ - rest;
         const bool last = c0 + nc >= np;
+        // The feed: this block's rows are already in hand (prefetched during the previous one); start the next
+        // block's reads now, so they run under this block's compute (the reference's prefetch_next(c1, ...)).
+        if (!engram_feed_prepare(c0, prompt.data() + c0, nc, err)) return false;
+        if (!last) {
+            const uint32_t c1 = c0 + nc;
+            uint32_t n1 = std::min<uint32_t>(np - c1, cap_);
+            const uint32_t rest1 = np - c1 - n1;
+            if (rest1 > 0 && rest1 < SWA_ && n1 > SWA_) n1 -= SWA_ - rest1;
+            engram_feed_prefetch(c1, prompt.data(), prompt.data() + c1, n1);
+        }
         if (!block(prompt.data() + c0, nc, last, false, err)) return false;
         c0 += nc;
         if (opt_.trace || np >= 64) std::fprintf(stderr, "[v41] prefill %u/%u (%.1fs)\r", c0, np, now_sec() - t0);
@@ -2274,6 +3093,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
 
     std::vector<int32_t> generated;
     if (gen > 0) {
+        in_decode_ = true;
         int32_t t = pick_token(err);
         if (t < 0) return false;
         const double td = now_sec();
@@ -2295,6 +3115,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
             }
             if (!opt_.dspark) {
                 // Plain decode: feed the token, pick its successor.
+                if (!engram_feed_prepare(n_past_, &t, 1, err)) return false;
                 if (!block(&t, 1, true, false, err)) return false;
                 t = pick_token(err);
                 if (t < 0) return false;
@@ -2315,6 +3136,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
             if (k == 0) {
                 // No draft, or a round the scheduler would have sat out: one direct token step.
                 ++plain_steps;
+                if (!engram_feed_prepare(n_past_, &t, 1, err)) return false;
                 if (!block(&t, 1, true, false, err)) return false;
                 t = pick_token(err);
                 if (t < 0) return false;
@@ -2327,6 +3149,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
             // Snapshot -> verify forward -> per-row argmax.  The snapshot is only the ring cells this batch
             // overwrites; the compressor's pending rows are captured inside compress_source.
             if (!spec_snapshot(nb, err)) return false;
+            if (!engram_feed_prepare(n_past_, batch, nb, err)) return false;
             if (!block(batch, nb, true, true, err)) return false;
             for (uint32_t i = 0; i < nb; ++i) {
                 if (!k::deepseek4_argmax(t_want_ + i, vlogits_ + uint64_t(i) * V_, V_, stream_)) {
@@ -2385,6 +3208,37 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
                          opt_.dspark ? "" : " (dspark off)");
         }
     }
+    if (opt_.ledger) {
+        std::fprintf(stderr, "[v41] ledger: prefill %llu block(s), decode %llu block(s)\n",
+                     static_cast<unsigned long long>(st_blocks_pre_),
+                     static_cast<unsigned long long>(st_blocks_dec_));
+        for (uint32_t s = 0; s < nstages_; ++s)
+            std::fprintf(stderr,
+                         "[v41]   stage %u (gpu %d) L%u..%u: prefill %.2fs, decode %.2fs, hand-off %.2fs, "
+                         "staged %.1f MiB in %llu expert slot(s), %.0f%% of them repeats\n",
+                         s, st_[s].dev, stage_first_[s], stage_first_[s + 1] - 1, st_pre_sec_[s], st_dec_sec_[s],
+                         st_hand_sec_[s], static_cast<double>(st_bytes_[s]) / 1048576.0,
+                         static_cast<unsigned long long>(st_slots_[s]),
+                         st_slots_[s] ? 100.0 * static_cast<double>(st_slots_[s] - st_new_[s]) /
+                                            static_cast<double>(st_slots_[s])
+                                      : 0.0);
+        if (!opt_.expert_cache_mib.empty()) {
+            for (uint32_t s = 0; s < nstages_; ++s) {
+                const uint64_t lookups = st_cache_hit_[s] + st_cache_miss_[s];
+                std::fprintf(stderr,
+                             "[v41]   stage %u cache: %llu hit, %llu miss (%.0f%%), %.1f MiB not read, "
+                             "%llu slot(s) of %llu\n",
+                             s, static_cast<unsigned long long>(st_cache_hit_[s]),
+                             static_cast<unsigned long long>(st_cache_miss_[s]),
+                             lookups ? 100.0 * static_cast<double>(st_cache_hit_[s]) /
+                                           static_cast<double>(lookups)
+                                     : 0.0,
+                             static_cast<double>(st_cache_bytes_[s]) / 1048576.0,
+                             static_cast<unsigned long long>(exp_cache_next_[s]),
+                             static_cast<unsigned long long>(exp_cache_slots_[s]));
+            }
+        }
+    }
     std::printf("generated=");
     for (size_t i = 0; i < generated.size(); ++i) std::printf("%s%d", i ? "," : "", generated[i]);
     std::printf("\n");
@@ -2428,6 +3282,27 @@ int main(int argc, char** argv) {
         else if (a == "--chunk") o.chunk = static_cast<uint32_t>(std::strtoul(next("--chunk"), nullptr, 10));
         else if (a == "--ctx") o.ctx = static_cast<uint32_t>(std::strtoul(next("--ctx"), nullptr, 10));
         else if (a == "--gpu") o.gpu = std::atoi(next("--gpu"));
+        else if (a == "--devices") {
+            const std::string v = next("--devices");
+            o.devices.clear();
+            size_t p = 0;
+            while (p < v.size()) {
+                while (p < v.size() && (v[p] == ',' || v[p] == ' ')) ++p;
+                if (p >= v.size()) break;
+                char* end = nullptr;
+                const long d = std::strtol(v.c_str() + p, &end, 10);
+                if (end == v.c_str() + p) {
+                    std::fprintf(stderr, "dsv4_run: --devices: '%s' is not a gpu index list\n", v.c_str());
+                    return 2;
+                }
+                o.devices.push_back(static_cast<int>(d));
+                p = static_cast<size_t>(end - v.c_str());
+            }
+            if (o.devices.empty()) {
+                std::fprintf(stderr, "dsv4_run: --devices needs at least one gpu index\n");
+                return 2;
+            }
+        }
         else if (a == "--logits-out") o.logits_out = next("--logits-out");
         else if (a == "--trace") o.trace = true;
         else if (a == "--dspark") o.dspark = true;
@@ -2445,15 +3320,52 @@ int main(int argc, char** argv) {
         else if (a == "--seed") o.seed = std::strtoull(next("--seed"), nullptr, 10);
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--stream-ids") o.stream_ids = true;
+        else if (a == "--ledger") o.ledger = true;
+        else if (a == "--expert-cache-mib") {
+            const std::string v = next("--expert-cache-mib");
+            o.expert_cache_mib.clear();
+            size_t p = 0;
+            while (p < v.size()) {
+                while (p < v.size() && (v[p] == ',' || v[p] == ' ')) ++p;
+                if (p >= v.size()) break;
+                char* end = nullptr;
+                const unsigned long m = std::strtoul(v.c_str() + p, &end, 10);
+                if (end == v.c_str() + p) {
+                    std::fprintf(stderr, "dsv4_run: --expert-cache-mib: '%s' is not a MiB list\n", v.c_str());
+                    return 2;
+                }
+                o.expert_cache_mib.push_back(static_cast<uint32_t>(m));
+                p = static_cast<size_t>(end - v.c_str());
+            }
+            if (o.expert_cache_mib.empty()) {
+                std::fprintf(stderr, "dsv4_run: --expert-cache-mib needs at least one budget\n");
+                return 2;
+            }
+        }
         else if (a == "--no-engram") o.engram = false;
+        else if (a == "--engram-feed") o.engram_feed = true;
         else if (a == "--no-check") o.check = false;
         else if (a == "--help" || a == "-h") {
             std::fprintf(stderr,
                          "usage: dsv4_run --ids 1,2,3 [--gen N] [--model BASE] [--engram-dir DIR] [--chunk 8]\n"
-                         "               [--ctx N] [--gpu 0] [--trace] [--no-engram] [--no-check] [--logits-out F]\n"
+                         "               [--ctx N] [--gpu 0] [--devices 0,1,2,3] [--trace] [--no-engram] [--no-check]\n"
+                         "               [--logits-out F]\n"
                          "               [--dspark] [--dspark-verify K] [--dspark-trace]\n"
                          "               [--temperature T] [--top-p P] [--min-p M] [--top-k K] [--seed S]\n"
-                         "               [--stop-eos] [--stream-ids]\n"
+                         "               [--stop-eos] [--stream-ids] [--ledger] [--engram-feed]\n"
+                         "               [--expert-cache-mib N[,N...]]\n"
+                         "  --devices        split the layers over these gpus, one stage each, layers in order;\n"
+                         "                   the split only cuts at a compressed-cache seam and must return the\n"
+                         "                   same ids as the one-gpu run (--dspark is one device only)\n"
+                         "  --chunk 0        auto: one block for the whole run when it fits.  The driver picks the\n"
+                         "                   largest block that leaves every stage's state, windows, engram rows and\n"
+                         "                   expert container inside 90%% of its free memory after the weights (at\n"
+                         "                   most 4096 rows, the MoE grid's bound); the default stays 8\n"
+                         "  --ledger         report prefill/decode seconds, the hand-off and staged bytes per stage\n"
+                         "  --expert-cache-mib\n"
+                         "                   keep staged expert payloads in N MiB of device slots per stage (a comma\n"
+                         "                   list gives one budget per stage); a hit copies from its slot instead of\n"
+                         "                   reading the parts again.  Off by default.\n"
                          "  --dspark         the MTP towers draft, the main forward verifies, the cache rolls back;\n"
                          "                   the greedy output must be byte-identical to the same run without it\n"
                          "  --dspark-verify  pin the verified rows per round (1..block, default: the whole block)\n"
@@ -2462,7 +3374,10 @@ int main(int argc, char** argv) {
                          "  --top-p/--min-p/--top-k  the chain's filters (default 1.0, 0.0, 0 = off)\n"
                          "  --seed           the sampler's seed (default 0; the server picks one per request)\n"
                          "  --stop-eos       stop after emitting the model's EOS id\n"
-                         "  --stream-ids     print each generated id as a line as it is produced\n");
+                         "  --stream-ids     print each generated id as a line as it is produced\n"
+                         "  --engram-feed    read the next block's engram rows while the current block computes\n"
+                         "                   (the reference's prepare/wait/prefetch_next); off by default, and\n"
+                         "                   the ids must not move\n");
             return 0;
         } else {
             std::fprintf(stderr, "dsv4_run: unknown argument '%s'\n", a.c_str());
