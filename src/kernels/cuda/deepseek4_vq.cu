@@ -23,6 +23,11 @@
 // value.  The decode kernel does not need this - it is not on a model path - and stays runtime so one launch
 // serves every width.
 //
+// THE ARITHMETIC IS NOT IN THIS FILE.  The lane map, the codeword decode, the multiply-add expression, the xor
+// tree and the gain live in include/strata/kernels/deepseek4_vq.hpp (as __host__ __device__ functions) and in
+// deepseek4_vq_device.hpp (the one-warp form).  The P3 MoE kernels and the MoE host oracle use the same
+// functions, so there is exactly one copy of the expression the reference's bit-identity depends on.
+//
 // THE E4M3 CONVERSION IS ARITHMETIC, NOT `cvt.rn.f16x2.e4m3x2`.  The instruction is exact (E4M3 is a subset
 // of f16) but it needs sm_89+, and this fork builds for sm_86 and HIP too.  The engine measured the scalar
 // table as slower - 26% per decode step, 20% prefill - which is a reason to add the instruction behind an
@@ -34,95 +39,11 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "deepseek4_vq_device.hpp"
+
 namespace strata::kernels {
 
 namespace {
-
-// f16 -> f32 with subnormals exact (the CPU decoder's dsv4_f16_to_f32, bit for bit; NaN payloads included).
-__device__ __forceinline__ float dsv4_vq_f16(uint16_t h) {
-    const uint32_t s = static_cast<uint32_t>(h & 0x8000u) << 16;
-    uint32_t e = (h >> 10) & 0x1Fu;
-    uint32_t m = h & 0x3FFu;
-    uint32_t f;
-    if (e == 0) {
-        if (m == 0) {
-            f = s;
-        } else {
-            e = 112;
-            while ((m & 0x400u) == 0) {
-                m <<= 1;
-                e--;
-            }
-            m &= 0x3FFu;
-            f = s | (e << 23) | (m << 13);
-        }
-    } else if (e == 31) {
-        f = s | 0x7F800000u | (m << 13);
-    } else {
-        f = s | ((e + 112) << 23) | (m << 13);
-    }
-    return __uint_as_float(f);
-}
-
-// E4M3FN -> f32 (the CPU decoder's ds4_e4m3fn_to_f32): 0x7f/0xff are NaN; exp 0 is mant * 2^-9.  Every
-// product here is exact (a 3-bit mantissa and powers of two), so this is the same value as the conversion
-// instruction, without being an instruction.
-__device__ __forceinline__ float dsv4_vq_e4m3(uint8_t x) {
-    const uint32_t abs = x & 0x7Fu;
-    const bool sign = (x & 0x80u) != 0;
-    if (abs == 0) return sign ? __int_as_float(0x80000000u) : 0.0f;
-    if (abs == 0x7Fu) return __int_as_float(0x7fc00000u);   // the CPU returns NAN, positive
-    const uint32_t exp = (x >> 3) & 0x0Fu;
-    const uint32_t man = x & 0x07u;
-    const float value = exp == 0 ? static_cast<float>(man) * 0.001953125f
-                                 : (1.0f + static_cast<float>(man) * 0.125f) *
-                                       static_cast<float>(1u << (exp - 1)) * 0.015625f;
-    return sign ? -value : value;
-}
-
-// The three-byte window.  The parser is the only bounds gate: it requires the last window's three bytes to
-// exist (the format's 8 B pad), exactly as the CPU decoder does, so a descriptor that reached a kernel is
-// safe to read this way.
-__device__ __forceinline__ uint32_t dsv4_vq_window(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16);
-}
-
-// One 8-value codeword, f32.  v3 reads nc*8 E4M3 bytes; v2 reads nc*8 f16 (16 B per codeword).
-__device__ __forceinline__ void dsv4_vq_codeword(const Deepseek4VqMatrix& m, uint32_t idx, float c[8]) {
-    if (m.v3) {
-        const uint8_t* p = m.codebook + static_cast<uint64_t>(idx) * 8u;
-        #pragma unroll
-        for (uint32_t d = 0; d < 8; d++) c[d] = dsv4_vq_e4m3(p[d]);
-    } else {
-        const uint8_t* p = m.codebook + static_cast<uint64_t>(idx) * 16u;
-        #pragma unroll
-        for (uint32_t d = 0; d < 8; d++) c[d] = dsv4_vq_f16(deepseek4_vq_rd_u16(p + d * 2));
-    }
-}
-
-// Runtime index extraction, identical to dsv4::VqMatrix::index: v2 8-bit bytes or an NBIT window per group;
-// v3 a fixed 12-bit window per row plus the 13th bit from the plane.  The window may start at any bit.
-__device__ __forceinline__ uint32_t dsv4_vq_index(const Deepseek4VqMatrix& m, uint32_t r, uint32_t i) {
-    if (!m.v3) {
-        const uint32_t gi = r * m.nidx_row + i;
-        if (m.nbit == 8) return m.stream[gi];
-        const uint64_t bit = static_cast<uint64_t>(gi) * m.nbit;
-        const uint32_t w = dsv4_vq_window(m.stream + (bit >> 3));
-        return (w >> (bit & 7u)) & ((1u << m.nbit) - 1u);
-    }
-    const uint32_t mrow = (m.nidx_row * 12u + 7u) / 8u;
-    const uint8_t* row_stream = m.stream + static_cast<uint64_t>(r) * mrow;
-    const uint32_t bit = i * 12u;
-    uint32_t v = dsv4_vq_window(row_stream + (bit >> 3)) >> (bit & 7u);
-    v &= 0xFFFu;
-    if (m.plane != nullptr) {
-        const uint32_t prow = (m.nidx_row + 7u) / 8u;
-        const uint8_t byte = m.plane[static_cast<uint64_t>(r) * prow + (i >> 3)];
-        v |= static_cast<uint32_t>((byte >> (i & 7u)) & 1u) << 12;
-    }
-    return v;
-}
 
 // ---- decode -------------------------------------------------------------------------------------------
 
@@ -132,70 +53,18 @@ __global__ void deepseek4_vq_dequant_kernel(Deepseek4VqMatrix m, float* __restri
     if (g >= total) return;
     const uint32_t r = static_cast<uint32_t>(g / m.nidx_row);
     const uint32_t i = static_cast<uint32_t>(g - static_cast<uint64_t>(r) * m.nidx_row);
-    const uint32_t idx = dsv4_vq_index(m, r, i);
+    const uint32_t idx = deepseek4_vq_index_at(m, r, i);
     float c[8];
-    dsv4_vq_codeword(m, idx, c);
+    deepseek4_vq_codeword_f32(m, idx, c);
     const float gain = m.gain_override != nullptr ? m.gain_override[r]
-                                                  : dsv4_vq_f16(deepseek4_vq_rd_u16(m.gains + static_cast<uint64_t>(r) * 2u));
+                                                  : deepseek4_vq_f16_to_f32(deepseek4_vq_rd_u16(
+                                                        m.gains + static_cast<uint64_t>(r) * 2u));
     float* o = out + static_cast<uint64_t>(r) * m.cols + static_cast<uint64_t>(i) * 8u;
     #pragma unroll
     for (uint32_t d = 0; d < 8; d++) o[d] = c[d] * gain;
 }
 
 // ---- row dot ------------------------------------------------------------------------------------------
-
-// One round's index for lane j in row r, with the width and version known at compile time.  v3's main stream
-// is always 12 bits (the 13th rides the plane); the EXT branch is its own template so the 13-bit layers do
-// not pay for a runtime `plane != nullptr` per group.
-template <int NBIT, int V3, int EXT>
-__device__ __forceinline__ uint32_t dsv4_vq_index_t(const Deepseek4VqMatrix& m, uint32_t r, uint32_t i) {
-    if (V3) {
-        const uint32_t mrow = (m.nidx_row * 12u + 7u) / 8u;
-        const uint8_t* row_stream = m.stream + static_cast<uint64_t>(r) * mrow;
-        const uint32_t bit = i * 12u;
-        uint32_t v = (dsv4_vq_window(row_stream + (bit >> 3)) >> (bit & 7u)) & 0xFFFu;
-        if (EXT) {
-            const uint32_t prow = (m.nidx_row + 7u) / 8u;
-            const uint8_t byte = m.plane[static_cast<uint64_t>(r) * prow + (i >> 3)];
-            v |= static_cast<uint32_t>((byte >> (i & 7u)) & 1u) << 12;
-        }
-        return v;
-    }
-    const uint32_t gi = r * m.nidx_row + i;
-    const uint64_t bit = static_cast<uint64_t>(gi) * NBIT;
-    const uint32_t w = dsv4_vq_window(m.stream + (bit >> 3));
-    return (w >> (bit & 7u)) & ((1u << NBIT) - 1u);
-}
-
-// The reference's one multiply-add expression (ds41_vq_row.cuh v41_vq_dot8_cw), kept as ONE expression: under
-// nvcc's default contraction the sum order and the FMA merge are what a different spelling would change.
-// A uint32 holds two bf16, low half = even column; the shifts restore f32.
-__device__ __forceinline__ float dsv4_vq_dot8_cw(const float c[8], uint32_t x0, uint32_t x1, uint32_t x2,
-                                                 uint32_t x3) {
-    return c[0] * __uint_as_float(x0 << 16) + c[1] * __uint_as_float(x0 & 0xffff0000u)
-         + c[2] * __uint_as_float(x1 << 16) + c[3] * __uint_as_float(x1 & 0xffff0000u)
-         + c[4] * __uint_as_float(x2 << 16) + c[5] * __uint_as_float(x2 & 0xffff0000u)
-         + c[6] * __uint_as_float(x3 << 16) + c[7] * __uint_as_float(x3 & 0xffff0000u);
-}
-
-// One warp, one row.  Lane j takes groups i = j, j + 32, ... - the reference's lane<->index map - so each
-// lane's per-group accumulation and the xor tree below are its single-token path.  `x` is cols/2 uint32.
-template <int NBIT, int V3, int EXT>
-__device__ __forceinline__ float dsv4_vq_row_dot(const Deepseek4VqMatrix& m, uint32_t r, const uint32_t* x) {
-    const uint32_t lane = threadIdx.x & 31u;
-    const uint32_t nidx = m.nidx_row;
-    float acc = 0.0f;
-    for (uint32_t i = lane; i < nidx; i += 32u) {
-        const uint32_t v = dsv4_vq_index_t<NBIT, V3, EXT>(m, r, i);
-        float c[8];
-        dsv4_vq_codeword(m, v, c);
-        const uint32_t* xw = x + static_cast<uint64_t>(i) * 4u;   // 8 bf16 = 16 B
-        acc += dsv4_vq_dot8_cw(c, xw[0], xw[1], xw[2], xw[3]);
-    }
-    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-    const float gain = dsv4_vq_f16(deepseek4_vq_rd_u16(m.gains + static_cast<uint64_t>(r) * 2u));
-    return acc * gain * (m.gain_override != nullptr ? m.gain_override[r] : 1.0f);
-}
 
 template <int NBIT, int V3, int EXT>
 __global__ void deepseek4_vq_gemv_kernel(Deepseek4VqMatrix m, const uint32_t* __restrict__ x,
@@ -205,7 +74,7 @@ __global__ void deepseek4_vq_gemv_kernel(Deepseek4VqMatrix m, const uint32_t* __
     const uint32_t warps = blockDim.x >> 5;
     const uint32_t r = blockIdx.x * warps + (threadIdx.x >> 5);
     if (r >= m.rows) return;
-    y[r] = dsv4_vq_row_dot<NBIT, V3, EXT>(m, r, x);
+    y[r] = deepseek4_vq_row_dot<NBIT, V3, EXT>(m, r, x);
 }
 
 // ---- launchers ----------------------------------------------------------------------------------------

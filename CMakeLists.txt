@@ -416,10 +416,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/deepseek4_hc.cu
                           src/kernels/cuda/deepseek4_dense.cu
                           src/kernels/cuda/deepseek4_attn.cu
+                          src/kernels/cuda/deepseek4_moe.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/deepseek4_hc_host.cpp
                           src/kernels/deepseek4_dense_host.cpp
                           src/kernels/deepseek4_attn_host.cpp
+                          src/kernels/deepseek4_moe_host.cpp
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -514,6 +516,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(deepseek4_indexer_cuda_test PRIVATE strata_kernels CUDA::cudart)
     add_test(NAME deepseek4_indexer_cuda_test COMMAND deepseek4_indexer_cuda_test)
     set_tests_properties(deepseek4_indexer_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
+    # DeepSeek-V4.1-Flash MoE (docs/DEEPSEEK4.md, P3): the router against its host oracle and the known
+    # tie/threshold/bias_vl cases; the routed VQ MoE against the reference engine's own fixture (bit-exact on
+    # the one-hot cases, the fixture's own scale tolerance on the random ones), against the host oracle, with
+    # a 2-token call and the partials + tail path. No model, no timing.
+    add_executable(deepseek4_moe_cuda_test tests/core/deepseek4_moe_cuda_test.cpp)
+    target_include_directories(deepseek4_moe_cuda_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+                                                               ${CMAKE_CURRENT_SOURCE_DIR}/tools/dsv4)
+    target_link_libraries(deepseek4_moe_cuda_test PRIVATE strata_kernels CUDA::cudart)
+    add_test(NAME deepseek4_moe_cuda_test
+             COMMAND deepseek4_moe_cuda_test ${CMAKE_CURRENT_SOURCE_DIR}/reference)
+    set_tests_properties(deepseek4_moe_cuda_test PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(qsa_topk_active_parity src/kernels/qsa_topk_active_parity.cpp)
     target_include_directories(qsa_topk_active_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_topk_active_parity PRIVATE strata_kernels CUDA::cudart)
