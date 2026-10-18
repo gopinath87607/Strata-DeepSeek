@@ -365,6 +365,8 @@ class Engine:
             cmd.append("--no-engram")
         if self.args.engram_feed:
             cmd.append("--engram-feed")
+        if self.args.ram_image:
+            cmd.append("--ram-image")
         return cmd
 
     def _kill(self):
@@ -641,6 +643,8 @@ class Engine:
                 cmd.append("--no-engram")
             if self.args.engram_feed:
                 cmd.append("--engram-feed")
+            if self.args.ram_image:
+                cmd.append("--ram-image")
             deadline = time.monotonic() + self.args.timeout
             proc = None
             try:
@@ -1206,6 +1210,8 @@ def main(argv):
     ap.add_argument("--no-engram", action="store_true")
     ap.add_argument("--engram-feed", action="store_true",
                     help="P7 engram feed: read the next block's engram rows while the current block computes")
+    ap.add_argument("--ram-image", action="store_true",
+                    help="load the whole image into host RAM once at start; expert misses are staged from there")
     ap.add_argument("--no-resident", action="store_true",
                     help="one driver process per request (the P6 path); the default keeps the model resident")
     ap.add_argument("--serve-ctx", type=int, default=16384,

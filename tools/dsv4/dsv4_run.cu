@@ -18,7 +18,7 @@
 //            [--devices 0,1,2,3] [--ledger] [--expert-cache-mib N[,N...]]
 //            [--dspark [--dspark-verify K] [--dspark-trace]]
 //            [--temperature T] [--top-p P] [--min-p M] [--top-k K] [--seed S] [--stop-eos] [--stream-ids]
-//            [--engram-feed]
+//            [--engram-feed] [--ram-image]
 //
 // The runner takes token ids, not text: the tokenizer is Python (tools/strata_tokenizer.py); see
 // tools/dsv4/dsv4_prompt.py for the text wrapper.
@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cinttypes>
 #include <cmath>
@@ -38,6 +39,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
@@ -107,6 +109,10 @@ public:
     ~Parts() {
         for (auto& p : parts_)
             if (p.fd >= 0) ::close(p.fd);
+        if (ram_ != nullptr) {
+            if (ram_pinned_) cudaFreeHost(ram_);
+            else std::free(ram_);
+        }
     }
 
     // `model` is the base name (with or without the suffix) or a single assembled file.
@@ -164,6 +170,76 @@ public:
     const std::string& gguf_path() const { return parts_.front().path; }
 
     bool read(uint64_t abs, void* dst, uint64_t len, std::string& err) const {
+        if (ram_ != nullptr) {
+            if (abs > total_ || len > total_ - abs) {
+                err = "read past the image end (offset " + std::to_string(abs) + ", " + std::to_string(len) + " bytes)";
+                return false;
+            }
+            std::memcpy(dst, ram_ + abs, static_cast<size_t>(len));
+            return true;
+        }
+        return read_disk(abs, dst, len, err);
+    }
+
+    // ---- The RAM image (--ram-image, opt-in) ----
+    // The whole assembled image in host memory, read once at start.  Every Parts read becomes a memcpy, and
+    // stage_blob_b copies an expert's slots straight from it to the device instead of assembling them in the
+    // pageable staging vector.  Pinned when cudaHostAlloc takes it (a direct DMA source, the case that saves a
+    // copy per miss); pageable otherwise, where the reads are still served from RAM.
+    bool load_ram(std::string& err) {
+        if (ram_ != nullptr) return true;
+        const double t0 = now_sec();
+        void* mem = nullptr;
+        const cudaError_t ce = cudaHostAlloc(&mem, static_cast<size_t>(total_), cudaHostAllocPortable);
+        ram_pinned_ = ce == cudaSuccess;
+        if (!ram_pinned_) {
+            (void) cudaGetLastError();
+            mem = std::malloc(static_cast<size_t>(total_));
+            if (mem == nullptr) {
+                err = "RAM image: cannot allocate " + std::to_string(total_ / (1ull << 20)) + " MiB of host memory";
+                return false;
+            }
+        }
+        ram_ = static_cast<uint8_t*>(mem);
+        std::atomic<bool> ok{true};
+        std::atomic<uint64_t> next{0};
+        std::string first_err;
+        std::mutex mu;
+        constexpr uint64_t kSlice = 64ull << 20;
+        const uint32_t nthr = std::min<uint32_t>(8u, std::max<uint32_t>(1u, std::thread::hardware_concurrency() / 4));
+        std::vector<std::thread> pool;
+        for (uint32_t t = 0; t < nthr; ++t) {
+            pool.emplace_back([&]() {
+                while (ok.load(std::memory_order_relaxed)) {
+                    const uint64_t at = next.fetch_add(kSlice);
+                    if (at >= total_) break;
+                    const uint64_t n = std::min(kSlice, total_ - at);
+                    std::string e;
+                    if (!read_disk(at, ram_ + at, n, e)) {
+                        std::lock_guard<std::mutex> g(mu);
+                        if (ok.exchange(false)) first_err = e;
+                        break;
+                    }
+                }
+            });
+        }
+        for (auto& th : pool) th.join();
+        if (!ok.load()) {
+            err = first_err;
+            return false;
+        }
+        const double secs = now_sec() - t0;
+        std::fprintf(stderr, "[v41] ram image: %.1f GiB %s in %.2fs (%.0f MB/s)\n",
+                     static_cast<double>(total_) / 1073741824.0,
+                     ram_pinned_ ? "pinned" : "pageable (cudaHostAlloc refused)",
+                     secs, static_cast<double>(total_) / 1e6 / (secs > 1e-9 ? secs : 1e-9));
+        return true;
+    }
+
+    const uint8_t* ram_base() const { return ram_; }   // the RAM image, or null when the tier is off
+
+private:
+    bool read_disk(uint64_t abs, void* dst, uint64_t len, std::string& err) const {
         uint8_t* out = static_cast<uint8_t*>(dst);
         if (abs > total_ || len > total_ - abs) {
             err = "read past the image end (offset " + std::to_string(abs) + ", " + std::to_string(len) + " bytes)";
@@ -196,6 +272,7 @@ public:
         return true;
     }
 
+public:
     std::string where(uint64_t abs) const {
         size_t i = 0;
         while (i + 1 < parts_.size() && abs >= parts_[i + 1].base) ++i;
@@ -207,6 +284,8 @@ public:
 private:
     std::vector<Part> parts_;
     uint64_t total_ = 0;
+    uint8_t* ram_ = nullptr;      // the RAM image (--ram-image), or null
+    bool ram_pinned_ = false;     // cudaHostAlloc took it: a direct DMA source for stage_blob_b
 };
 
 // ---- The expert blob ------------------------------------------------------------------------------------------
@@ -317,6 +396,11 @@ struct Options {
     // number applies to every stage; a comma list gives one budget per stage (see --devices).  Empty is off and
     // changes nothing: the default path stays byte-identical to the run without this switch.
     std::vector<uint32_t> expert_cache_mib;
+    // RAM image (opt-in): the whole assembled image in host memory, read once at start.  Off by default, and the
+    // default path stays byte-identical: every read still goes to the parts.  On, an expert-cache miss is copied
+    // straight from the (pinned, when the driver allows it) image to the device container instead of being read
+    // from disk and assembled in the pageable staging buffer first.
+    bool ram_image = false;
 };
 
 // ---- The runner -----------------------------------------------------------------------------------------------
@@ -818,6 +902,7 @@ bool Runner::open(const Options& o, std::string& err) {
     if (!parts_.open(o.model, err)) return false;
     std::fprintf(stderr, "[v41] image %s: %" PRIu64 " bytes in %zu part(s)\n", parts_.gguf_path().c_str(),
                  parts_.size(), parts_.count());
+    if (opt_.ram_image && !parts_.load_ram(err)) return false;
     try {
         gguf_ = std::make_unique<GgufFile>(parts_.gguf_path());
     } catch (const std::exception& e) {
@@ -1323,6 +1408,11 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
     std::vector<uint64_t> pinned;   // slots this container points at: never evicted by its own misses
     struct Move { uint64_t dst = 0, src = 0, len = 0; bool to_cache = false; };
     std::vector<Move> moves;
+    // --ram-image: a miss's slots are queued here and copied from the RAM image straight to the container
+    // (dst is the container offset, src the absolute image offset), so the bytes are never assembled into the
+    // pageable staging vector.  Empty when the tier is off, and then the path below is the old one.
+    const uint8_t* const ram = parts_.ram_base();
+    std::vector<Move> pulls;
     // Least recently used slot the container does not point at; -1 when every slot is pinned.
     auto evict_one = [&]() -> int64_t {
         uint64_t victim = 0, best = ~uint64_t{0};
@@ -1370,12 +1460,35 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
         } else {
             uint64_t rd = cur;
             bool payload_ok = true;
-            for (uint32_t w = 0; w < 3; ++w) {
-                const size_t i = i0 + w;
-                if (!parts_.read(b.abs + b.slot[i], p + rd, b.span[i], err)) return false;
-                const uint32_t magic = rd32(p + rd);
-                if (magic != d4::kMatV3Magic && magic != d4::kMatV2Magic) { ++holes; payload_ok = false; }
-                rd += b.span[i];
+            if (ram != nullptr) {
+                uint64_t dst = cur;
+                for (uint32_t w = 0; w < 3; ++w) {
+                    const size_t i = i0 + w;
+                    const uint64_t src = b.abs + b.slot[i];
+                    if (src > parts_.size() || b.span[i] > parts_.size() - src) {
+                        err = "read past the image end (offset " + std::to_string(src) + ", " +
+                              std::to_string(b.span[i]) + " bytes)";
+                        return false;
+                    }
+                    // The three slots are usually adjacent in both the image and the container; one copy then
+                    // carries all three and a prefill layer issues a third of the calls.
+                    if (!pulls.empty() && pulls.back().src + pulls.back().len == src &&
+                        pulls.back().dst + pulls.back().len == dst)
+                        pulls.back().len += b.span[i];
+                    else
+                        pulls.push_back({dst, src, b.span[i], false});
+                    const uint32_t magic = rd32(ram + src);
+                    if (magic != d4::kMatV3Magic && magic != d4::kMatV2Magic) { ++holes; payload_ok = false; }
+                    dst += b.span[i];
+                }
+            } else {
+                for (uint32_t w = 0; w < 3; ++w) {
+                    const size_t i = i0 + w;
+                    if (!parts_.read(b.abs + b.slot[i], p + rd, b.span[i], err)) return false;
+                    const uint32_t magic = rd32(p + rd);
+                    if (magic != d4::kMatV3Magic && magic != d4::kMatV2Magic) { ++holes; payload_ok = false; }
+                    rd += b.span[i];
+                }
             }
             if (opt_.ledger) ++st_cache_miss_[stage_cur_];
             if (caching && payload_ok) {
@@ -1401,8 +1514,16 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
         if (blob_dev_ == nullptr) { err = last_error; return false; }
         blob_dcap_ = cur;
     }
-    const cudaError_t ce = cudaMemcpyAsync(blob_dev_, p, cur, cudaMemcpyHostToDevice, stream_);
+    // The header (and the shared codebook) always rides the staging vector; with the RAM image the experts'
+    // bytes are pulled straight from it below, so only [0, table_end + cb_len) is uploaded here.
+    const uint64_t upload = ram != nullptr ? table_end + b.cb_len : cur;
+    const cudaError_t ce = cudaMemcpyAsync(blob_dev_, p, upload, cudaMemcpyHostToDevice, stream_);
     if (ce != cudaSuccess) { err = std::string("expert container upload: ") + cudaGetErrorString(ce); return false; }
+    for (const Move& m : pulls) {
+        const cudaError_t pe = cudaMemcpyAsync(static_cast<uint8_t*>(blob_dev_) + m.dst, ram + m.src, m.len,
+                                               cudaMemcpyHostToDevice, stream_);
+        if (pe != cudaSuccess) { err = std::string("expert container pull: ") + cudaGetErrorString(pe); return false; }
+    }
     // The moves ride the container's stream after the upload, so a hit's bytes land before the MoE reads them and
     // a fresh slot copies the payload that was just uploaded.
     for (const Move& m : moves) {
@@ -3427,6 +3548,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--no-engram") o.engram = false;
         else if (a == "--engram-feed") o.engram_feed = true;
+        else if (a == "--ram-image") o.ram_image = true;
         else if (a == "--serve") o.serve = true;
         else if (a == "--serve-ctx") o.serve_ctx = static_cast<uint32_t>(std::strtoul(next("--serve-ctx"), nullptr, 10));
         else if (a == "--no-check") o.check = false;
@@ -3438,7 +3560,7 @@ int main(int argc, char** argv) {
                          "               [--dspark] [--dspark-verify K] [--dspark-trace]\n"
                          "               [--temperature T] [--top-p P] [--min-p M] [--top-k K] [--seed S]\n"
                          "               [--stop-eos] [--stream-ids] [--ledger] [--engram-feed]\n"
-                         "               [--expert-cache-mib N[,N...]]\n"
+                         "               [--expert-cache-mib N[,N...]] [--ram-image]\n"
                          "               [--serve --serve-ctx N]\n"
                          "  --devices        split the layers over these gpus, one stage each, layers in order;\n"
                          "                   the split only cuts at a compressed-cache seam and must return the\n"
@@ -3452,6 +3574,9 @@ int main(int argc, char** argv) {
                          "                   keep staged expert payloads in N MiB of device slots per stage (a comma\n"
                          "                   list gives one budget per stage); a hit copies from its slot instead of\n"
                          "                   reading the parts again.  Off by default.\n"
+                         "  --ram-image      read the whole image into host RAM once at start (pinned when the\n"
+                         "                   driver allows it, so the copy is a direct DMA) and stage expert misses\n"
+                         "                   from there instead of the disk.  Off by default.\n"
                          "  --dspark         the MTP towers draft, the main forward verifies, the cache rolls back;\n"
                          "                   the greedy output must be byte-identical to the same run without it\n"
                          "  --dspark-verify  pin the verified rows per round (1..block, default: the whole block)\n"
