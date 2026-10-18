@@ -368,6 +368,27 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # Naive first, each with a parity test against a reference that was itself validated against ggml.  The
   # kernels link `strata_artifact` for the scalar dequantizers, because using the VALIDATED scalar path as the
   # reference is the whole point - a kernel checked against another copy of itself proves nothing.
+  #
+  # The batched MoE prefill's tiles are bf16 tensor-core mma.sync, which needs sm_80 or newer - above the floor
+  # the rest of the tree is compiled for.  It is its own static library so it alone carries the higher arch
+  # (SASS for the 86 and 120 cards the port is measured on, plus PTX for the arches between), and strata_kernels
+  # links it so the driver and the tests pick it up the way they pick up the rest.
+  if(STRATA_ENABLE_CUDA)
+    add_library(strata_kernels_dsv4_prefill STATIC src/kernels/cuda/deepseek4_prefill.cu)
+    set_target_properties(strata_kernels_dsv4_prefill PROPERTIES CUDA_ARCHITECTURES "86-real;86-virtual;120")
+    target_link_libraries(strata_kernels_dsv4_prefill PUBLIC strata_artifact)
+    # The batched dense tensor-core tiles (--tc-gemm, opt-in) carry the same bf16 mma.sync and sit in their own
+    # library for the same reason: SASS for the 86/120 cards, PTX for the arches between, above the floor.
+    add_library(strata_kernels_dsv4_dense_tc STATIC src/kernels/cuda/deepseek4_dense_tc.cu)
+    set_target_properties(strata_kernels_dsv4_dense_tc PROPERTIES CUDA_ARCHITECTURES "86-real;86-virtual;120")
+    target_link_libraries(strata_kernels_dsv4_dense_tc PUBLIC strata_artifact)
+    # The sparse attention's tensor-core prefill route (--attn-mma, opt-in) is the same bf16 mma.sync over the
+    # same m16n8k16 tiles, so it takes the same own-library arch pin.
+    add_library(strata_kernels_dsv4_attn_mma STATIC src/kernels/cuda/deepseek4_attn_mma.cu)
+    set_target_properties(strata_kernels_dsv4_attn_mma PROPERTIES CUDA_ARCHITECTURES "86-real;86-virtual;120")
+    target_link_libraries(strata_kernels_dsv4_attn_mma PUBLIC strata_artifact)
+  endif()
+
   add_library(strata_kernels STATIC src/kernels/cuda/dequant_s2.cu src/kernels/cuda/s2_gemv.cu
                           src/kernels/cuda/s_gemv.cu
                           src/kernels/cuda/s2_gemv_quads.cu
@@ -427,6 +448,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  if(STRATA_ENABLE_CUDA)
+    target_link_libraries(strata_kernels PUBLIC strata_kernels_dsv4_prefill strata_kernels_dsv4_dense_tc
+                                                strata_kernels_dsv4_attn_mma)
+  endif()
   # DeepSeek-V4.1-Flash forward driver (docs/DEEPSEEK4.md, P3's runnable arm): one GPU, greedy decode, the 40-part
   # GGUF through a parts-aware reader. Not a test: it wants the model and the two engram shards, so it is built
   # whenever the CUDA backend is on and is not registered with ctest.

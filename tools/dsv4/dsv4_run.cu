@@ -18,7 +18,7 @@
 //            [--devices 0,1,2,3] [--ledger] [--expert-cache-mib N[,N...]]
 //            [--dspark [--dspark-verify K] [--dspark-trace]]
 //            [--temperature T] [--top-p P] [--min-p M] [--top-k K] [--seed S] [--stop-eos] [--stream-ids]
-//            [--engram-feed] [--ram-image]
+//            [--engram-feed [--engram-kick]] [--ram-image] [--moe-prefill [--moe-prefill-check]]
 //
 // The runner takes token ids, not text: the tokenizer is Python (tools/strata_tokenizer.py); see
 // tools/dsv4/dsv4_prompt.py for the text wrapper.
@@ -57,6 +57,7 @@
 #include "strata/kernels/deepseek4_fp8.hpp"
 #include "strata/kernels/deepseek4_hc.hpp"
 #include "strata/kernels/deepseek4_moe.hpp"
+#include "strata/kernels/deepseek4_prefill.hpp"
 #include "strata/kernels/deepseek4_vq.hpp"
 
 namespace d4 = strata::deepseek4;
@@ -401,6 +402,35 @@ struct Options {
     // straight from the (pinned, when the driver allows it) image to the device container instead of being read
     // from disk and assembled in the pageable staging buffer first.
     bool ram_image = false;
+    // Batched MoE prefill (opt-in): above kGemvMaxTok tokens the routed experts go through the bf16 tensor-core
+    // arm (sort by expert, 128x128 tiles) instead of one warp per (token, expert) pair, which is what makes a
+    // prompt block's time depend on the block instead of on each token.  Off by default, and the default path is
+    // unchanged.  --moe-prefill-check also runs the per-pair arm on the first kGemvMaxTok tokens of the first
+    // three layers and prints both results' scale, max difference and equality count.
+    bool moe_prefill = false;
+    bool moe_prefill_check = false;
+    // --pf-time (diagnostic, opt-in): per layer, the time from the router's sync to the container's last byte
+    // (staging: the host table build plus every copy queued by stage_blob) and from there to the routed MoE
+    // kernel's end.  Prints one line per layer; the default path records no events.
+    bool pf_time = false;
+    // --dense-batch (opt-in): prompt-width dense matmuls go through the token-batched q4_K/bf16 tiles.  The
+    // per-(row, token) kernels read one activation row per output row, which at prefill widths is out_dim times
+    // more traffic than the arithmetic needs.  Off by default; the kernels' sums differ in order (bf16-ulp equal).
+    bool dense_batch = false;
+    // --tc-gemm (opt-in, implies --dense-batch): the batched matmuls run the bf16 tensor-core tiles (ldmatrix +
+    // m16n8k16, 128 rows x 128 tokens a block) instead of the SIMT tiles.  The products are bf16 tensor-core
+    // FMAs into an f32 accumulator; outputs stay on the bf16 grid, a run's rounded ids are expected unchanged.
+    bool tc_gemm = false;
+    // --attn-mma (opt-in): the prompt's sparse attention runs the tensor-core route (16 heads x 16 keys a block,
+    // bf16 mma) instead of the SIMT kernel.  Not bit-equal (accumulation order and key tiles differ, the
+    // reference's own caveat); prompt batches shorter than 64 tokens keep the SIMT kernel.
+    bool attn_mma = false;
+    // --expert-loan (opt-in, needs --expert-cache-mib): the per-stage expert pool is the layer's container, not a
+    // copy behind it.  A hit's table entry points into its slot (no device copy); a miss is pulled from the RAM
+    // image straight into a slot.  The chunk budget then reserves max(slots, the container's experts) once, where
+    // the cache used to be reserved beside the whole container -- the chunk grows by the cache's bytes.  Off by
+    // default and the default path is unchanged.
+    bool expert_loan = false;
 };
 
 // ---- The runner -----------------------------------------------------------------------------------------------
@@ -445,7 +475,9 @@ private:
         float* ekv = nullptr;
         uint64_t blob_dcap = 0;
         void* blob_dev = nullptr;
+        void* container = nullptr;   // where stage_blob_b() put the layer: blob_dev, or the pool under --expert-loan
         uint64_t stage_used = 0;
+        k::Deepseek4MoePrefillScratch pf;   // --moe-prefill: this stage's scratch (sorted acts, gate, mid, plan)
     };
     void bind_stage(uint32_t s);
     void save_stage();
@@ -535,6 +567,7 @@ private:
     Blob blob_[64];
     uint64_t blob_dcap_ = 0;
     void* blob_dev_ = nullptr;
+    void* layer_container_ = nullptr;   // the base the MoE arms read: blob_dev_, or the loan pool
     uint64_t stage_used_ = 0;
     std::vector<uint8_t> stage_;
 
@@ -705,8 +738,32 @@ private:
     std::vector<uint64_t> exp_cache_next_;     // bump cursor per stage
     uint64_t exp_cache_stride_ = 0;            // bytes per slot (the largest expert payload)
     uint64_t cache_tick_ = 0;
+    // --expert-loan: the pool above is the container.  Slot i lives at loan_hdr_[stage] + i * stride; the header
+    // (magic, table, codebook) is uploaded to the pool's first bytes each layer and the table points at the slots.
+    // loan_hdr_ and loan_span_ are per stage; loan_span_ is the stride count the pool was allocated with.
+    bool loan_ = false;
+    std::vector<uint64_t> loan_hdr_;
+    std::vector<uint64_t> loan_span_;
+    uint64_t stage_read_ = 0;                  // bytes a layer actually pulled (--pf-time's print, loan's too)
     // --ledger: what the cache answered, and the bytes those hits did not have to read.
     uint64_t st_cache_hit_[8] {}, st_cache_miss_[8] {}, st_cache_bytes_[8] {};
+    // --moe-prefill-check: layers compared so far, and one note if the arm declines (a payload/geometry with no
+    // arm), so a fallback does not print once per layer per block.
+    uint32_t pf_checked_ = 0;
+    bool pf_note_ = false;
+    // --pf-time: three stream events per layer (sync, container staged, MoE done), read at the next layer's sync.
+    // Events belong to the device context they were created in, so each stage owns a set and the pending one is
+    // flushed before block() switches devices.
+    // Two sets per stage, alternating per layer: a layer's start event must not be overwritten by the next
+    // layer before the previous layer's line is read.  0 start, 1 router sync, 2 staged, 3 MoE, 4 end.
+    cudaEvent_t pf_ev_[8][2][9] {};   // 0..4 = front/staging/moe/tail, 5..8 = attention: start, sparse start/end
+    uint32_t pf_slot_ = 0, pf_pend_slot_ = 0;   // the current layer's set, and the pending layer's
+    bool pf_ev_made_[8] {};
+    bool pf_ev_pending_ = false;
+    bool pf_ev4_valid_ = false;   // the pending record got its end marker (see layer(): cross-stage, it can't)
+    uint32_t pf_ev_stage_ = 0, pf_ev_layer_ = 0, pf_ev_rows_ = 0, pf_ev_exp_ = 0;
+    uint64_t pf_ev_bytes_ = 0;
+    void pf_flush();
 };
 
 void* Runner::dev(uint64_t bytes, const char* what) {
@@ -836,6 +893,7 @@ void Runner::bind_stage(uint32_t s) {
     ekv_ = g.ekv;
     blob_dcap_ = g.blob_dcap;
     blob_dev_ = g.blob_dev;
+    layer_container_ = g.container;
     stage_used_ = g.stage_used;
 }
 
@@ -894,6 +952,7 @@ void Runner::save_stage() {
     g.ekv = ekv_;
     g.blob_dcap = blob_dcap_;
     g.blob_dev = blob_dev_;
+    g.container = layer_container_;
     g.stage_used = stage_used_;
 }
 
@@ -1400,10 +1459,12 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
     if (b.cb_len != 0 && !parts_.read(b.abs + b.cb_off, p + table_end, b.cb_len, err)) return false;
 
     // ---- the expert cache (opt-in): a hit skips the parts read and is copied from its slot after the upload ----
+    // (&b == &blob_[layer_id] keeps the MTP drafter's own containers -- same expert count, smaller tables -- out
+    // of the main layers' slots and, with --expert-loan, out of the pool's header.)
     const bool caching = !opt_.expert_cache_mib.empty() && b.experts == NE_ && layer_id < nlayers_ &&
-                         stage_cur_ < exp_cache_dev_.size() && exp_cache_dev_[stage_cur_] != nullptr &&
-                         exp_cache_slots_[stage_cur_] != 0;
-    uint8_t* const cbase = caching ? exp_cache_dev_[stage_cur_] : nullptr;
+                         &b == &blob_[layer_id] && stage_cur_ < exp_cache_dev_.size() &&
+                         exp_cache_dev_[stage_cur_] != nullptr && exp_cache_slots_[stage_cur_] != 0;
+    uint8_t* cbase = caching ? exp_cache_dev_[stage_cur_] : nullptr;   // the pool base under --expert-loan
     auto& cmap = exp_cache_[stage_cur_];
     std::vector<uint64_t> pinned;   // slots this container points at: never evicted by its own misses
     struct Move { uint64_t dst = 0, src = 0, len = 0; bool to_cache = false; };
@@ -1431,37 +1492,79 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
         return slot;
     };
 
-    uint64_t cur = table_end + b.cb_len;
+    // --expert-loan: the pool is the container.  Its first bytes carry the header (magic, table, codebook), the
+    // cached slots follow at one stride each, and the spill after them answers a layer that selects more experts
+    // than there are slots.  A hit's table entry points into its slot and a miss is pulled straight into one, so
+    // no payload is copied a second time on the device and the chunk does not pay for the container beside the
+    // cache.  Off by default; the path below is the one this function always had.
+    bool lending = loan_ && caching;
+    uint8_t* pool = lending ? cbase : nullptr;
+    const uint64_t pool_hdr = lending ? loan_hdr_[stage_cur_] : 0;
+    if (lending && uniq_.size() > loan_span_[stage_cur_]) {
+        // The auto chunk's estimate was low (only possible when it reserved fewer strides than the layers
+        // select).  Nothing has been read for this layer yet, so grow once and forget the map's slot contents.
+        const uint64_t span = uniq_.size();
+        const uint64_t bytes = pool_hdr + span * exp_cache_stride_ + (opt_.moe_prefill ? 8u : 0u);
+        cudaFree(pool);
+        exp_cache_dev_[stage_cur_] = static_cast<uint8_t*>(dev(bytes, "expert pool (grown)"));
+        if (exp_cache_dev_[stage_cur_] == nullptr) { err = last_error; return false; }
+        pool = cbase = exp_cache_dev_[stage_cur_];
+        loan_span_[stage_cur_] = span;
+        cmap.clear();
+        std::fprintf(stderr, "[v41] expert loan: stage %u pool grown to %" PRIu64 " stride(s)\n", stage_cur_,
+                     span);
+    }
+    std::vector<Move> ups;   // loan, no RAM image: a miss read into the staging vector, queued for its slot
+
+    uint64_t cur = table_end + b.cb_len;   // host assembly offset; the loan's bytes go straight to the pool
     uint32_t holes = 0;
+    uint32_t spill = 0;
+    stage_read_ = 0;
     for (uint32_t e : uniq_) {
         const size_t i0 = static_cast<size_t>(e) * 3;
         const uint64_t len = b.span[i0] + b.span[i0 + 1] + b.span[i0 + 2];
-        uint64_t at = cur;
         for (uint32_t w = 0; w < 3; ++w) {
-            const uint64_t sl = b.span[i0 + w];
-            if (sl == 0) {
+            if (b.span[i0 + w] == 0) {
                 err = "expert " + std::to_string(e) + " slot " + std::to_string(w) + " is absent";
                 return false;
             }
-            wr64(p + 16 + (i0 + w) * 8, at);   // slot table entry i is at 16 + i*8
-            at += sl;
         }
         const uint64_t key = static_cast<uint64_t>(layer_id) * NE_ + e;
         auto it = caching ? cmap.find(key) : cmap.end();
         const bool hit = it != cmap.end() && it->second.len == len;
+        int64_t slot = -1;
+        uint64_t at = cur;
+        if (lending) {
+            if (hit) {
+                at = pool_hdr + static_cast<uint64_t>(it->second.slot) * exp_cache_stride_;
+            } else {
+                if (exp_cache_next_[stage_cur_] < exp_cache_slots_[stage_cur_])
+                    slot = static_cast<int64_t>(exp_cache_next_[stage_cur_]++);
+                else
+                    slot = evict_one();
+                at = slot >= 0 ? pool_hdr + static_cast<uint64_t>(slot) * exp_cache_stride_
+                               : pool_hdr + (exp_cache_slots_[stage_cur_] + spill++) * exp_cache_stride_;
+            }
+        }
+        uint64_t q = at;
+        for (uint32_t w = 0; w < 3; ++w) {
+            wr64(p + 16 + (i0 + w) * 8, q);   // slot table entry i is at 16 + i*8
+            q += b.span[i0 + w];
+        }
         if (hit) {
             pinned.push_back(key);
-            moves.push_back({cur, it->second.slot * exp_cache_stride_, len, false});
+            if (!lending) moves.push_back({cur, it->second.slot * exp_cache_stride_, len, false});
             it->second.stamp = ++cache_tick_;
             if (opt_.ledger) {
                 ++st_cache_hit_[stage_cur_];
                 st_cache_bytes_[stage_cur_] += len;
             }
         } else {
+            stage_read_ += len;
             uint64_t rd = cur;
             bool payload_ok = true;
             if (ram != nullptr) {
-                uint64_t dst = cur;
+                uint64_t dst = at;
                 for (uint32_t w = 0; w < 3; ++w) {
                     const size_t i = i0 + w;
                     const uint64_t src = b.abs + b.slot[i];
@@ -1491,15 +1594,18 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
                 }
             }
             if (opt_.ledger) ++st_cache_miss_[stage_cur_];
-            if (caching && payload_ok) {
-                int64_t slot = -1;
+            if (lending) {
+                if (payload_ok && slot >= 0) cmap[key] = CacheEnt{len, ++cache_tick_, static_cast<uint32_t>(slot)};
+                if (ram == nullptr) ups.push_back({at, cur, len, false});
+            } else if (caching && payload_ok) {
+                int64_t slot2 = -1;
                 if (exp_cache_next_[stage_cur_] < exp_cache_slots_[stage_cur_])
-                    slot = static_cast<int64_t>(exp_cache_next_[stage_cur_]++);
+                    slot2 = static_cast<int64_t>(exp_cache_next_[stage_cur_]++);
                 else
-                    slot = evict_one();
-                if (slot >= 0) {
-                    cmap[key] = CacheEnt{len, ++cache_tick_, static_cast<uint32_t>(slot)};
-                    moves.push_back({static_cast<uint64_t>(slot) * exp_cache_stride_, cur, len, true});
+                    slot2 = evict_one();
+                if (slot2 >= 0) {
+                    cmap[key] = CacheEnt{len, ++cache_tick_, static_cast<uint32_t>(slot2)};
+                    moves.push_back({static_cast<uint64_t>(slot2) * exp_cache_stride_, cur, len, true});
                 }
             }
         }
@@ -1508,21 +1614,41 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
     if (holes != 0)
         std::fprintf(stderr, "[v41] L%02u: %u of %u selected expert payloads are unreadable (a holey part); "
                              "the kernel skips them\n", layer_id, holes, static_cast<uint32_t>(uniq_.size()) * 3u);
-    if (cur > blob_dcap_) {
-        if (blob_dev_ != nullptr) cudaFree(blob_dev_);
-        blob_dev_ = dev(cur, "expert container");
-        if (blob_dev_ == nullptr) { err = last_error; return false; }
-        blob_dcap_ = cur;
+    // The batched prefill arm reads the stream eight bytes at a time from the last codeword on, which can reach
+    // past the payload's own end; the parser's 3-byte guarantee plus this pad keeps that read inside the buffer.
+    const uint64_t pad = opt_.moe_prefill ? 8u : 0u;
+    uint8_t* container = nullptr;
+    uint64_t upload = 0;
+    if (lending) {
+        container = pool;
+        upload = table_end + b.cb_len;
+        stage_used_ = pool_hdr + loan_span_[stage_cur_] * exp_cache_stride_ + pad;
+    } else {
+        const uint64_t alloc = cur + pad;
+        if (alloc > blob_dcap_) {
+            if (blob_dev_ != nullptr) cudaFree(blob_dev_);
+            blob_dev_ = dev(alloc, "expert container");
+            if (blob_dev_ == nullptr) { err = last_error; return false; }
+            blob_dcap_ = alloc;
+        }
+        // The header (and the shared codebook) always rides the staging vector; with the RAM image the experts'
+        // bytes are pulled straight from it below, so only [0, table_end + cb_len) is uploaded here.
+        container = static_cast<uint8_t*>(blob_dev_);
+        upload = ram != nullptr ? table_end + b.cb_len : cur;
+        stage_used_ = cur;
     }
-    // The header (and the shared codebook) always rides the staging vector; with the RAM image the experts'
-    // bytes are pulled straight from it below, so only [0, table_end + cb_len) is uploaded here.
-    const uint64_t upload = ram != nullptr ? table_end + b.cb_len : cur;
-    const cudaError_t ce = cudaMemcpyAsync(blob_dev_, p, upload, cudaMemcpyHostToDevice, stream_);
+    layer_container_ = container;   // the MoE arms read this, not blob_dev_: the loan put the layer in the pool
+    const cudaError_t ce = cudaMemcpyAsync(container, p, upload, cudaMemcpyHostToDevice, stream_);
     if (ce != cudaSuccess) { err = std::string("expert container upload: ") + cudaGetErrorString(ce); return false; }
     for (const Move& m : pulls) {
-        const cudaError_t pe = cudaMemcpyAsync(static_cast<uint8_t*>(blob_dev_) + m.dst, ram + m.src, m.len,
+        const cudaError_t pe = cudaMemcpyAsync(container + m.dst, ram + m.src, m.len,
                                                cudaMemcpyHostToDevice, stream_);
         if (pe != cudaSuccess) { err = std::string("expert container pull: ") + cudaGetErrorString(pe); return false; }
+    }
+    for (const Move& m : ups) {
+        const cudaError_t ue = cudaMemcpyAsync(container + m.dst, p + m.src, m.len,
+                                               cudaMemcpyHostToDevice, stream_);
+        if (ue != cudaSuccess) { err = std::string("expert container upload: ") + cudaGetErrorString(ue); return false; }
     }
     // The moves ride the container's stream after the upload, so a hit's bytes land before the MoE reads them and
     // a fresh slot copies the payload that was just uploaded.
@@ -1532,9 +1658,8 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
         const cudaError_t me = cudaMemcpyAsync(dst, src, m.len, cudaMemcpyDeviceToDevice, stream_);
         if (me != cudaSuccess) { err = std::string("expert cache move: ") + cudaGetErrorString(me); return false; }
     }
-    stage_used_ = cur;
     if (opt_.ledger) {
-        st_bytes_[stage_cur_] += cur;
+        st_bytes_[stage_cur_] += lending ? stage_read_ : stage_used_;
         st_experts_[stage_cur_] += uniq_.size();
     }
     return true;
@@ -1898,7 +2023,7 @@ bool Runner::tower_moe(uint32_t T, std::string& err) {
     if (ce != cudaSuccess) { err = std::string("tower selection readback: ") + cudaGetErrorString(ce); return false; }
     if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "tower selection readback sync failed"; return false; }
     if (!stage_blob_b(tblob_[T], T, sel_host_.data(), n * mtp_used_, err)) return false;
-    if (!k::deepseek4_routed_moe(t_y_, t_partial_, blob_dev_, stage_used_, E_, FF_, E_, t_sel_, t_rw_, mtp_used_,
+    if (!k::deepseek4_routed_moe(t_y_, t_partial_, layer_container_, stage_used_, E_, FF_, E_, t_sel_, t_rw_, mtp_used_,
                                  clamp_, t_xn_, n, tblob_[T].nc, tblob_[T].v3 ? 1u : 0u, nullptr, stream_)) {
         err = "tower deepseek4_routed_moe failed";
         return false;
@@ -2177,6 +2302,24 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
     exp_cache_dev_.assign(nstages_, nullptr);
     exp_cache_slots_.assign(nstages_, 0);
     exp_cache_next_.assign(nstages_, 0);
+    // --expert-loan: a stage's header (magic, expert table, shared codebook) is the pool's first bytes, and the
+    // slots follow it at one stride each.  The size is the largest header of the layers that stage owns.
+    loan_ = opt_.expert_loan;
+    loan_hdr_.assign(nstages_, 0);
+    loan_span_.assign(nstages_, 0);
+    if (loan_ && opt_.expert_cache_mib.empty()) {
+        err = "--expert-loan needs --expert-cache-mib (the pool it lends)";
+        return false;
+    }
+    for (uint32_t s = 0; loan_ && s < nstages_; ++s) {
+        uint64_t hdr = 0;
+        for (uint32_t il = stage_first_[s]; il < stage_first_[s + 1]; ++il) {
+            const Blob& b = blob_[il];
+            if (b.experts != NE_) continue;
+            hdr = std::max(hdr, 16 + static_cast<uint64_t>(b.experts) * 24 + b.cb_len);
+        }
+        loan_hdr_[s] = (hdr + 255) & ~uint64_t{255};
+    }
     for (uint32_t s = 0; s < 8; ++s) st_cache_hit_[s] = st_cache_miss_[s] = st_cache_bytes_[s] = 0;
 
     // Auto chunk (`--chunk 0`): the largest block that fits on every stage, picked here because the fit needs the
@@ -2241,6 +2384,13 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
             const uint64_t budget = static_cast<uint64_t>(static_cast<double>(free_b) * 0.9);
             auto fits = [&](uint64_t cap) {
                 const uint64_t uniq = std::min<uint64_t>(NE_, 24 + cap / 3);   // the container's experts
+                if (loan_ && cache_b != 0) {
+                    // The pool is the container: its slots and (when the layer selects more experts than it has
+                    // slots) its spill live in one buffer, so the reserve is max(slots, uniq) strides plus the
+                    // header -- where the old path paid the whole container and the cache beside it.
+                    const uint64_t slots = cache_b / exp_cache_stride_;
+                    return cap * row + std::max(uniq, slots) * exp_cache_stride_ + loan_hdr_[s] + fixed <= budget;
+                }
                 return cap * row + uniq * exp_cache_stride_ + fixed + cache_b <= budget;
             };
             if (!fits(floor_cap)) {
@@ -2365,13 +2515,67 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
                                     : std::min<size_t>(s, opt_.expert_cache_mib.size() - 1);
             const uint32_t mib = opt_.expert_cache_mib[pick];
             const uint64_t slots = (static_cast<uint64_t>(mib) << 20) / exp_cache_stride_;
-            if (slots != 0) {
+            if (slots != 0 && loan_) {
+                // The pool is the container: the header, the cached slots, then the spill that answers a layer
+                // whose selected experts exceed the slots.  The auto chunk reserved max(slots, uniq) strides.
+                const uint64_t uniq_est = std::min<uint64_t>(NE_, 24 + cap_ / 3);
+                const uint64_t span = std::max(slots, uniq_est);
+                const uint64_t pool = loan_hdr_[s] + span * exp_cache_stride_ + (opt_.moe_prefill ? 8u : 0u);
+                exp_cache_dev_[s] = static_cast<uint8_t*>(dev(pool, "expert pool"));
+                if (exp_cache_dev_[s] == nullptr) { err = last_error; return false; }
+                exp_cache_slots_[s] = slots;
+                loan_span_[s] = span;
+                std::fprintf(stderr,
+                             "[v41] expert loan: stage %u %u MiB = %" PRIu64 " slot(s) of %" PRIu64 " B + %" PRIu64
+                             " B header, %.0f MiB pool (container and cache in one)\n",
+                             s, mib, slots, exp_cache_stride_, loan_hdr_[s],
+                             static_cast<double>(pool) / (1024.0 * 1024.0));
+            } else if (slots != 0) {
                 exp_cache_dev_[s] = static_cast<uint8_t*>(dev(slots * exp_cache_stride_, "expert cache"));
                 if (exp_cache_dev_[s] == nullptr) { err = last_error; return false; }
                 exp_cache_slots_[s] = slots;
                 std::fprintf(stderr, "[v41] expert cache: stage %u %u MiB = %" PRIu64 " slot(s) of %" PRIu64 " B\n",
                              s, mib, slots, exp_cache_stride_);
+            } else if (loan_) {
+                std::fprintf(stderr, "[v41] expert loan: stage %u has no slot at %u MiB; the container stays\n", s,
+                             mib);
             }
+        }
+        // The batched MoE prefill's scratch (opt-in): one sorted activation row per (token, pick) pair of a full
+        // block, the gate and mid rows at the model's FF, the plan, and the layer's bf16 codebook.  It rides the
+        // 10% the auto chunk leaves free rather than the row budget, so turning it on does not shrink the block.
+        if (opt_.moe_prefill) {
+            uint32_t nc_max = 0;
+            for (uint32_t il = stage_first_[s]; il < stage_first_[s + 1]; ++il)
+                nc_max = std::max(nc_max, blob_[il].nc);
+            k::Deepseek4MoePrefillSizes sz;
+            if (nc_max == 0 || !k::deepseek4_moe_prefill_sizes(cap_ * KU_, NE_, E_, FF_, nc_max, &sz)) {
+                err = "moe prefill: no arm for this stage's codebook width";
+                return false;
+            }
+            k::Deepseek4MoePrefillScratch& pf = st_[s].pf;
+            pf = k::Deepseek4MoePrefillScratch{};
+            pf.xs = static_cast<uint16_t*>(dev(sz.xs, "moe prefill xs"));
+            pf.g16 = static_cast<uint16_t*>(dev(sz.g16, "moe prefill gate"));
+            pf.h16 = static_cast<uint16_t*>(dev(sz.h16, "moe prefill mid"));
+            pf.cb16 = static_cast<uint16_t*>(dev(sz.cb16, "moe prefill codebook"));
+            pf.perm = static_cast<int32_t*>(dev(sz.perm, "moe prefill perm"));
+            pf.inv = static_cast<int32_t*>(dev(sz.inv, "moe prefill inv"));
+            pf.off = static_cast<uint32_t*>(dev(sz.off, "moe prefill off"));
+            pf.items = static_cast<k::Deepseek4MoePrefillItem*>(dev(sz.items, "moe prefill items"));
+            pf.pairs_cap = cap_ * KU_;
+            pf.experts_cap = NE_;
+            pf.mid_cap = FF_;
+            pf.cb_cap = nc_max * 8u;
+            if (pf.xs == nullptr || pf.g16 == nullptr || pf.h16 == nullptr || pf.cb16 == nullptr ||
+                pf.perm == nullptr || pf.inv == nullptr || pf.off == nullptr || pf.items == nullptr) {
+                err = last_error;
+                return false;
+            }
+            std::fprintf(stderr, "[v41] moe prefill: stage %u scratch %.1f MiB (%u pair(s), %u-bit codebook)\n", s,
+                         static_cast<double>(sz.xs + sz.g16 + sz.h16 + sz.cb16 + sz.perm + sz.inv + sz.off +
+                                             sz.items) / (1024.0 * 1024.0), pf.pairs_cap,
+                         nc_max == 8192u ? 13u : 12u);
         }
         save_stage();
     }
@@ -2508,7 +2712,38 @@ bool Runner::engram_layer(uint32_t il, std::string& err) {
 // Two slots of one layer can read at once (the first block's prepare and its prefetch): EngramShard's Unix
 // path is pread-only, so that is safe; its Windows FILE* path would need a lock and the feed stays off there.
 
-Runner::~Runner() { engram_feed_close(); }
+Runner::~Runner() { engram_feed_close(); }   // cudaEvent_t handles die with their contexts at process exit
+
+// --pf-time: print the pending layer's staging/kernel split.  Only called with that stage's stream synced and
+// its device still current.
+void Runner::pf_flush() {
+    if (!opt_.pf_time || !pf_ev_pending_) return;
+    float front_ms = 0.0f, stage_ms = 0.0f, moe_ms = 0.0f, tail_ms = 0.0f, all_ms = 0.0f;
+    float attn_ms = 0.0f, attn_in_ms = 0.0f, sparse_ms = 0.0f, attn_out_ms = 0.0f;
+    cudaEvent_t* e = pf_ev_[pf_ev_stage_][pf_pend_slot_];
+    cudaEventElapsedTime(&front_ms, e[0], e[1]);
+    cudaEventElapsedTime(&stage_ms, e[1], e[2]);
+    cudaEventElapsedTime(&moe_ms, e[2], e[3]);
+    cudaEventElapsedTime(&attn_ms, e[5], e[6]);
+    cudaEventElapsedTime(&attn_in_ms, e[5], e[7]);
+    cudaEventElapsedTime(&sparse_ms, e[7], e[8]);
+    cudaEventElapsedTime(&attn_out_ms, e[8], e[6]);
+    if (pf_ev4_valid_) {
+        cudaEventElapsedTime(&tail_ms, e[3], e[4]);
+        cudaEventElapsedTime(&all_ms, e[0], e[4]);
+    } else {
+        cudaEventElapsedTime(&all_ms, e[0], e[3]);   // no end marker: a block-boundary record, tail uncounted
+    }
+    std::fprintf(stderr,
+                 "[v41] pf time L%02u: %u row(s), %u expert(s), %" PRIu64 " B staged: front %.1f ms "
+                 "(attn %.1f = in %.1f + sparse %.1f + out %.1f), staging %.1f ms, moe %.1f ms, tail %.1f ms, "
+                 "layer %.1f ms\n",
+                 pf_ev_layer_, pf_ev_rows_, pf_ev_exp_, pf_ev_bytes_, static_cast<double>(front_ms),
+                 static_cast<double>(attn_ms), static_cast<double>(attn_in_ms), static_cast<double>(sparse_ms),
+                 static_cast<double>(attn_out_ms), static_cast<double>(stage_ms), static_cast<double>(moe_ms),
+                 static_cast<double>(tail_ms), static_cast<double>(all_ms));
+    pf_ev_pending_ = false;
+}
 
 void Runner::engram_feed_close() {
     for (auto& jobs : efeed_)
@@ -2562,12 +2797,32 @@ bool Runner::engram_feed_start(uint32_t ei, int slot, uint32_t pos0, const int32
             }
         }
         const d4::EngramTable& t = geo.engram_tables[ei];
-        std::string e;
-        if (!shard_[ei]->rows(t.weight_offset, t.scale_offset, efeed_ids_[ei][static_cast<size_t>(slot)].data(),
-                              rows, eng_hd_, efeed_raw_[ei][static_cast<size_t>(slot)].data(), e)) {
-            jj.ok = false;
-            jj.err = e;
+        const int64_t* ids = efeed_ids_[ei][static_cast<size_t>(slot)].data();
+        uint8_t* raw = efeed_raw_[ei][static_cast<size_t>(slot)].data();
+        // A block is one pread a column: 24 columns x 2 planes for every token, each a small O_DIRECT read, so
+        // gathering it on one thread spends the whole first block in seek latency (~19 s of the first engram
+        // layer's front for a 2845-token prompt).  Split the id list over kEngramFanOut threads; pread on the
+        // shared descriptor is thread-safe (the Windows FILE* path is not, and the feed stays off there).
+        constexpr size_t kEngramFanOut = 64;
+        const size_t nfan = rows >= kEngramFanOut * 256 ? kEngramFanOut : 1;
+        const uint32_t stride = d4::EngramShard::row_stride(eng_hd_);
+        std::atomic<bool> all_ok{true};
+        std::string errs[kEngramFanOut];
+        std::vector<std::thread> fan;
+        for (size_t w = 0; w < nfan; ++w) {
+            const size_t lo = rows * w / nfan, hi = rows * (w + 1) / nfan;
+            fan.emplace_back([&, lo, hi, w]() {
+                std::string e;
+                if (!shard_[ei]->rows(t.weight_offset, t.scale_offset, ids + lo, hi - lo, eng_hd_,
+                                      raw + lo * stride, e)) {
+                    errs[w] = e;
+                    all_ok.store(false, std::memory_order_relaxed);
+                }
+            });
         }
+        for (std::thread& w : fan) w.join();
+        if (!all_ok.load()) jj.err = errs[0].empty() ? std::string("engram feed: the read failed") : errs[0];
+        jj.ok = all_ok.load();
     });
     j.running = true;
     return true;
@@ -2883,12 +3138,14 @@ bool Runner::attn(uint32_t il, std::string& err) {
     }
     const bool compressed = ng != 0 && topk != 0;
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(HD_)));
+    if (opt_.pf_time) cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][7], stream_);
     if (!k::deepseek4_sparse_attn(o_, q_, win_[il], compressed ? comp_kv_[kv_src_[il]] : nullptr,
                                   compressed ? idx_ : nullptr, static_cast<const float*>(l.sinks), n, cur_pos0_,
                                   SWA_, ng, topk, H_, HD_, scale, 0, true, 0, stream_)) {
         err = "deepseek4_sparse_attn failed";
         return false;
     }
+    if (opt_.pf_time) cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][8], stream_);
     if (!k::deepseek4_win_commit(win_[il], cur_pos0_, n, SWA_, HD_, nullptr, stream_)) {
         err = "deepseek4_win_commit failed";
         return false;
@@ -2929,12 +3186,74 @@ bool Runner::moe(uint32_t il, std::string& err) {
     cudaError_t ce = cudaMemcpyAsync(sel_host_.data(), sel_, uint64_t(n) * KU_ * 4, cudaMemcpyDeviceToHost, stream_);
     if (ce != cudaSuccess) { err = std::string("selection readback: ") + cudaGetErrorString(ce); return false; }
     if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "selection readback sync failed"; return false; }
+    // --pf-time: the previous layer's events are complete now (this sync drained the stream).  Read them before
+    // this layer's staging overwrites the events.
+    if (opt_.pf_time) {
+        pf_flush();
+        cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][1], stream_);
+    }
     if (!stage_blob(il, sel_host_.data(), n * KU_, err)) return false;
+    if (opt_.pf_time) cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][2], stream_);
     const bool tail = n <= kGemvMaxTok;
-    if (!k::deepseek4_routed_moe(tail ? nullptr : y_, partial_, blob_dev_, stage_used_, E_, FF_, E_, sel_, rw_, KU_,
+    bool used_prefill = false;
+    if (!tail && opt_.moe_prefill) {
+        used_prefill = k::deepseek4_routed_moe_prefill(
+            y_, partial_, layer_container_, stage_used_, E_, FF_, E_, sel_host_.data(), rw_, KU_, clamp_, xn_, n, NE_,
+            blob_[il].nc, blob_[il].v3 ? 1u : 0u, &st_[stage_cur_].pf, stream_);
+        if (!used_prefill && !pf_note_) {
+            pf_note_ = true;
+            std::fprintf(stderr, "[v41] moe prefill: declined at L%02u (%u tokens); the per-pair arm answers\n", il,
+                         n);
+        }
+    }
+    if (!used_prefill &&
+        !k::deepseek4_routed_moe(tail ? nullptr : y_, partial_, layer_container_, stage_used_, E_, FF_, E_, sel_, rw_, KU_,
                                  clamp_, xn_, n, blob_[il].nc, blob_[il].v3 ? 1u : 0u, nullptr, stream_)) {
         err = "deepseek4_routed_moe failed";
         return false;
+    }
+    if (opt_.pf_time) {
+        cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][3], stream_);
+        pf_pend_slot_ = pf_slot_;
+        pf_ev_stage_ = stage_cur_;
+        pf_ev_layer_ = il;
+        pf_ev_rows_ = n;
+        pf_ev_exp_ = static_cast<uint32_t>(uniq_.size());
+        pf_ev_bytes_ = stage_read_;   // bytes this layer pulled, not the container's size (a hit pulls none)
+        pf_ev_pending_ = true;
+    }
+    if (used_prefill && opt_.moe_prefill_check && pf_checked_ < 3) {
+        // --moe-prefill-check: the per-pair arm on this block's first kGemvMaxTok tokens, into attn_out_ (free
+        // until the next layer's attention).  That entry synchronizes, so both outputs are complete on return.
+        if (!k::deepseek4_routed_moe(attn_out_, partial_, layer_container_, stage_used_, E_, FF_, E_, sel_, rw_, KU_,
+                                     clamp_, xn_, kGemvMaxTok, blob_[il].nc, blob_[il].v3 ? 1u : 0u, nullptr,
+                                     stream_)) {
+            err = "moe prefill check: the per-pair reference failed";
+            return false;
+        }
+        const size_t cnt = static_cast<size_t>(kGemvMaxTok) * E_;
+        std::vector<float> a(cnt), b(cnt);
+        if (cudaMemcpy(a.data(), y_, cnt * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(b.data(), attn_out_, cnt * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = "moe prefill check: readback failed";
+            return false;
+        }
+        float amax = 0.0f, dmax = 0.0f;
+        size_t exact = 0;
+        for (size_t i = 0; i < cnt; ++i) {
+            amax = std::max(amax, std::fabs(b[i]));
+            const float d = std::fabs(a[i] - b[i]);
+            dmax = std::max(dmax, d);
+            if (d == 0.0f) ++exact;
+        }
+        ++pf_checked_;
+        std::fprintf(stderr,
+                     "[v41] moe prefill check L%02u: ref max %.4g, max|d| %.4g, rel %.2g, exact %.1f%% (%u "
+                     "tokens)%s\n",
+                     il, static_cast<double>(amax), static_cast<double>(dmax),
+                     static_cast<double>(amax > 0.0f ? dmax / amax : dmax),
+                     100.0 * static_cast<double>(exact) / static_cast<double>(cnt), kGemvMaxTok,
+                     dmax > amax * 0.05f ? "  <- mismatch" : "");
     }
     if (tail) {
         if (!k::deepseek4_moe_tail(y_, partial_, rw_, so_, n, KU_, E_, stream_)) {
@@ -2952,6 +3271,24 @@ bool Runner::moe(uint32_t il, std::string& err) {
 }
 
 bool Runner::layer(uint32_t il, std::string& err) {
+    if (opt_.pf_time) {
+        if (!pf_ev_made_[stage_cur_]) {
+            for (auto& set : pf_ev_[stage_cur_])
+                for (cudaEvent_t& e : set) cudaEventCreateWithFlags(&e, cudaEventDefault);
+            pf_ev_made_[stage_cur_] = true;
+        }
+        if (pf_ev_pending_) {
+            // The end marker rides the pending record's own stage's stream.  The first layer after a stage
+            // hand-off belongs to another device, so its marker cannot be recorded there; the previous stage's
+            // stream was synced on the way out, so the record is already complete and pf_flush drops the tail
+            // term.  (The mid-block hand-off below records and flushes before bind_stage, so only the
+            // block-boundary layer reaches here with a foreign pending record.)
+            pf_ev4_valid_ = pf_ev_stage_ == stage_cur_;
+            if (pf_ev4_valid_) cudaEventRecord(pf_ev_[pf_ev_stage_][pf_pend_slot_][4], stream_);   // previous end
+        }
+        pf_slot_ ^= 1u;
+        cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][0], stream_);
+    }
     if (engram_of_[il] >= 0 && engram_on_ && !engram_layer(il, err)) return false;
     // DSpark: capture the target layers' attention input (the hc four-route mean, after the engram and before the
     // layer) into the main-hidden ring.  A wrong capture point does not error; acceptance collapses to about 1.
@@ -2967,7 +3304,9 @@ bool Runner::layer(uint32_t il, std::string& err) {
     }
     if (opt_.trace) probe(("L" + std::to_string(il) + " hc_in").c_str(), hc_, uint64_t(cur_n_) * HC_ * E_);
     if (!hc_half(il, true, err)) return false;
+    if (opt_.pf_time) cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][5], stream_);
     if (!attn(il, err)) return false;
+    if (opt_.pf_time) cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][6], stream_);
     if (!k::deepseek4_hc_post(attn_out_, hc_, post_, comb_, hc2_, E_, HC_, cur_n_, stream_)) {
         err = "hc_post (attn) failed";
         return false;
@@ -3100,6 +3439,8 @@ bool Runner::block(const int32_t* ids, uint32_t n, bool head, bool head_all, std
             // host: a sync, two reads and two writes.  Stages run in order for now; a later change can overlap
             // stage s + 1's entry with stage s's tail.
             if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "stage hand-off sync failed"; return false; }
+            if (opt_.pf_time && pf_ev_pending_) cudaEventRecord(pf_ev_[pf_ev_stage_][pf_pend_slot_][4], stream_);
+            pf_flush();   // --pf-time: the stage's last layer, before bind_stage leaves this device's context
             const uint64_t hc_bytes = uint64_t(n) * HC_ * E_ * 4;
             const uint64_t prem_bytes = uint64_t(n) * HC_ * 4;
             cudaError_t he = cudaMemcpy(handoff_hc_.data(), hc_, hc_bytes, cudaMemcpyDeviceToHost);
@@ -3549,6 +3890,13 @@ int main(int argc, char** argv) {
         else if (a == "--no-engram") o.engram = false;
         else if (a == "--engram-feed") o.engram_feed = true;
         else if (a == "--ram-image") o.ram_image = true;
+        else if (a == "--moe-prefill") o.moe_prefill = true;
+        else if (a == "--moe-prefill-check") o.moe_prefill_check = true;
+        else if (a == "--pf-time") o.pf_time = true;
+        else if (a == "--dense-batch") o.dense_batch = true;
+        else if (a == "--tc-gemm") { o.tc_gemm = true; o.dense_batch = true; }
+        else if (a == "--attn-mma") o.attn_mma = true;
+        else if (a == "--expert-loan") o.expert_loan = true;
         else if (a == "--serve") o.serve = true;
         else if (a == "--serve-ctx") o.serve_ctx = static_cast<uint32_t>(std::strtoul(next("--serve-ctx"), nullptr, 10));
         else if (a == "--no-check") o.check = false;
@@ -3561,6 +3909,7 @@ int main(int argc, char** argv) {
                          "               [--temperature T] [--top-p P] [--min-p M] [--top-k K] [--seed S]\n"
                          "               [--stop-eos] [--stream-ids] [--ledger] [--engram-feed]\n"
                          "               [--expert-cache-mib N[,N...]] [--ram-image]\n"
+                         "               [--moe-prefill [--moe-prefill-check]]\n"
                          "               [--serve --serve-ctx N]\n"
                          "  --devices        split the layers over these gpus, one stage each, layers in order;\n"
                          "                   the split only cuts at a compressed-cache seam and must return the\n"
@@ -3574,9 +3923,27 @@ int main(int argc, char** argv) {
                          "                   keep staged expert payloads in N MiB of device slots per stage (a comma\n"
                          "                   list gives one budget per stage); a hit copies from its slot instead of\n"
                          "                   reading the parts again.  Off by default.\n"
+                         "  --expert-loan    with --expert-cache-mib: the pool is the layer's container (a hit's\n"
+                         "                   table entry points into its slot, a miss lands straight in one), so the\n"
+                         "                   chunk reserves the pool once instead of the container plus the cache\n"
                          "  --ram-image      read the whole image into host RAM once at start (pinned when the\n"
                          "                   driver allows it, so the copy is a direct DMA) and stage expert misses\n"
                          "                   from there instead of the disk.  Off by default.\n"
+                         "  --dense-batch    run prompt-width dense matmuls (q4_K, grouped wo_a, bf16) through the\n"
+                         "                   token-tiled kernels instead of one block per (row, token)\n"
+                         "  --tc-gemm        the batched matmuls run the bf16 tensor-core tiles (ldmatrix + m16n8k16,\n"
+                         "                   128 rows x 128 tokens a block); implies --dense-batch\n"
+                         "  --attn-mma       the prompt's sparse attention runs the tensor-core route (16 heads x 16\n"
+                         "                   keys a block, bf16 mma) instead of the SIMT kernel.  Not bit-equal;\n"
+                         "                   prompt batches shorter than 64 tokens keep the SIMT kernel.\n"
+                         "  --moe-prefill    run the routed experts' block through the batched bf16 tensor-core arm\n"
+                         "                   (sort by expert, 128-row x 128-token tiles) instead of one warp per\n"
+                         "                   (token, expert) pair; its k16 accumulation order is the only difference\n"
+                         "                   from the per-pair arm.  Off by default; blocks of 8 tokens or fewer\n"
+                         "                   keep the per-pair arm.\n"
+                         "  --moe-prefill-check\n"
+                         "                   with --moe-prefill: also run the per-pair arm on the first 8 tokens of\n"
+                         "                   the first three layers and print ref max, max|d|, relative and exact%%\n"
                          "  --dspark         the MTP towers draft, the main forward verifies, the cache rolls back;\n"
                          "                   the greedy output must be byte-identical to the same run without it\n"
                          "  --dspark-verify  pin the verified rows per round (1..block, default: the whole block)\n"
@@ -3589,6 +3956,8 @@ int main(int argc, char** argv) {
                          "  --engram-feed    read the next block's engram rows while the current block computes\n"
                          "                   (the reference's prepare/wait/prefetch_next); off by default, and\n"
                          "                   the ids must not move\n"
+                         "  --engram-kick    with --engram-feed: the first block's rows start during the image load\n"
+                         "                   instead of at its prepare, so layer 1 no longer waits for a cold read\n"
                          "  --serve          resident: load the weights once, size the state for --serve-ctx, print\n"
                          "                   ready, then answer one request per stdin line: ids=1,2,3 gen=16\n"
                          "                   temperature=1 top_p=1 min_p=0.05 top_k=0 seed=1 stop_eos=1.  Each\n"
@@ -3601,6 +3970,10 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (o.moe_prefill_check) o.moe_prefill = true;   // the check compares the arm, so it implies it
+    if (o.dense_batch) k::deepseek4_dense_set_batched(true);
+    if (o.tc_gemm) k::deepseek4_dense_set_tc(true);
+    if (o.attn_mma) k::deepseek4_sparse_attn_set_mma(true);
     if (!o.ids_file.empty()) {
         std::FILE* f = std::fopen(o.ids_file.c_str(), "rb");
         if (f == nullptr) {

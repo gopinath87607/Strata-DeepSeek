@@ -367,6 +367,18 @@ class Engine:
             cmd.append("--engram-feed")
         if self.args.ram_image:
             cmd.append("--ram-image")
+        if self.args.moe_prefill:
+            cmd.append("--moe-prefill")
+        if self.args.pf_time:
+            cmd.append("--pf-time")
+        if self.args.dense_batch:
+            cmd.append("--dense-batch")
+        if self.args.tc_gemm:
+            cmd.append("--tc-gemm")
+        if self.args.expert_loan:
+            cmd.append("--expert-loan")
+        if self.args.attn_mma:
+            cmd.append("--attn-mma")
         return cmd
 
     def _kill(self):
@@ -645,6 +657,18 @@ class Engine:
                 cmd.append("--engram-feed")
             if self.args.ram_image:
                 cmd.append("--ram-image")
+            if self.args.moe_prefill:
+                cmd.append("--moe-prefill")
+            if self.args.pf_time:
+                cmd.append("--pf-time")
+            if self.args.dense_batch:
+                cmd.append("--dense-batch")
+            if self.args.tc_gemm:
+                cmd.append("--tc-gemm")
+            if self.args.expert_loan:
+                cmd.append("--expert-loan")
+            if self.args.attn_mma:
+                cmd.append("--attn-mma")
             deadline = time.monotonic() + self.args.timeout
             proc = None
             try:
@@ -1210,6 +1234,21 @@ def main(argv):
     ap.add_argument("--no-engram", action="store_true")
     ap.add_argument("--engram-feed", action="store_true",
                     help="P7 engram feed: read the next block's engram rows while the current block computes")
+    ap.add_argument("--moe-prefill", action="store_true",
+                    help="hand a request's expert blocks to the driver's batched bf16 tensor-core arm")
+    ap.add_argument("--pf-time", action="store_true",
+                    help="diagnostic: ask the driver for a per-layer staging/MoE time line")
+    ap.add_argument("--dense-batch", action="store_true",
+                    help="prompt-width dense matmuls use the driver's token-tiled q4_K/bf16 kernels")
+    ap.add_argument("--tc-gemm", action="store_true",
+                    help="with --dense-batch: run the tiles as bf16 tensor-core MMA (128x128 blocks); outputs "
+                         "stay on the bf16 grid but differ from the SIMT tiles by small f32 rounding")
+    ap.add_argument("--expert-loan", action="store_true",
+                    help="with --expert-cache-mib: the pool is the layer's expert container (no second copy, "
+                         "and the chunk reserves the pool once instead of the container plus the cache)")
+    ap.add_argument("--attn-mma", action="store_true",
+                    help="the prompt's sparse attention runs the bf16 tensor-core route (16 heads x 16 keys a "
+                         "block); not bit-equal to the SIMT kernel, prompt batches under 64 tokens keep SIMT")
     ap.add_argument("--ram-image", action="store_true",
                     help="load the whole image into host RAM once at start; expert misses are staged from there")
     ap.add_argument("--no-resident", action="store_true",
