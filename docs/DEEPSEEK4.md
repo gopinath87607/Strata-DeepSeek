@@ -20,7 +20,11 @@ pieces have landed and are gated too — hyper-connections, the dense
 primitives, RoPE, the quantized-KV group, sparse attention, the window ring,
 the sparse indexer, and now the router and the routed VQ MoE with the
 reference engine's own MoE fixture bit-exact on its one-hot cases; the trunk
-forward driver itself is still open. This file is the
+forward driver is written and builds (`tools/dsv4/dsv4_run.cu`: the reference's
+layer order end to end over the 40-part image, the engram feed, one GPU, greedy
+decode, the selected experts streamed per layer). It has not been run on
+weights yet, and 25 of the 40 parts still hold holes (§3), so P3's
+temperature-0 gate remains open. This file is the
 state carrier for the port.
 
 Goal: serve the published DeepSeek-V4.1-Flash-1017 VQ artifact on one normal
@@ -364,6 +368,8 @@ tests/core/deepseek4_attn_kv_cuda_test.cpp the quantized-KV gate: pool, three qu
 tests/core/deepseek4_sparse_attn_cuda_test.cpp the sparse attention gate: exact fixtures, ring and draft-block geometry, host-vs-device
 tests/core/deepseek4_win_commit_cuda_test.cpp the window ring gate: commit and snapshot vs oracle, whole buffer bitwise
 tests/core/deepseek4_indexer_cuda_test.cpp the sparse indexer gate: exact score fixtures, the candidate list's four selection paths, topk ties/tail/compact/pos
+tools/dsv4/dsv4_run.cu                   the P3 forward driver: 40-part reader, blob staging, the reference's layer order, greedy decode
+tools/dsv4/dsv4_prompt.py                text in front of it: the DSML head, the artifact tokenizer, the ids file, decoding back
 
 include/strata/artifact/deepseek4_engram.hpp       P4 host half: hash, O_DIRECT row reader, gate emulation
 include/strata/artifact/deepseek4_engram_bits.hpp  the fp8/bf16 conversions, host and device, shared by both
@@ -416,6 +422,9 @@ cmake --build /tmp/dsv4-build --target deepseek4_indexer_cuda_test
 /tmp/dsv4-build/deepseek4_indexer_cuda_test
 cmake --build /tmp/dsv4-build --target deepseek4_moe_cuda_test
 /tmp/dsv4-build/deepseek4_moe_cuda_test reference
+cmake --build /tmp/dsv4-build --target dsv4_run
+python3 tools/dsv4/dsv4_prompt.py --prompt "Hello" --gen 32 --binary /tmp/dsv4-build/dsv4_run
+/tmp/dsv4-build/dsv4_run --ids 1,2,3 --gen 8 --chunk 8 --trace
 ```
 
 Expected: `89 checks, 0 failures`, two fixture lines with 0 mismatches, three
@@ -465,6 +474,16 @@ and whose tail and 2-token lines report `0 differ`); all exit 77 without a CUDA
 device. Without `reference/ds4-dfm-rs/tests/fixtures/ds41/vq/` the MoE test
 prints one SKIP line for the fixture and still runs the router, guard and tail
 sections.
+
+The forward driver is not a test and is not in ctest: it wants the 113.6 GB
+image and both engram shards. It prints the image (`113556639424 bytes in 40
+part(s)`), the geometry and wiring line, `weights resident`, `state: chunk 8,
+groups cap ...`, a prefill line with its rate, `generated=...` on stdout, and
+the decode rate. `--trace` adds `[trace]` max and non-finite counts per layer
+half; `--chunk` is the block cap (the prefill chunk rule from the reference),
+`--gen` is greedy decode one token at a time, and `--logits-out` writes the
+last prefill chunk's logits as f32. A payload slot that sits in a hole reads as
+zeros and the driver names the part that holds it.
 
 ### The tokenizer, measured
 

@@ -426,6 +426,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  # DeepSeek-V4.1-Flash forward driver (docs/DEEPSEEK4.md, P3's runnable arm): one GPU, greedy decode, the 40-part
+  # GGUF through a parts-aware reader. Not a test: it wants the model and the two engram shards, so it is built
+  # whenever the CUDA backend is on and is not registered with ctest.
+  if(STRATA_ENABLE_CUDA)
+    add_executable(dsv4_run tools/dsv4/dsv4_run.cu)
+    target_include_directories(dsv4_run PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(dsv4_run PRIVATE strata_kernels CUDA::cudart)
+  endif()
   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,
   # also available where the published source omits tests/.
   option(STRATA_PARITY_GFX1100_QSA_SCORES "Build the exact gfx1100 QSA score/ID check" OFF)
