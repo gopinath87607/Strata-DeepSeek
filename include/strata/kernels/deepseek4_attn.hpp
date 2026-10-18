@@ -1,6 +1,6 @@
 // include/strata/kernels/deepseek4_attn.hpp - P3: attention primitives.
 //
-// The first one is RoPE, which every attention path runs: the q path and the window kv at the layer's base,
+// The first group is RoPE, which every attention path runs: the q path and the window kv at the layer's base,
 // the compressor's pooled key and the indexer's key at the compressor base, and the attention output through
 // the inverse rotation.  This is the reference engine's cuda/ds41_attn.cuh:52-94, which in turn is the official
 // precompute_freqs_cis + apply_rotary_emb:
@@ -56,5 +56,209 @@ void deepseek4_rope_host(float* x, const int32_t* pos, uint32_t n_tok, uint32_t 
 bool deepseek4_rope(float* d_x, const int32_t* d_pos, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
                     uint32_t n_rot, float theta, uint32_t original_seq_len, float factor, float beta_fast,
                     float beta_slow, bool inverse, void* stream);
+
+// ---- the quantized-KV primitives ----
+//
+// The window key, the indexer query and key and both packed caches share one block quant, written once in the
+// reference (cuda/ds41_attn.cuh:171-267) because "the packed value equals the f32 it replaces" depends on the
+// encode steps being identical, not merely close.  One warp owns one block: a magnitude max over the block,
+// one scale, each value rounded and written back as bf16r(q * s).  The mode picks the value range and scale:
+//
+//   0  fp8 E4M3 (|v| <= 448), scale 2^ceil(log2(amax / 448))   the window kv, block 32
+//   1  fp4 E2M1 (|v| <= 6),   scale 2^ceil(log2(amax / 6))     the index query and key, block 32
+//   2  fp4 E2M1,              scale E4M3(amax / 6)             the compressed KV, block 16
+//
+// A packed cache keeps the quantized pair at its native width:
+//
+//   compressed KV (ckv)  512 dims = 256 B nibbles + 32 B E4M3 scales = 288 B per group
+//   index key     (idxk) 128 dims =  64 B nibbles +  4 B E8M0 scales = 68 B, padded to 72
+//
+// Element e is the low half of byte e/2 when e is even and the high half when odd, and shares scale byte
+// e / block.  Reading one back computes bf16r(nibble * scale), the expression the in-place quant evaluates,
+// so the packed element is exactly the f32 value it replaced.  The index key's four pad bytes are never read
+// (the pad only keeps a warp's 64 B read on one 32 B sector); this port zeroes them so a cache's bytes are
+// deterministic.  The E4M3/E8M0 decoders are the engram header's (deepseek4_engram_bits.hpp), which the
+// reference's ds4_e4m3fn_to_f32 / ds4_e8m0_to_f32 match value for value.
+
+inline constexpr uint32_t kDeepseek4CkvBlock = 16;         // values per compressed-KV quant block
+inline constexpr uint32_t kDeepseek4CkvDim = 512;          // values per compressed-KV group
+inline constexpr uint32_t kDeepseek4CkvNibbleBytes = 256;  // 512 nibbles
+inline constexpr uint32_t kDeepseek4CkvBytes = 288;        // + 32 E4M3 scale bytes
+
+inline constexpr uint32_t kDeepseek4IdxkBlock = 32;        // values per index-key quant block
+inline constexpr uint32_t kDeepseek4IdxkDim = 128;         // values per index-key group
+inline constexpr uint32_t kDeepseek4IdxkNibbleBytes = 64;  // 128 nibbles
+inline constexpr uint32_t kDeepseek4IdxkBytes = 72;        // 64 + 4 E8M0 scale bytes + 4 pad
+
+inline constexpr int kDeepseek4QuantFp8E8m0 = 0;  // window kv
+inline constexpr int kDeepseek4QuantFp4E8m0 = 1;  // index query and index key
+inline constexpr int kDeepseek4QuantFp4E4m3 = 2;  // compressed KV
+
+/// 2^ceil(log2 v), the reference's fast_round_scale (cuda/ds41_attn.cuh:34-37; cuda_v41_1.inc.cu:130-133).
+STRATA_DSV4_HD inline float deepseek4_pow2_ceil_log2(float v) {
+    int e;
+    const float m = frexpf(v, &e);  // v = m * 2^e with m in [0.5, 1)
+    return ldexpf(1.0f, (m == 0.5f) ? e - 1 : e);
+}
+
+/// E4M3FN code `i`'s value (cuda/ds41_fp8blk.cuh:85-94): exp 0 is subnormal man * 2^-9, else (1 + man/8) 2^(exp-7).
+STRATA_DSV4_HD inline float deepseek4_e4m3_value(int i) {
+    const int exp = (i >> 3) & 0x0f;
+    const int mant = i & 0x07;
+    return exp == 0 ? (float) mant * 0.001953125f
+                    : (1.0f + (float) mant * 0.125f) * ldexpf(1.0f, exp - 7);
+}
+
+/// Nearest E4M3FN value to x, ties to an even mantissa code (cuda/ds41_fp8blk.cuh:95-109).
+STRATA_DSV4_HD inline float deepseek4_e4m3_round(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax = fminf(fabsf(x), 448.0f);
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (deepseek4_e4m3_value(mid) <= ax) lo = mid;
+        else hi = mid - 1;
+    }
+    int best = lo;
+    if (best < 126) {
+        const float best_diff = fabsf(ax - deepseek4_e4m3_value(best));
+        const float next_diff = fabsf(ax - deepseek4_e4m3_value(best + 1));
+        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0))
+            best++;
+    }
+    return sign * deepseek4_e4m3_value(best);
+}
+
+/// E2M1 (fp4 magnitude) table entry `i` in 0..7 (cuda/ds41_fp8blk.cuh:110-113).
+STRATA_DSV4_HD inline float deepseek4_e2m1_value(int i) {
+    switch (i & 7) {
+        case 0: return 0.0f;
+        case 1: return 0.5f;
+        case 2: return 1.0f;
+        case 3: return 1.5f;
+        case 4: return 2.0f;
+        case 5: return 3.0f;
+        case 6: return 4.0f;
+        default: return 6.0f;
+    }
+}
+
+/// Nearest E2M1 value to x (|x| clamped to 6), ties to an even table index (cuda/ds41_fp8blk.cuh:114-127).
+STRATA_DSV4_HD inline float deepseek4_e2m1_round(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax = fminf(fabsf(x), 6.0f);
+    int best = 0;
+    float best_diff = fabsf(ax - deepseek4_e2m1_value(0));
+    for (int i = 1; i < 8; i++) {
+        const float diff = fabsf(ax - deepseek4_e2m1_value(i));
+        if (diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return sign * deepseek4_e2m1_value(best);
+}
+
+/// FP4 nibble (sign in bit 3) -> f32 (cuda/ds41_fp8blk.cuh:128-134; nibble 8 is -0.0).
+STRATA_DSV4_HD inline float deepseek4_fp4_from_nibble(uint8_t n) {
+    const float v = deepseek4_e2m1_value(n & 7);
+    return (n & 8u) ? -v : v;
+}
+
+/// f32 -> FP4 nibble (cuda/ds41_fp8blk.cuh:135-143).
+STRATA_DSV4_HD inline uint8_t deepseek4_fp4_to_nibble(float x) {
+    const float v = deepseek4_e2m1_round(x);
+    const float av = fabsf(v);
+    uint8_t n = 0;
+    for (int i = 1; i < 8; i++) {
+        if (av == deepseek4_e2m1_value(i)) { n = (uint8_t) i; break; }   // exact table values
+    }
+    return n == 0 ? (uint8_t) 0 : (uint8_t)(v < 0.0f ? (n | 8u) : n);
+}
+
+/// E4M3 scale byte (cuda/ds41_fp8blk.cuh:146-155).
+STRATA_DSV4_HD inline uint8_t deepseek4_e4m3_byte(float x) {
+    const float v = deepseek4_e4m3_round(x);
+    const float av = fabsf(v);
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (deepseek4_e4m3_value(mid) <= av) lo = mid;
+        else hi = mid - 1;
+    }
+    return (uint8_t)((v < 0.0f && av != 0.0f) ? (lo | 0x80) : lo);
+}
+
+/// UE8M0 scale byte (cuda/ds41_fp8blk.cuh:144-148); s is a power of two (or 2^-127, stored as 0).
+STRATA_DSV4_HD inline uint8_t deepseek4_e8m0_byte(float s) {
+    const uint32_t bits = strata::deepseek4::engram_f32_to_bits(s);
+    if (bits == 0x00400000u) return 0;
+    return (uint8_t)((bits >> 23) & 0xffu);
+}
+
+/// The scale one quant block shares; the floors are the smallest value each mode's scale can carry
+/// (cuda/ds41_attn.cuh:180-187 and :225-227, one copy).
+STRATA_DSV4_HD inline float deepseek4_quant_scale(float absmax, int mode) {
+    if (mode == kDeepseek4QuantFp8E8m0)
+        return deepseek4_pow2_ceil_log2(fmaxf(absmax, 1e-4f) / 448.0f);
+    if (mode == kDeepseek4QuantFp4E8m0)
+        return deepseek4_pow2_ceil_log2(fmaxf(absmax, 6.0f * ldexpf(1.0f, -126)) / 6.0f);
+    return deepseek4_e4m3_round(fmaxf(absmax, 6.0f * ldexpf(1.0f, -9)) / 6.0f);
+}
+
+/// One value through the block quant: bf16r(round(clamp(v / s)) * s), the reference's write-back.
+STRATA_DSV4_HD inline float deepseek4_quant_value(float v, float s, int mode) {
+    if (mode == kDeepseek4QuantFp8E8m0) {
+        const float q = deepseek4_e4m3_round(fminf(fmaxf(v / s, -448.0f), 448.0f));
+        return strata::deepseek4::engram_bf16r(q * s);
+    }
+    const float q = deepseek4_e2m1_round(fminf(fmaxf(v / s, -6.0f), 6.0f));
+    return strata::deepseek4::engram_bf16r(q * s);
+}
+
+/// Element `d` of one packed compressed-KV row (cuda/ds41_attn.cuh:239-244).
+STRATA_DSV4_HD inline float deepseek4_ckv_get(const uint8_t* row, uint32_t d) {
+    const uint8_t by = row[d >> 1];
+    const uint8_t nib = (d & 1u) ? (uint8_t)(by >> 4) : (uint8_t)(by & 0x0Fu);
+    return strata::deepseek4::engram_bf16r(
+        deepseek4_fp4_from_nibble(nib) *
+        strata::deepseek4::engram_e4m3_to_f32(row[kDeepseek4CkvNibbleBytes + (d >> 4)]));
+}
+
+/// Element `d` of one packed index-key row (cuda/ds41_attn.cuh:251-256).
+STRATA_DSV4_HD inline float deepseek4_idxk_get(const uint8_t* row, uint32_t d) {
+    const uint8_t by = row[d >> 1];
+    const uint8_t nib = (d & 1u) ? (uint8_t)(by >> 4) : (uint8_t)(by & 0x0Fu);
+    return strata::deepseek4::engram_bf16r(
+        deepseek4_fp4_from_nibble(nib) *
+        strata::deepseek4::engram_e8m0_to_f32(row[kDeepseek4IdxkNibbleBytes + (d >> 5)]));
+}
+
+/// Compressor pooling (cuda/ds41_attn.cuh:86-104): group g spans ratio consecutive rows; each dimension is a
+/// softmax over the group's scores weighting the group's kv values, bf16-rounded once.  Only complete groups
+/// are written - floor(n_tok / ratio) rows; the tail is the caller's pending rows.
+void deepseek4_compress_pool_host(float* out, const float* kv, const float* score, uint32_t n_tok, uint32_t ratio,
+                                  uint32_t dim);
+
+/// One block of 256 threads per complete group; n_tok / ratio == 0 is a successful no-op.
+bool deepseek4_compress_pool(float* d_out, const float* d_kv, const float* d_score, uint32_t n_tok, uint32_t ratio,
+                             uint32_t dim, void* stream);
+
+/// In-place block quant (cuda/ds41_attn.cuh:171-205): one warp per block, block <= 32 and dim a multiple of it.
+void deepseek4_act_quant_host(float* x, uint32_t n_rows, uint32_t dim, uint32_t block, int mode);
+bool deepseek4_act_quant(float* d_x, uint32_t n_rows, uint32_t dim, uint32_t block, int mode, void* stream);
+
+/// Pack `n_rows` f32 rows into groups [g0, g0 + n_rows) of the cache (cuda/ds41_attn.cuh:207-284).  Only those
+/// rows are touched; the caller allocates at least g0 + n_rows rows.
+void deepseek4_ckv_pack_host(uint8_t* cache, uint32_t g0, const float* rows, uint32_t n_rows);
+bool deepseek4_ckv_pack(uint8_t* d_cache, uint32_t g0, const float* d_rows, uint32_t n_rows, void* stream);
+void deepseek4_idxk_pack_host(uint8_t* cache, uint32_t g0, const float* rows, uint32_t n_rows);
+bool deepseek4_idxk_pack(uint8_t* d_cache, uint32_t g0, const float* d_rows, uint32_t n_rows, void* stream);
+
+/// The unpack direction over rows [0, n_rows), for the gate and any f32 consumer of a packed cache.
+void deepseek4_ckv_unpack_host(const uint8_t* cache, uint32_t n_rows, float* out);
+bool deepseek4_ckv_unpack(const uint8_t* d_cache, uint32_t n_rows, float* d_out, void* stream);
+void deepseek4_idxk_unpack_host(const uint8_t* cache, uint32_t n_rows, float* out);
+bool deepseek4_idxk_unpack(const uint8_t* d_cache, uint32_t n_rows, float* d_out, void* stream);
 
 }  // namespace strata::kernels
