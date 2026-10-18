@@ -20,17 +20,23 @@ pieces have landed and are gated too — hyper-connections, the dense
 primitives, RoPE, the quantized-KV group, sparse attention, the window ring,
 the sparse indexer, and now the router and the routed VQ MoE with the
 reference engine's own MoE fixture bit-exact on its one-hot cases; the trunk
-forward driver is written, builds, and has run end to end on the real weights
-(`tools/dsv4/dsv4_run.cu`: the reference's layer order over the 40-part image,
-the engram feed, one GPU, greedy decode, the selected experts streamed per
+forward driver is written, builds, and has answered real prompts on the real
+weights (`tools/dsv4/dsv4_run.cu`: the reference's layer order over the 40-part
+image, the engram feed, one GPU, greedy decode, the selected experts streamed per
 layer). The 25 parts found damaged on 2026-10-18 were re-downloaded and swapped
 for copies checked against the tree API's size and SHA-256 (0 of 40 parts now
-hold a hole; the parts checker reads all 43 expert blobs, `OK`). A run on the
-repaired image (3 control ids, chunk 8) printed 40 layers with no unreadable
-payload and no non-finite value, 3 prompt tokens in 1.20 s and 2 greedy tokens
-in 0.88 s; runs before and after the repair generated the same two ids, so P3's
-temperature-0 gate against the reference engine remains open. This file is the
-state carrier for the port.
+hold a hole; the parts checker reads all 43 expert blobs, `OK`). Two chat runs on
+the repaired image (chunk 8, RTX 3060): "Hello! In one short sentence, what are
+you?" (15 prompt tokens) prefilled in 7.99 s, generated at 1.3 tok/s and stopped
+at end-of-sentence with "I'm an AI assistant created by DeepSeek to help you with
+questions and tasks."; "What is the capital of France? Answer in one word."
+(16 tokens) answered "Paris". The first longer prompt exposed an argument-order
+bug in the driver's two hc_post calls (the output pointer was passed where the
+API takes y, so the kernel wrote into the 128-float comb_ buffer, up to ~650 KB
+out of bounds); the earlier 3-token smoke run had stayed inside the arena and
+silently corrupted the hyper-connection state, so its ids were not meaningful.
+Fixed in `e466ec94`. P3's temperature-0 gate against the reference engine
+remains open. This file is the state carrier for the port.
 
 Goal: serve the published DeepSeek-V4.1-Flash-1017 VQ artifact on one normal
 PC — NVIDIA or AMD cards plus system RAM — with Strata's layer split, expert
