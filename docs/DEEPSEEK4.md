@@ -20,11 +20,16 @@ pieces have landed and are gated too — hyper-connections, the dense
 primitives, RoPE, the quantized-KV group, sparse attention, the window ring,
 the sparse indexer, and now the router and the routed VQ MoE with the
 reference engine's own MoE fixture bit-exact on its one-hot cases; the trunk
-forward driver is written and builds (`tools/dsv4/dsv4_run.cu`: the reference's
-layer order end to end over the 40-part image, the engram feed, one GPU, greedy
-decode, the selected experts streamed per layer). It has not been run on
-weights yet, and 25 of the 40 parts still hold holes (§3), so P3's
-temperature-0 gate remains open. This file is the
+forward driver is written, builds, and has run end to end on the real weights
+(`tools/dsv4/dsv4_run.cu`: the reference's layer order over the 40-part image,
+the engram feed, one GPU, greedy decode, the selected experts streamed per
+layer). The 25 parts found damaged on 2026-10-18 were re-downloaded and swapped
+for copies checked against the tree API's size and SHA-256 (0 of 40 parts now
+hold a hole; the parts checker reads all 43 expert blobs, `OK`). A run on the
+repaired image (3 control ids, chunk 8) printed 40 layers with no unreadable
+payload and no non-finite value, 3 prompt tokens in 1.20 s and 2 greedy tokens
+in 0.88 s; runs before and after the repair generated the same two ids, so P3's
+temperature-0 gate against the reference engine remains open. This file is the
 state carrier for the port.
 
 Goal: serve the published DeepSeek-V4.1-Flash-1017 VQ artifact on one normal
