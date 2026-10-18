@@ -804,7 +804,10 @@ struct Inventory {
 
 /// Checks every tensor's name, type, shape and payload length against `expected_tensors`, and its offset against
 /// the file.  A payload past EOF is counted in `beyond_eof`; `allow_partial` decides whether that is an error.
-inline Inventory check_inventory(const GgufFile& g, const Geometry& geo, bool allow_partial) {
+/// `assembled_size`, when nonzero, replaces `g.file_size()`: a download split into byte-identical parts is
+/// checked against the length it will have once assembled, while `g` still reads the header from part 1.
+inline Inventory check_inventory(const GgufFile& g, const Geometry& geo, bool allow_partial,
+                                 uint64_t assembled_size = 0) {
     Inventory inv;
     const auto spec = expected_tensors(geo);
     struct Span {
@@ -813,7 +816,8 @@ inline Inventory check_inventory(const GgufFile& g, const Geometry& geo, bool al
         bool inside;
     };
     std::vector<Span> spans;
-    const uint64_t payload_end = g.file_size() - g.data_start();
+    const uint64_t file_size = assembled_size != 0 ? assembled_size : g.file_size();
+    const uint64_t payload_end = file_size > g.data_start() ? file_size - g.data_start() : 0;
 
     for (const TensorInfo& t : g.tensors()) {
         inv.tensors++;
