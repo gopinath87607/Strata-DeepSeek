@@ -776,8 +776,9 @@ Checked on the P5 gate's chat prompt (whose greedy output is the 8 ids
 The cost is the process. One request at 16 prompt tokens took 12.3-12.8 s
 wall: about 3.9-4.2 s of model open, 7.6-7.8 s of prefill and 0.8 s of decode
 (2.5 tok/s). The thinking request at 40 prompt tokens took 37.75 s (20.7 s
-prefill, 12.8 s for 16 tokens). Residency, prefix reuse and batching are P7;
-this server pays a fresh load and a cold prefill per request.
+prefill, 12.8 s for 16 tokens). This path pays a fresh load and a cold prefill
+per request; residency landed afterwards under "Residency, measured" below,
+and prefix reuse and batching remain open.
 
 Only text is served. `tools`, images and tool results are refused with a 400
 by name rather than dropped. There is no API key unless `--api-key` is given,
@@ -927,6 +928,78 @@ stages that own an engram layer (stage 0: 40.23 -> 35.22 s for L1, stage 2:
 At 79 tokens over ten 8-row blocks it is 38.58 -> 36.89 s, decode 5.69 ->
 5.52 s.  Both pairs return the gate ids above, and without the flag the
 synchronous path runs unchanged.
+
+### Residency, measured (P7)
+
+`--serve` on the driver, and on by default in the server (`--no-resident`
+keeps the P6 process-per-request path).  The driver loads the weights and the
+engrams once, sizes the state once for `min(--ctx, --serve-ctx)` tokens, prints
+`ready`, and then answers one request per stdin line:
+
+```
+ids=1,2,3 gen=16 temperature=0 top_p=1 min_p=0 top_k=0 seed=42 stop_eos=1
+```
+
+With `--stream-ids` it prints one id per line, then `generated=...`, then
+`done`.  A line that does not parse, or a request longer than the resident
+state, prints `error=...` and `done` and the process keeps serving; a failed
+forward exits 1, and the server's next request starts a fresh driver.
+`--dspark` is refused with `--serve`.  The server's `--serve-ctx` defaults to
+16384; the context you actually want to serve has to be passed.
+
+Resident mode resets only what belongs to a request: `n_past_`, `in_decode_`,
+the group-completion counters and snapshots, the engram n-gram history
+(`hist_` - a longer previous prompt must not feed the next prompt's window),
+the engram feed buffers (running reads are joined first) and the RNG (reseeded
+from `seed`).  The weights, the state allocation and the expert cache slots
+persist.  Temperature 0 stays argmax.
+
+The gate is byte identity against a cold process, in one resident process that
+alternates a 30-token and an 11-token prompt, greedy, on one card and on four:
+
+| prompt | ids |
+| --- | --- |
+| long (30 tokens) | `51119,344,270,6102,294,8760,16,455` |
+| short (11 tokens) | `32,3476,477,260,11502,22896,16,11992` |
+| short, T 1.0 / top_p 1.0 / min_p 0 / seed 42 | `5957,54921,10240,54921,539,31683,54921,331` |
+
+Every occurrence of an arm in the process matched the fresh-process ids.  The
+four-card run sent long, short, long, short, and all four matched.
+
+Same HTTP request before and after, same four cards, same flags (`--devices
+0,1,2,3 --chunk 0 --engram-feed --expert-cache-mib 1024,1024,4096,4096`):
+"What is the capital of France?", max_tokens 8, temperature 0.
+
+| server | request 1 | request 2 | answer |
+| --- | --- | --- | --- |
+| `--no-resident` (P6 path) | 13.79 s | 13.79 s | `The capital of France is **Paris**.` |
+| resident | 9.32 s | 8.13 s | same, usage 11 + 8 |
+
+The non-resident request pays model open and a cold prefill every time; the
+resident first request pays them once at startup, and the second finds the
+expert cache warm.  A 21-token prose prompt with 48 generated tokens took
+34.71 s through the resident server.
+
+The expert cache earns more resident than it did cold, because it survives
+between requests.  Isolated driver runs (`--serve-ctx 256`, 8 generated
+tokens):
+
+| plan | prefill | decode 8 | cache |
+| --- | --- | --- | --- |
+| one RTX 5060, no cache | 4.81 s short; 10.38 / 9.98 s long | 5.7-5.8 s | - |
+| one RTX 3060, 4096 MiB | unchanged | 4.22 s against 5.73 s with no slots | 595 slots, 28-29% hits, 11.0 GiB not read on request 2 |
+| four cards, 1024/1024/4096/4096 MiB | 5.13 s then 4.44 s | 3.80 s then 3.68 s | 148/148/595/595 slots; hits 31-43 / 31-43 / 38-69 / 34-37%; not read 6.6 then 15.9 GiB |
+
+State size costs the prompt chunk: the same four-card plan with the 1/1/4/4
+GiB caches picks auto chunks 2191/3491/3261/2130 rows for a 16,384-token state
+and 1787/3009/2857/1664 for the full 1,048,576-token one (stage 3 binds either
+way).  Each stage owns one KV source layer, so a row costs 360 B there; the
+drop is the whole price of serving the full context resident.
+
+```
+python3 tools/dsv4/dsv4_server.py --port 8080 --devices 0,1,2,3 --chunk 0 \
+    --engram-feed --expert-cache-mib 1024,1024,4096,4096 --serve-ctx 1048576
+```
 
 ## 9. Downloads for the next phases
 
