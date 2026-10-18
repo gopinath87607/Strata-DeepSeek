@@ -16,6 +16,7 @@
 // Usage:
 //   dsv4_run --ids 1,2,3 [--gen 32] [--model BASE] [--engram-dir DIR] [--chunk 8] [--ctx N] [--gpu 0]
 //            [--dspark [--dspark-verify K] [--dspark-trace]]
+//            [--temperature T] [--top-p P] [--min-p M] [--top-k K] [--seed S] [--stop-eos] [--stream-ids]
 //
 // The runner takes token ids, not text: the tokenizer is Python (tools/strata_tokenizer.py); see
 // tools/dsv4/dsv4_prompt.py for the text wrapper.
@@ -36,6 +37,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include "strata/artifact/deepseek4.hpp"
@@ -254,6 +256,14 @@ struct LayerW {
     void* eng_wkv = nullptr;    // fp8_32x32: in_dim*out_dim e4m3 then the tile scales
 };
 
+// splitmix64, the seed expander for the sampler's xorshift128+ (P6).
+uint64_t splitmix64(uint64_t& x) {
+    uint64_t z = (x += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
 struct Options {
     std::string model = "/mnt/nvme/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf";
     std::string engram_dir = "/mnt/nvme";
@@ -272,6 +282,16 @@ struct Options {
     bool dspark = false;
     uint32_t dspark_verify = 0;   // 0: verify the tower's whole block; else pin k (the trace gate)
     bool dspark_trace = false;    // print each round's k, accepted count, confidence and both id lists
+    // Sampling (P6).  temperature <= 0 is the greedy path, byte-identical to the runs before this switch; a
+    // positive temperature runs the server's chain (temperature, top_k, min_p, top_p) over the logits row the
+    // argmax path already reads back, draws with a seeded xorshift128+.  The DSpark verify is greedy-only.
+    float temperature = 0.0f;
+    float top_p = 1.0f;
+    float min_p = 0.0f;
+    uint32_t top_k = 0;   // 0: off
+    uint64_t seed = 0;
+    bool stop_eos = false;   // stop after emitting the model's EOS (id 1 here); off keeps every gate run's ids
+    bool stream_ids = false; // print each generated id as a line as it is produced, before the final generated=
 };
 
 // ---- The runner -----------------------------------------------------------------------------------------------
@@ -307,7 +327,8 @@ private:
     bool index_source(uint32_t il, uint32_t ratio, std::string& err);
     bool moe(uint32_t il, std::string& err);
     bool engram_layer(uint32_t il, std::string& err);
-    int32_t argmax_logits(std::string& err);
+    int32_t pick_token(std::string& err);
+    int32_t sample_host(std::string& err);
     // ---- DSpark (P5): the draft towers, the verify batch and its rollback ----
     bool load_towers(std::string& err);
     bool draft_alloc(std::string& err);
@@ -332,6 +353,7 @@ private:
     std::unique_ptr<GgufFile> gguf_;
     uint32_t E_ = 0, V_ = 0, H_ = 0, HD_ = 0, Q_ = 0, OL_ = 0, NG_ = 0, NE_ = 0, KU_ = 0, FF_ = 0, HC_ = 0;
     uint32_t IH_ = 0, IK_ = 0, SWA_ = 0, nlayers_ = 0;
+    uint32_t eos_ = 1;   // tokenizer.ggml.eos_token_id, read by open(); --stop-eos stops after emitting it
     uint32_t cap_ = 0, ctx_ = 0, topk_cap_ = 0;
     float rms_eps_ = 0, hc_eps_ = 0, route_scale_ = 1.5f, clamp_ = 10.0f;
     uint32_t sinkhorn_ = 0, nrot_ = 0;
@@ -464,6 +486,18 @@ private:
     std::vector<int32_t> sel_host_;
     std::vector<uint32_t> uniq_;
     std::vector<float> logits_host_;
+    // P6 sampling: the sorted (score, id) work list and the seeded xorshift128+ state.  The readback that feeds
+    // it is the one the argmax path already does, so a sampled step costs the sort, not another transfer.
+    std::vector<std::pair<float, uint32_t>> samp_work_;
+    uint64_t rng_s0_ = 0, rng_s1_ = 0;
+    uint64_t rng_next() {
+        uint64_t x = rng_s0_, y = rng_s1_;
+        rng_s0_ = y;
+        x ^= x << 23;
+        rng_s1_ = x ^ y ^ (x >> 17) ^ (y >> 26);
+        return rng_s1_ + y;
+    }
+    double rng_uniform() { return static_cast<double>(rng_next() >> 11) * 0x1.0p-53; }
 
     cudaStream_t stream_ = nullptr;
 };
@@ -677,6 +711,30 @@ bool Runner::open(const Options& o, std::string& err) {
         mtp_on_ = true;
     }
     prod_cap_ = std::max(cap_, SWA_);
+
+    // P6 sampling: the wire accepts the server's defaults; the engine refuses what its chain cannot mean.
+    if (opt_.temperature < 0.0f) { err = "--temperature is negative"; return false; }
+    if (!(opt_.top_p > 0.0f && opt_.top_p <= 1.0f)) { err = "--top-p is outside (0, 1]"; return false; }
+    if (!(opt_.min_p >= 0.0f && opt_.min_p < 1.0f)) { err = "--min-p is outside [0, 1)"; return false; }
+    if (opt_.top_k > V_) opt_.top_k = V_;
+    if (opt_.temperature > 0.0f && opt_.dspark) {
+        err = "--dspark verifies by argmax; drafting and sampling cannot be combined yet";
+        return false;
+    }
+    {
+        uint64_t seedsrc = opt_.seed;   // splitmix64 advances its argument
+        rng_s0_ = splitmix64(seedsrc);
+        rng_s1_ = splitmix64(seedsrc);
+        if (rng_s0_ == 0 && rng_s1_ == 0) rng_s0_ = 1;   // xorshift128+ cannot start all-zero
+    }
+    if (const strata::MetaValue* e = gguf_->get("tokenizer.ggml.eos_token_id")) {
+        if (e->is_num() && e->num() >= 0.0 && e->num() < static_cast<double>(V_))
+            eos_ = static_cast<uint32_t>(e->num());
+    }
+    if (opt_.stop_eos)
+        std::fprintf(stderr, "[v41] stop at EOS (id %u); sampling temperature %.3f top_p %.3f min_p %.3f top_k %u\n",
+                     eos_, static_cast<double>(opt_.temperature), static_cast<double>(opt_.top_p),
+                     static_cast<double>(opt_.min_p), opt_.top_k);
 
     std::fprintf(stderr,
                  "[v41] model: %u layers, E %u, V %u, H %u x HD %u, Q %u, OL %u x NG %u, experts %u top %u FF %u,\n"
@@ -2034,15 +2092,72 @@ bool Runner::layer(uint32_t il, std::string& err) {
     return true;
 }
 
-int32_t Runner::argmax_logits(std::string& err) {
+int32_t Runner::pick_token(std::string& err) {
     const cudaError_t ce = cudaMemcpyAsync(logits_host_.data(), logits_, uint64_t(V_) * 4, cudaMemcpyDeviceToHost,
                                            stream_);
     if (ce != cudaSuccess) { err = std::string("logits readback: ") + cudaGetErrorString(ce); return -1; }
     if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "logits readback sync failed"; return -1; }
-    uint32_t best = 0;
-    for (uint32_t i = 1; i < V_; ++i)
-        if (logits_host_[i] > logits_host_[best]) best = i;   // strict >: ties take the lower index
-    return static_cast<int32_t>(best);
+    if (opt_.temperature <= 0.0f) {
+        uint32_t best = 0;
+        for (uint32_t i = 1; i < V_; ++i)
+            if (logits_host_[i] > logits_host_[best]) best = i;   // strict >: ties take the lower index
+        return static_cast<int32_t>(best);
+    }
+    return sample_host(err);
+}
+
+// The server's sampling chain over the row pick_token read back: temperature, top_k, min_p (relative to the
+// maximum probability), top_p, then one draw.  Ties sort by ascending id, matching the argmax's lower-id rule.
+// Non-finite logits are excluded rather than poisoning the sort (a valid model writes none).
+int32_t Runner::sample_host(std::string& err) {
+    const float inv = 1.0f / opt_.temperature;
+    samp_work_.resize(V_);
+    bool any = false;
+    for (uint32_t i = 0; i < V_; ++i) {
+        const float s = logits_host_[i];
+        const bool ok = std::isfinite(s);
+        samp_work_[i] = {ok ? s * inv : -INFINITY, i};
+        any = any || ok;
+    }
+    if (!any) { err = "sampling: no finite logit"; return -1; }
+    auto& w = samp_work_;
+    std::sort(w.begin(), w.end(), [](const std::pair<float, uint32_t>& a, const std::pair<float, uint32_t>& b) {
+        if (a.first != b.first) return a.first > b.first;
+        return a.second < b.second;
+    });
+    uint32_t n = V_;
+    if (opt_.top_k > 0 && opt_.top_k < n) n = opt_.top_k;
+    const double m = w[0].first;
+    double sum = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const double e = std::exp(static_cast<double>(w[i].first) - m);
+        w[i].first = static_cast<float>(e);
+        sum += e;
+    }
+    if (opt_.min_p > 0.0f) {   // p_i / p_max = exp(s_i - s_max), so the floor is min_p itself
+        uint32_t k = 1;
+        while (k < n && static_cast<double>(w[k].first) >= static_cast<double>(opt_.min_p)) ++k;
+        n = k;
+    }
+    if (opt_.top_p < 1.0f) {
+        double cum = 0;
+        uint32_t k = 0;
+        while (k < n && cum < static_cast<double>(opt_.top_p)) {
+            cum += static_cast<double>(w[k].first) / sum;
+            ++k;
+        }
+        n = k ? k : 1;
+    }
+    double total = 0;
+    for (uint32_t i = 0; i < n; ++i) total += static_cast<double>(w[i].first);
+    if (!(total > 0.0)) { err = "sampling: empty distribution"; return -1; }
+    const double u = rng_uniform() * total;
+    double cum = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        cum += static_cast<double>(w[i].first);
+        if (u < cum) return static_cast<int32_t>(w[i].second);
+    }
+    return static_cast<int32_t>(w[n - 1].second);
 }
 
 bool Runner::block(const int32_t* ids, uint32_t n, bool head, bool head_all, std::string& err) {
@@ -2159,7 +2274,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
 
     std::vector<int32_t> generated;
     if (gen > 0) {
-        int32_t t = argmax_logits(err);
+        int32_t t = pick_token(err);
         if (t < 0) return false;
         const double td = now_sec();
         // The DSpark summary counters (report-only; the token stream is what the gate reads).
@@ -2168,6 +2283,11 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
             // The loop-top emit (the reference's core_v41_api.c:246): this token's successor is already decided.
             generated.push_back(t);
             ++g;
+            if (opt_.stream_ids) {
+                std::printf("%d\n", t);
+                std::fflush(stdout);
+            }
+            if (opt_.stop_eos && static_cast<uint32_t>(t) == eos_) break;
             if (g >= gen) break;
             if (n_past_ + 1 > ctx_) {
                 err = "context full (" + std::to_string(n_past_) + "+1 > " + std::to_string(ctx_) + ")";
@@ -2176,7 +2296,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
             if (!opt_.dspark) {
                 // Plain decode: feed the token, pick its successor.
                 if (!block(&t, 1, true, false, err)) return false;
-                t = argmax_logits(err);
+                t = pick_token(err);
                 if (t < 0) return false;
                 continue;
             }
@@ -2196,7 +2316,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
                 // No draft, or a round the scheduler would have sat out: one direct token step.
                 ++plain_steps;
                 if (!block(&t, 1, true, false, err)) return false;
-                t = argmax_logits(err);
+                t = pick_token(err);
                 if (t < 0) return false;
                 continue;
             }
@@ -2242,12 +2362,19 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
             for (uint32_t i = 0; i < a && g < gen; ++i) {
                 generated.push_back(batch[i + 1]);
                 ++g;
+                if (opt_.stream_ids) {
+                    std::printf("%d\n", batch[i + 1]);
+                    std::fflush(stdout);
+                }
             }
+            if (opt_.stop_eos && static_cast<uint32_t>(generated.back()) == eos_) break;
             t = t_want_host_[a];
         }
         const double dt = now_sec() - td;
-        std::fprintf(stderr, "[v41] generated %u tokens in %.2fs (%.1f tok/s)\n", gen, dt,
-                     dt > 0 ? static_cast<double>(gen) / dt : 0.0);
+        const uint64_t n_emitted = generated.size();
+        std::fprintf(stderr, "[v41] generated %llu tokens in %.2fs (%.1f tok/s)\n",
+                     static_cast<unsigned long long>(n_emitted), dt,
+                     dt > 0 ? static_cast<double>(n_emitted) / dt : 0.0);
         if (rounds || plain_steps) {
             std::fprintf(stderr, "[v41] DSpark: %llu round(s), %.2f accepted of %llu drafted (%.1f%%), %llu plain step(s)%s\n",
                          static_cast<unsigned long long>(rounds),
@@ -2311,6 +2438,13 @@ int main(int argc, char** argv) {
             o.dspark_trace = true;
             o.dspark = true;
         }
+        else if (a == "--temperature") o.temperature = std::strtof(next("--temperature"), nullptr);
+        else if (a == "--top-p") o.top_p = std::strtof(next("--top-p"), nullptr);
+        else if (a == "--min-p") o.min_p = std::strtof(next("--min-p"), nullptr);
+        else if (a == "--top-k") o.top_k = static_cast<uint32_t>(std::strtoul(next("--top-k"), nullptr, 10));
+        else if (a == "--seed") o.seed = std::strtoull(next("--seed"), nullptr, 10);
+        else if (a == "--stop-eos") o.stop_eos = true;
+        else if (a == "--stream-ids") o.stream_ids = true;
         else if (a == "--no-engram") o.engram = false;
         else if (a == "--no-check") o.check = false;
         else if (a == "--help" || a == "-h") {
@@ -2318,10 +2452,17 @@ int main(int argc, char** argv) {
                          "usage: dsv4_run --ids 1,2,3 [--gen N] [--model BASE] [--engram-dir DIR] [--chunk 8]\n"
                          "               [--ctx N] [--gpu 0] [--trace] [--no-engram] [--no-check] [--logits-out F]\n"
                          "               [--dspark] [--dspark-verify K] [--dspark-trace]\n"
+                         "               [--temperature T] [--top-p P] [--min-p M] [--top-k K] [--seed S]\n"
+                         "               [--stop-eos] [--stream-ids]\n"
                          "  --dspark         the MTP towers draft, the main forward verifies, the cache rolls back;\n"
                          "                   the greedy output must be byte-identical to the same run without it\n"
                          "  --dspark-verify  pin the verified rows per round (1..block, default: the whole block)\n"
-                         "  --dspark-trace   print each round's k, accepted count, confidence and both id lists\n");
+                         "  --dspark-trace   print each round's k, accepted count, confidence and both id lists\n"
+                         "  --temperature    <= 0 (the default) is greedy; above 0 runs the sampling chain\n"
+                         "  --top-p/--min-p/--top-k  the chain's filters (default 1.0, 0.0, 0 = off)\n"
+                         "  --seed           the sampler's seed (default 0; the server picks one per request)\n"
+                         "  --stop-eos       stop after emitting the model's EOS id\n"
+                         "  --stream-ids     print each generated id as a line as it is produced\n");
             return 0;
         } else {
             std::fprintf(stderr, "dsv4_run: unknown argument '%s'\n", a.c_str());
