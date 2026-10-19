@@ -27,12 +27,18 @@
 #include "strata/artifact/deepseek4.hpp"
 #include "strata/artifact/deepseek4_engram_bits.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -307,6 +313,9 @@ public:
         aligned_ = false;
         size_ = 0;
         path_.clear();
+        std::vector<uint8_t>().swap(scales_);
+        scale_base_ = 0;
+        scale_span_ = 0;
     }
 
     bool is_open() const {
@@ -349,6 +358,69 @@ public:
         return true;
     }
 
+    /// Opt-in (`--engram-scale-cache`): hold the table's scale plane in host RAM.  A row costs two random 4 KiB
+    /// preads -- 256 weight bytes and 8 scale bytes -- and the scale plane is only rows*(head_dim/32) bytes
+    /// (3.1 GB a table here), so reading it once in order removes one of the two reads for every row after.
+    bool cache_scales(uint64_t scale_off, uint64_t rows, uint32_t head_dim, std::string& err) {
+        if (!is_open()) {
+            err = "engram shard: not open";
+            return false;
+        }
+        if (head_dim == 0 || head_dim % 32 != 0) {
+            err = "engram shard: head_dim is not a multiple of 32";
+            return false;
+        }
+        const uint64_t nsc = head_dim / 32;
+        if (rows != 0 && rows * nsc / nsc != rows) {
+            err = "engram shard: row count overflows";
+            return false;
+        }
+        const uint64_t plane = rows * nsc;
+        if (scale_off > size_ || plane > size_ - scale_off) {
+            err = "engram shard: scale plane runs past the shard";
+            return false;
+        }
+        std::vector<uint8_t> buf;
+        try {
+            buf.resize(static_cast<size_t>(plane));
+        } catch (const std::bad_alloc&) {
+            err = "engram shard: not enough RAM for the scale cache";
+            return false;
+        }
+#if defined(_WIN32)
+        if (!read_exact(buf.data(), static_cast<size_t>(plane), scale_off, err)) return false;
+#else
+        // A separate buffered descriptor for the one sequential pass: the read has no O_DIRECT alignment
+        // rules, and readahead is what this access pattern wants.  The shard's own descriptor stays O_DIRECT
+        // for the random 256-byte rows.
+        const int bfd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+        if (bfd < 0) {
+            err = "engram shard: cannot open the shard for the scale cache";
+            return false;
+        }
+        size_t got = 0;
+        while (got < plane) {
+            const size_t chunk = std::min<size_t>(static_cast<size_t>(plane - got), size_t{8} << 20);
+            const ssize_t n = ::pread(bfd, buf.data() + got, chunk, static_cast<off_t>(scale_off + got));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) {
+                ::close(bfd);
+                err = "engram shard: scale plane read failed";
+                return false;
+            }
+            got += static_cast<size_t>(n);
+        }
+        (void)posix_fadvise(bfd, static_cast<off_t>(scale_off), static_cast<off_t>(plane), POSIX_FADV_DONTNEED);
+        ::close(bfd);
+#endif
+        scales_ = std::move(buf);
+        scale_base_ = scale_off;
+        scale_span_ = plane;
+        return true;
+    }
+
+    bool scales_cached() const { return !scales_.empty(); }
+
     /// One row's raw bytes: `head_dim` weights and `head_dim/32` scales.
     bool row(uint64_t weight_off, uint64_t scale_off, uint64_t r, uint32_t head_dim, uint8_t* weights,
              uint8_t* scale, std::string& err) const {
@@ -363,22 +435,92 @@ public:
             return false;
         }
         if (!read_exact(weights, hd, weight_off + r * hd, err)) return false;
+        if (!scales_.empty()) {
+            // The cache holds the plane from scale_base_: any scale_off inside it maps to an offset.
+            if (scale_off < scale_base_ || scale_off - scale_base_ > scale_span_) {
+                err = "engram shard: the scale cache does not cover that row";
+                return false;
+            }
+            const uint64_t in = scale_off - scale_base_;
+            const uint64_t avail = scale_span_ - in;
+            if (avail < nsc || r > (avail - nsc) / nsc) {
+                err = "engram shard: the scale cache does not cover that row";
+                return false;
+            }
+            std::memcpy(scale, scales_.data() + in + r * nsc, static_cast<size_t>(nsc));
+            return true;
+        }
         return read_exact(scale, nsc, scale_off + r * nsc, err);
     }
 
     /// `n_ids` rows as the forward consumes them: row i lands at out[i*row_stride()] as weights then scales.
+    ///
+    /// A prompt block's IDs are hashed, so consecutive rows land anywhere in a multi-hundred-gigabyte shard and
+    /// one pread at a time leaves the drive's queue empty: measured 9 s per table per 1024 tokens on the
+    /// reference box, the single largest prefill cost.  The descriptor is only pread from, so a long call reads
+    /// contiguous ID slices on several threads.  Decode-sized calls keep the serial loop; the bytes and the
+    /// errors are the same either way.
     bool rows(uint64_t weight_off, uint64_t scale_off, const int64_t* ids, size_t n_ids, uint32_t head_dim,
               uint8_t* out, std::string& err) const {
         const uint32_t stride = row_stride(head_dim);
-        for (size_t i = 0; i < n_ids; ++i) {
+        auto one = [&](size_t i, std::string& e) -> bool {
             const int64_t r = ids[i];
             if (r < 0) {
-                err = "engram shard: negative row id";
+                e = "engram shard: negative row id";
                 return false;
             }
-            if (!row(weight_off, scale_off, static_cast<uint64_t>(r), head_dim, out + i * stride,
-                     out + i * stride + head_dim, err))
-                return false;
+            return row(weight_off, scale_off, static_cast<uint64_t>(r), head_dim, out + i * stride,
+                       out + i * stride + head_dim, e);
+        };
+        uint32_t nthreads = 1;
+#if !defined(_WIN32)
+        // The read path is pread on a shared descriptor there; Windows seeks a shared FILE* and stays serial.
+        if (n_ids >= 4096) {
+            // 8 matched the reference box's QLC drive; STRATA_V4_ENGRAM_ROWS_THREADS overrides for a sweep.
+            static const uint32_t rows_threads_env = [] {
+                const char* v = std::getenv("STRATA_V4_ENGRAM_ROWS_THREADS");
+                if (v != nullptr) {
+                    const long t = std::strtol(v, nullptr, 10);
+                    if (t >= 1 && t <= 64) return static_cast<uint32_t>(t);
+                }
+                return 8u;
+            }();
+            nthreads = rows_threads_env;
+            if (nthreads > n_ids / 1024) nthreads = static_cast<uint32_t>(n_ids / 1024);
+            if (nthreads == 0) nthreads = 1;
+        }
+#endif
+        if (nthreads <= 1) {
+            for (size_t i = 0; i < n_ids; ++i)
+                if (!one(i, err)) return false;
+            return true;
+        }
+        const size_t per = (n_ids + nthreads - 1) / nthreads;
+        std::atomic<bool> ok{true};
+        std::mutex mu;
+        std::string first_err;
+        std::vector<std::thread> pool;
+        pool.reserve(nthreads);
+        for (uint32_t t = 0; t < nthreads; ++t) {
+            const size_t i0 = std::min(n_ids, static_cast<size_t>(t) * per);
+            const size_t i1 = std::min(n_ids, i0 + per);
+            if (i0 >= i1) break;
+            pool.emplace_back([&, i0, i1]() {
+                std::string e;
+                for (size_t i = i0; i < i1; ++i) {
+                    if (!ok.load(std::memory_order_relaxed)) return;
+                    if (!one(i, e)) {
+                        std::lock_guard<std::mutex> g(mu);
+                        if (ok.exchange(false)) first_err = e;
+                        return;
+                    }
+                }
+            });
+        }
+        for (auto& th : pool) th.join();
+        if (!ok.load()) {
+            err = first_err;
+            return false;
         }
         return true;
     }
@@ -396,6 +538,12 @@ private:
         aligned_ = o.aligned_;
         size_ = o.size_;
         path_ = o.path_;
+        scales_ = std::move(o.scales_);
+        o.scales_ = {};
+        scale_base_ = o.scale_base_;
+        scale_span_ = o.scale_span_;
+        o.scale_base_ = 0;
+        o.scale_span_ = 0;
         o.direct_ = false;
         o.aligned_ = false;
         o.size_ = 0;
@@ -438,7 +586,10 @@ private:
         const uint64_t a = off & ~(static_cast<uint64_t>(kAlign) - 1);
         const uint64_t span = off - a + len;
         const uint64_t nb = (span + kAlign - 1) / kAlign * kAlign;
-        std::vector<uint8_t> bounce(static_cast<size_t>(nb) + kAlign);
+        // Per-thread now that rows() reads on several threads: one reused aligned scratch per thread instead of
+        // a fresh allocation per pread.
+        thread_local std::vector<uint8_t> bounce;
+        bounce.resize(static_cast<size_t>(nb) + kAlign);
         uint8_t* buf = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(bounce.data()) + kAlign - 1) &
                                                   ~(static_cast<uintptr_t>(kAlign) - 1));
         size_t got = 0;
@@ -465,13 +616,17 @@ private:
     bool aligned_ = false;
     uint64_t size_ = 0;
     std::string path_;
+    // --engram-scale-cache: the scale plane, read once; empty when the tier is off.
+    std::vector<uint8_t> scales_;
+    uint64_t scale_base_ = 0;   // the file offset scales_[0] came from
+    uint64_t scale_span_ = 0;   // bytes held, from scale_base_
 };
 
 /// Opens engram index `ei`'s shard from `dir`: the metadata records the writer's path, so the runtime's
 /// `--engram-dir` supplies the directory and the recorded file name is kept.  The span is checked with the
 /// metadata's offsets and row count, so a mismatched or truncated shard is refused here.
 inline bool open_engram_table(const Geometry& geo, size_t ei, const std::string& dir, EngramShard& shard,
-                              std::string& err) {
+                              std::string& err, bool cache_scales = false) {
     if (ei >= geo.engram_tables.size()) {
         err = "engram index " + std::to_string(ei) + " is not in the geometry";
         return false;
@@ -484,6 +639,10 @@ inline bool open_engram_table(const Geometry& geo, size_t ei, const std::string&
         return false;
     }
     if (!shard.check_span(t.weight_offset, t.scale_offset, t.rows, geo.engram_head_dim, e)) {
+        err = "engram table " + std::to_string(ei) + ": " + e;
+        return false;
+    }
+    if (cache_scales && !shard.cache_scales(t.scale_offset, t.rows, geo.engram_head_dim, e)) {
         err = "engram table " + std::to_string(ei) + ": " + e;
         return false;
     }

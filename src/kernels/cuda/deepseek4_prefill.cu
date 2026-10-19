@@ -119,7 +119,7 @@ __global__ __launch_bounds__(kPfThreads, 1) void pf_mma_kernel(
         uint16_t* __restrict__ g16, uint16_t* __restrict__ h16, float* __restrict__ ys,
         const uint8_t* __restrict__ blob, uint64_t blob_size, const Deepseek4MoePrefillItem* __restrict__ items,
         uint32_t nitems, const uint16_t* __restrict__ act, const uint32_t* __restrict__ off, uint32_t m_rows,
-        uint32_t k_cols, float clamp, uint32_t nc, const uint16_t* __restrict__ cb16) {
+        uint32_t k_cols, float clamp, uint32_t nc, const uint16_t* __restrict__ cb16, uint32_t act_rows) {
     extern __shared__ __align__(16) uint8_t pfsh[];
     uint16_t* cbs = reinterpret_cast<uint16_t*>(pfsh);
     uint8_t* As = pfsh + (CB ? nc * 16u : 0u);
@@ -175,9 +175,15 @@ __global__ __launch_bounds__(kPfThreads, 1) void pf_mma_kernel(
 #pragma unroll
             for (uint32_t c = 0; c < (kPfTok * kPfCw) / kPfThreads; c++) {
                 const uint32_t ch = tid + c * kPfThreads, bt = ch / kPfCw, bc = ch % kPfCw;
-                if (bt < bt_max)
-                    bx[c] = __ldg(reinterpret_cast<const uint4*>(act + static_cast<uint64_t>(base + bt) * k_cols +
+                if (bt < bt_max) {
+                    // The last slice of an item is read whole even when nt is not a multiple of 8; past the
+                    // final pair those rows are the next expert's, and at a full block the very last item runs
+                    // off the end of the activation array (a page-aligned alloc: the read faults).  Re-read the
+                    // last row instead; its token columns are discarded with the rest of the partial slice.
+                    const uint32_t br = base + bt < act_rows ? base + bt : act_rows - 1u;
+                    bx[c] = __ldg(reinterpret_cast<const uint4*>(act + static_cast<uint64_t>(br) * k_cols +
                                                                static_cast<uint64_t>(i) * kPfK + bc * 8u));
+                }
             }
         };
         load_round(0);
@@ -277,7 +283,7 @@ __global__ void pf_reduce_kernel(float* __restrict__ out, const float* __restric
 template <int EXT, int MODE, int CB>
 bool pf_launch(uint16_t* g16, uint16_t* h16, float* ys, const uint8_t* blob, uint64_t blob_size,
                const Deepseek4MoePrefillScratch* s, const uint16_t* act, uint32_t nitems, uint32_t m_rows,
-               uint32_t k_cols, uint32_t nc, float clamp, cudaStream_t stream) {
+               uint32_t k_cols, uint32_t nc, float clamp, uint32_t act_rows, cudaStream_t stream) {
     const uint32_t shb = (CB ? nc * 16u : 0u) + kPfTileBytes;
     cudaError_t ce = cudaFuncSetAttribute(pf_mma_kernel<EXT, MODE, CB>,
                                           cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shb));
@@ -304,7 +310,7 @@ bool pf_launch(uint16_t* g16, uint16_t* h16, float* ys, const uint8_t* blob, uin
     const uint64_t nwork = static_cast<uint64_t>(nitems) * ntile;
     const uint32_t grid = static_cast<uint32_t>(std::min<uint64_t>(nwork, static_cast<uint64_t>(nsm) * occ));
     pf_mma_kernel<EXT, MODE, CB><<<grid, kPfThreads, shb, stream>>>(
-        g16, h16, ys, blob, blob_size, s->items, nitems, act, s->off, m_rows, k_cols, clamp, nc, s->cb16);
+        g16, h16, ys, blob, blob_size, s->items, nitems, act, s->off, m_rows, k_cols, clamp, nc, s->cb16, act_rows);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -328,15 +334,18 @@ bool deepseek4_moe_prefill_sizes(uint32_t pairs_cap, uint32_t n_expert, uint32_t
     return true;
 }
 
-bool deepseek4_routed_moe_prefill(float* d_out, float* d_ys, const void* d_blob, uint64_t blob_size,
-                                  uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim, const int32_t* sel_host,
-                                  const float* d_w, uint32_t topk, float clamp, const float* d_x, uint32_t n_tok,
-                                  uint32_t n_expert, uint32_t nc, uint32_t blob_v3,
-                                  Deepseek4MoePrefillScratch* s, void* stream_void) {
-    cudaStream_t stream = static_cast<cudaStream_t>(stream_void);
-    if (s == nullptr || d_out == nullptr || d_ys == nullptr || d_blob == nullptr || sel_host == nullptr ||
-        d_w == nullptr || d_x == nullptr || s->items == nullptr || s->perm == nullptr || s->inv == nullptr ||
-        s->off == nullptr || s->xs == nullptr || s->g16 == nullptr || s->h16 == nullptr || s->cb16 == nullptr) {
+namespace {
+
+// The plan and the three stages, with no reduce.  host_slots gives every negative selection entry a d_ys slot
+// after the sorted GPU rows (the --cpu-moe split); without it a negative entry is skipped, which is the full
+// entry's documented behavior and the only plan the default path ever makes.
+bool prefill_partial_impl(float* d_ys, const void* d_blob, uint64_t blob_size, uint32_t in_dim, uint32_t mid_dim,
+                          uint32_t out_dim, const int32_t* sel_host, uint32_t topk, float clamp, const float* d_x,
+                          uint32_t n_tok, uint32_t n_expert, uint32_t nc, uint32_t blob_v3, bool host_slots,
+                          Deepseek4MoePrefillScratch* s, cudaStream_t stream) {
+    if (s == nullptr || d_ys == nullptr || d_blob == nullptr || sel_host == nullptr || d_x == nullptr ||
+        s->items == nullptr || s->perm == nullptr || s->inv == nullptr || s->off == nullptr || s->xs == nullptr ||
+        s->g16 == nullptr || s->h16 == nullptr || s->cb16 == nullptr) {
         return false;
     }
     if (blob_v3 == 0) return false;   // v2's f16 codebook loses mantissa bits to bf16: the per-pair arm stays
@@ -370,6 +379,14 @@ bool deepseek4_routed_moe_prefill(float* d_out, float* d_ys, const void* d_blob,
             perm[p] = static_cast<int32_t>(i);
             inv[i] = static_cast<int32_t>(p);
         }
+    }
+    if (host_slots) {
+        // Every pair the GPU leaves alone has one slot after the sorted rows, in pair order.  No item names it,
+        // so it stays untouched until the host fills it.
+        uint32_t p = nvalid;
+        for (uint64_t i = 0; i < npairs; i++)
+            if (inv[i] < 0) inv[i] = static_cast<int32_t>(p++);
+        if (p != npairs) return false;
     }
     std::vector<Deepseek4MoePrefillItem> items;
     items.reserve(static_cast<size_t>(nvalid / kPfTok + n_expert));
@@ -407,24 +424,98 @@ bool deepseek4_routed_moe_prefill(float* d_out, float* d_ys, const void* d_blob,
         bool ok;
         if (ext) {
             ok = pf_launch<1, 0, 0>(s->g16, nullptr, nullptr, static_cast<const uint8_t*>(d_blob), blob_size, s,
-                                    s->xs, nitems, mid_dim, in_dim, nc, clamp, stream) &&
+                                    s->xs, nitems, mid_dim, in_dim, nc, clamp, nvalid, stream) &&
                  pf_launch<1, 1, 0>(s->g16, s->h16, nullptr, static_cast<const uint8_t*>(d_blob), blob_size, s,
-                                    s->xs, nitems, mid_dim, in_dim, nc, clamp, stream) &&
+                                    s->xs, nitems, mid_dim, in_dim, nc, clamp, nvalid, stream) &&
                  pf_launch<1, 2, 0>(nullptr, nullptr, d_ys, static_cast<const uint8_t*>(d_blob), blob_size, s,
-                                    s->h16, nitems, out_dim, mid_dim, nc, clamp, stream);
+                                    s->h16, nitems, out_dim, mid_dim, nc, clamp, nvalid, stream);
         } else {
             ok = pf_launch<0, 0, 1>(s->g16, nullptr, nullptr, static_cast<const uint8_t*>(d_blob), blob_size, s,
-                                    s->xs, nitems, mid_dim, in_dim, nc, clamp, stream) &&
+                                    s->xs, nitems, mid_dim, in_dim, nc, clamp, nvalid, stream) &&
                  pf_launch<0, 1, 1>(s->g16, s->h16, nullptr, static_cast<const uint8_t*>(d_blob), blob_size, s,
-                                    s->xs, nitems, mid_dim, in_dim, nc, clamp, stream) &&
+                                    s->xs, nitems, mid_dim, in_dim, nc, clamp, nvalid, stream) &&
                  pf_launch<0, 2, 1>(nullptr, nullptr, d_ys, static_cast<const uint8_t*>(d_blob), blob_size, s,
-                                    s->h16, nitems, out_dim, mid_dim, nc, clamp, stream);
+                                    s->h16, nitems, out_dim, mid_dim, nc, clamp, nvalid, stream);
         }
         if (!ok) return false;
     }
-    const dim3 rgrid((out_dim + 255u) / 256u, n_tok);
-    pf_reduce_kernel<<<rgrid, 256, 0, stream>>>(d_out, d_ys, s->inv, d_w, topk, out_dim);
-    if (cudaGetLastError() != cudaSuccess) return false;
+    return true;
+}
+
+// ys[inv[pair_of[r]]] = the host's bf16 row r.  `rows` is mapped pinned host memory: the device reads each row
+// where the host wrote it.
+__global__ void pf_fill_cpu_kernel(float* __restrict__ ys, const int32_t* __restrict__ inv,
+                                   const int32_t* __restrict__ pair_of, const uint16_t* __restrict__ rows,
+                                   uint32_t n_rows, uint32_t out_dim) {
+    const uint32_t r = blockIdx.y, o = blockIdx.x * 256u + threadIdx.x;
+    if (r >= n_rows || o >= out_dim) return;
+    const int32_t p = inv[pair_of[r]];
+    if (p < 0) return;
+    ys[static_cast<uint64_t>(p) * out_dim + o] =
+        __uint_as_float(static_cast<uint32_t>(rows[static_cast<uint64_t>(r) * out_dim + o]) << 16);
+}
+
+}  // namespace
+
+bool deepseek4_routed_moe_prefill(float* d_out, float* d_ys, const void* d_blob, uint64_t blob_size,
+                                  uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim, const int32_t* sel_host,
+                                  const float* d_w, uint32_t topk, float clamp, const float* d_x, uint32_t n_tok,
+                                  uint32_t n_expert, uint32_t nc, uint32_t blob_v3,
+                                  Deepseek4MoePrefillScratch* s, void* stream_void) {
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_void);
+    if (d_out == nullptr || d_w == nullptr) return false;
+    if (!prefill_partial_impl(d_ys, d_blob, blob_size, in_dim, mid_dim, out_dim, sel_host, topk, clamp, d_x, n_tok,
+                              n_expert, nc, blob_v3, /*host_slots=*/false, s, stream)) {
+        return false;
+    }
+    return deepseek4_routed_moe_prefill_reduce(d_out, d_ys, s->inv, d_w, topk, n_tok, out_dim, stream_void);
+}
+
+bool deepseek4_routed_moe_prefill_partial(float* d_ys, const void* d_blob, uint64_t blob_size, uint32_t in_dim,
+                                          uint32_t mid_dim, uint32_t out_dim, const int32_t* sel_host, uint32_t topk,
+                                          float clamp, const float* d_x, uint32_t n_tok, uint32_t n_expert,
+                                          uint32_t nc, uint32_t blob_v3, Deepseek4MoePrefillScratch* scratch,
+                                          void* stream_void) {
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_void);
+    return prefill_partial_impl(d_ys, d_blob, blob_size, in_dim, mid_dim, out_dim, sel_host, topk, clamp, d_x, n_tok,
+                                n_expert, nc, blob_v3, /*host_slots=*/true, scratch, stream);
+}
+
+bool deepseek4_routed_moe_prefill_fill_cpu(float* d_ys, const int32_t* d_inv, const int32_t* d_pair_of,
+                                           const uint16_t* d_rows, uint32_t n_rows, uint32_t out_dim,
+                                           void* stream_void) {
+    if (d_ys == nullptr || d_inv == nullptr || d_pair_of == nullptr || d_rows == nullptr) return false;
+    if (n_rows == 0 || out_dim == 0) return true;   // nothing to fill
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_void);
+    // grid.y is capped at 65535 blocks; a very wide block fills in row groups.  The row and its pair index
+    // both start at r0, so the kernel's r * out_dim stays relative to the pointers it is handed.
+    constexpr uint32_t kRowGroup = 65535u;
+    for (uint32_t r0 = 0; r0 < n_rows; r0 += kRowGroup) {
+        const uint32_t nr = (n_rows - r0 < kRowGroup) ? (n_rows - r0) : kRowGroup;
+        const dim3 grid((out_dim + 255u) / 256u, nr);
+        pf_fill_cpu_kernel<<<grid, 256, 0, stream>>>(
+            d_ys, d_inv, d_pair_of + r0, d_rows + static_cast<uint64_t>(r0) * out_dim, nr, out_dim);
+        if (cudaGetLastError() != cudaSuccess) return false;
+    }
+    return true;
+}
+
+bool deepseek4_routed_moe_prefill_reduce(float* d_out, const float* d_ys, const int32_t* d_inv, const float* d_w,
+                                         uint32_t topk, uint32_t n_tok, uint32_t out_dim, void* stream_void) {
+    if (d_out == nullptr || d_ys == nullptr || d_inv == nullptr || d_w == nullptr) return false;
+    if (topk == 0 || n_tok == 0 || out_dim == 0) return false;
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_void);
+    // grid.y is capped at 65535 blocks; tile the token axis in groups.  inv and w are token-major, out is
+    // token-major, and ys is indexed by the (global) pair index inv yields.
+    constexpr uint32_t kTokGroup = 65535u;
+    for (uint32_t t0 = 0; t0 < n_tok; t0 += kTokGroup) {
+        const uint32_t nt = (n_tok - t0 < kTokGroup) ? (n_tok - t0) : kTokGroup;
+        const dim3 rgrid((out_dim + 255u) / 256u, nt);
+        pf_reduce_kernel<<<rgrid, 256, 0, stream>>>(
+            d_out + static_cast<uint64_t>(t0) * out_dim, d_ys, d_inv + static_cast<uint64_t>(t0) * topk,
+            d_w + static_cast<uint64_t>(t0) * topk, topk, out_dim);
+        if (cudaGetLastError() != cudaSuccess) return false;
+    }
     return true;
 }
 

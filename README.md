@@ -13,6 +13,25 @@ Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Nex
 large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
 and coding agents. Nothing leaves your PC.
 
+## DeepSeek V4.1 Flash (this fork)
+
+This fork adds a second engine: **DeepSeek V4.1 Flash**, a 40-layer, 384-expert mixture-of-experts model that
+runs on one to four consumer graphics cards with the expert payloads in host RAM. It is CUDA-only and entirely
+opt-in; the Qwen engine, the installer and the default path above are unchanged.
+
+Measured on a four-card machine (2 x RTX 3060 12 GB + 2 x RTX 5060 8 GB, 247 GiB RAM):
+
+| what | this machine |
+| --- | --- |
+| Reads your prompt | **200.8 tok/s** at 8,160 tokens; **203.7-204.3 tok/s** at 4,687 |
+| Writes answers | 3.6-4.5 tok/s (expert cache on, 81% of expert picks hit) |
+| Model | a 105.8 GiB image in 40 parts, plus 189.2 GiB of engram shards |
+
+Every driver and server flag with its explanation and default, the build command, the exact serving command,
+all measured speeds with their configurations, the memory fit (`--reserve-container`), and what was not tested
+are in **[README-DEEPSEEK4.md](README-DEEPSEEK4.md)**. The long-form engineering record is
+[docs/DEEPSEEK4.md](docs/DEEPSEEK4.md).
+
 ## How fast is it?
 
 We measured it on two ordinary gaming PCs. A token is about ¾ of a word.

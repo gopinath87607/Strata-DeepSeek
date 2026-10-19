@@ -970,6 +970,27 @@ forward exits 1, and the server's next request starts a fresh driver.
 `--dspark` is refused with `--serve`.  The server's `--serve-ctx` defaults to
 16384; the context you actually want to serve has to be passed.
 
+A client that goes away no longer costs a reload.  When a stream write fails,
+the server sends the driver `SIGUSR1`; the handler sets a flag that `run()`
+checks at the top of every decode token and every prefill chunk.  The driver
+finishes the step it is in, drains the work already queued on each stage,
+prints the ids and `generated=...` it had, then `done`, and stays resident.
+A signal that arrives while no request is running is ignored (it can only be
+a late one for the request that just ended, and honoring it would cut the next
+request short at its first token).  On platforms without `SIGUSR1` the old
+path remains: the server drains to `done` for up to 600 s, then restarts the
+driver.  The server also checks a prompt against the same
+`min(--ctx, --serve-ctx)` limit before it writes a request, so an oversized
+prompt is a 400 and the driver is never touched.
+
+Measured on 2026-10-19 with the four-card serving flags above: a client read
+three SSE chunks and hung up at 2.07 s; the driver stopped after 4 tokens
+(1.26 s of decode, `[cancelled]` in its log), the server logged `client
+disconnected; the engine stays resident`, and the next request (`That's 4.`,
+6 tokens) ran on the same process in 2.91 s.  A `SIGUSR1` sent while the
+driver sat idle did not disturb the next request.  A 9,005-token prompt was
+refused with a 400 in 0.03 s, before any load.
+
 Resident mode resets only what belongs to a request: `n_past_`, `in_decode_`,
 the group-completion counters and snapshots, the engram n-gram history
 (`hist_` - a longer previous prompt must not feed the next prompt's window),
@@ -1023,6 +1044,52 @@ drop is the whole price of serving the full context resident.
 python3 tools/dsv4/dsv4_server.py --port 8080 --devices 0,1,2,3 --chunk 0 \
     --engram-feed --ram-image --expert-cache-mib 1100,1950,5000,4096 --serve-ctx 1048576
 ```
+
+### The long prompt's fit, measured (`--reserve-container`)
+
+A prompt block's expert selection is only known at run time, and a multi-thousand-row block can select every one
+of its stage's 384 experts.  Without the flag the driver grows the expert container when that happens - a
+`cudaMalloc` of up to 2,639.7 MiB for stage 0's 384 experts (10 layers, 7,208,056 B a slot) - while the state,
+the index scratch and the expert cache are already resident.  On 2026-10-19 a 4,667-token request through the
+server died 2.18 s in on stage 0 (CUDA device 0, an 8 GB RTX 5060) with `cudaMalloc candidate blocks (8392704
+bytes): out of memory`: the explicit `--chunk 1024` had skipped the auto-chunk fit check, and the 8 MiB index
+scratch was the allocation with no room left.  The 2,500 MiB cache in that plan filled the card first.
+
+`--reserve-container` (opt-in; off by default) makes the fit a startup decision.  During `alloc_state`, before the
+expert cache, each stage allocates its worst-case container (all of its layers' experts) and its index scratch
+for a full chunk; the run prints the reserve and the free memory either side of the cache:
+
+```
+[v41] expert container: stage 0 reserved 2639.7 MiB (all 384 experts)
+[v41] stage 0: 2151 MiB free before the expert cache (state + full-chunk reserve)
+[v41] stage 0: state + cache + full-chunk reserve + moe scratch resident, 535 MiB free
+```
+
+If the plan does not fit, startup fails with the stage and the flag to lower; a request then never allocates.
+Measured on 2026-10-19 with the serving flags above, `--chunk 1024 --serve-ctx 8192` and the caches
+1500,1500,5000,5000 MiB: all four stages fit - 535 MiB free on stage 0, 915 on stage 1 (the two 8 GB cards),
+1,660 on stage 2 and 1,747 on stage 3 (the two 12 GB cards).  The 4,687-token request (the prompt file's 4,683
+tokens plus the chat template) that used to die now completes twice on one resident engine, 22.99 s and 22.94 s
+of prefill (203.9 and 204.3 tok/s), returning the same single token both times.  The same 2,500 MiB cache plan
+with the reserve fails at startup instead, on stage 0, with `lower this stage's --expert-cache-mib; the state and
+the prompt reserve are already resident`.  The default path (no flag) still grows lazily.
+
+### CPU MoE in decode, measured
+
+`--cpu-moe N --cpu-moe-decode` divides each layer's routed experts between the host (the N hottest) and the
+GPUs, the Qwen/Maya-style split.  Under `--stage-pipeline` the pipelined prefill is `layer_front`/`layer_back`,
+which have no host arm, so the combination is refused without `--cpu-moe-decode`: there the host's share is
+decode-only, through the serial `block()->layer()->moe()` path.
+
+Measured on 2026-10-19 on the four-card rig with the serving flags above, `--cpu-moe 2 --cpu-moe-share 40
+--cpu-moe-threads 28`: the host took 2 of the 6 experts on each layer.  On the 37-token prompt it computed
+1,555 of 8,880 pairs (17.5%) in 2.57 s while the GPU arm took 0.41 s; its rate in this path was about 605
+pairs/s.  The same 48-token reply then decoded at **1.74 tok/s against 3.57 tok/s with the GPUs alone** - the
+host's two experts add about 0.13 s to a 0.28 s token.  At the measured 605 pairs/s, even one expert a layer
+would add about 66 ms a token, so no share is free.  Decode is a serial 40-layer chain: the host's work sits on
+the critical path, and the GPU arm's four remaining pairs are not what the token waits on (staging misses and
+the chain are), so removing them buys nothing.  The option stays opt-in and off by default, and on this machine
+it is slower; a faster host kernel or a slower GPU could change that, and no other share was tested.
 
 ### The RAM image, measured (`--ram-image`)
 

@@ -18,7 +18,7 @@
 //            [--devices 0,1,2,3] [--ledger] [--expert-cache-mib N[,N...]]
 //            [--dspark [--dspark-verify K] [--dspark-trace]]
 //            [--temperature T] [--top-p P] [--min-p M] [--top-k K] [--seed S] [--stop-eos] [--stream-ids]
-//            [--engram-feed [--engram-kick]] [--ram-image] [--moe-prefill [--moe-prefill-check]]
+//            [--engram-feed] [--ram-image] [--moe-prefill [--moe-prefill-check]]
 //
 // The runner takes token ids, not text: the tokenizer is Python (tools/strata_tokenizer.py); see
 // tools/dsv4/dsv4_prompt.py for the text wrapper.
@@ -31,6 +31,7 @@
 #include <cerrno>
 #include <cinttypes>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +41,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <signal.h>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
@@ -60,8 +62,11 @@
 #include "strata/kernels/deepseek4_prefill.hpp"
 #include "strata/kernels/deepseek4_vq.hpp"
 
+#include "cpu_vq_moe.hpp"
+
 namespace d4 = strata::deepseek4;
 namespace k = strata::kernels;
+namespace dsv4cpu = strata::dsv4cpu;
 using strata::GgufFile;
 using strata::TensorInfo;
 
@@ -83,6 +88,44 @@ double now_sec() {
     return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
 }
 
+// --serve cancel: a client that hangs up must not cost a full reload.  The server raises SIGUSR1, the handler
+// only sets the flag, and run() checks it between tokens and between prefill chunks.  The request then ends
+// through its ordinary tail (generated=..., then done) and the driver stays resident for the next one.
+// A signal that arrives while no request is running is ignored (`in_request`): it can only be a late one for
+// the request that just ended, and honoring it would cut the next request short at its first token.  SIGUSR1
+// and <csignal> exist on this driver's POSIX builds; elsewhere the server's drain deadline is the fallback.
+#ifdef SIGUSR1
+volatile std::sig_atomic_t g_cancel = 0;
+volatile std::sig_atomic_t g_in_request = 0;
+void on_cancel_signal(int) {
+    if (g_in_request) g_cancel = 1;
+}
+bool cancel_requested() { return g_cancel != 0; }
+void begin_request() {
+    g_cancel = 0;
+    g_in_request = 1;
+}
+void end_request() {
+    g_in_request = 0;
+    g_cancel = 0;
+}
+void install_cancel_handler() {
+    // SA_RESTART: the handler must not turn a signal aimed at the run loop into a failed stdin read while the
+    // driver waits for its next request.
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_cancel_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGUSR1, &sa, nullptr);
+}
+#else
+bool cancel_requested() { return false; }
+void begin_request() {}
+void end_request() {}
+void install_cancel_handler() {}
+#endif
+
 uint32_t rd32(const uint8_t* p) {
     uint32_t v;
     std::memcpy(&v, p, 4);
@@ -95,6 +138,18 @@ uint64_t rd64(const uint8_t* p) {
 }
 void wr32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
 void wr64(uint8_t* p, uint64_t v) { std::memcpy(p, &v, 8); }
+
+// --cpu-moe: copy the host's partial rows into the device's per-pair array.  `src` is the pinned, mapped host
+// buffer (the CPU's bf16 output); row r belongs to pair pair_of[r] (token * topk + k).  One thread per output
+// column, one block row per host row.
+__global__ void cpu_moe_scatter_kernel(float* __restrict__ partial, const uint16_t* __restrict__ src,
+                                       const int32_t* __restrict__ pair_of, uint32_t n_rows, uint32_t out_dim) {
+    const uint32_t row = blockIdx.y;
+    const uint32_t o = blockIdx.x * 256u + threadIdx.x;
+    if (row >= n_rows || o >= out_dim) return;
+    const uint32_t u = static_cast<uint32_t>(src[static_cast<uint64_t>(row) * out_dim + o]) << 16;
+    partial[static_cast<uint64_t>(pair_of[row]) * out_dim + o] = __uint_as_float(u);
+}
 
 // ---- The 40-part image ----------------------------------------------------------------------------------------
 
@@ -369,6 +424,10 @@ struct Options {
     // while the current block computes, and each engram layer then only waits for its buffer and uploads it.
     // Off by default: the synchronous path is unchanged and the default run stays byte-identical.
     bool engram_feed = false;
+    // --engram-scale-cache (opt-in): read each table's scale plane into host RAM once, so a prompt row costs one
+    // random pread (its 256 weight bytes) instead of two (weights and 8 scale bytes).  Off by default: the
+    // default path stays byte-identical, and this only changes where the same bytes come from.
+    bool engram_scale_cache = false;
     bool check = true;   // the inventory check (header only)
     std::string logits_out;
     // DSpark: the MTP towers draft, the main forward verifies, the cache rolls back.  Off unless asked, and the
@@ -397,6 +456,17 @@ struct Options {
     // number applies to every stage; a comma list gives one budget per stage (see --devices).  Empty is off and
     // changes nothing: the default path stays byte-identical to the run without this switch.
     std::vector<uint32_t> expert_cache_mib;
+    // --expert-cache-decode-only (opt-in, needs --expert-cache-mib): look up and admit slots only for blocks of at
+    // most kGemvMaxTok rows (decode).  A multi-thousand-row prefill selects nearly every expert of every layer, so
+    // admitting it would evict the hot set the decode steps reuse.  Off by default: every block uses the cache.
+    bool expert_cache_decode_only = false;
+    // --reserve-container (opt-in): allocate each stage's worst-case expert container (every expert its layers can
+    // select) and the index scratch for a full chunk while the state is sized, before the expert cache.  A prompt
+    // block's selection is only known at run time and can reach all 384 experts; growing the container then is a
+    // cudaMalloc that can fail with the cache and the state already resident (measured: a 4,667-token request died
+    // 8 MiB short).  With this switch the fit is decided at startup, the reserve is printed per stage, and a
+    // request never allocates.  Off by default: the driver keeps growing the buffers lazily.
+    bool reserve_container = false;
     // RAM image (opt-in): the whole assembled image in host memory, read once at start.  Off by default, and the
     // default path stays byte-identical: every read still goes to the parts.  On, an expert-cache miss is copied
     // straight from the (pinned, when the driver allows it) image to the device container instead of being read
@@ -409,6 +479,33 @@ struct Options {
     // three layers and prints both results' scale, max difference and equality count.
     bool moe_prefill = false;
     bool moe_prefill_check = false;
+    // CPU MoE (opt-in, needs --ram-image): the same split Qwen and Maya use.  Each prefill layer's routed
+    // experts are divided between the host and the GPU: the N most-selected experts (or as many as
+    // --cpu-moe-share's percentage of the pairs needs, if that is smaller) are computed on the CPU out of the
+    // resident RAM image and their selections are marked -1 in the
+    // device arm's table.  With --moe-prefill the batched arm plans those pairs as host slots after the sorted
+    // GPU rows, the CPU workers fill them, and its reduce sums every pair; without it the per-pair arm writes
+    // zeros and the tail sums both halves.  The CPU workers overlap the GPU arm either way.  0 is off, and the
+    // default path stays byte-identical.  Blocks of kGemvMaxTok tokens or fewer and decode keep the plain path.
+    // Under --stage-pipeline the prefill is layer_front/layer_back, which have no host arm, so the combination is
+    // refused without --cpu-moe-decode: there the host's share is decode-only (the serial block->layer->moe arm).
+    uint32_t cpu_moe = 0;
+    // --cpu-moe-share PCT: take the hottest experts until PCT percent of the block's pairs are the host's,
+    // instead of a fixed expert count.  The expert skew is steep (48 of 384 carried 81% of the pairs on the
+    // measured 128-token block), so a pair share is the dial that tracks the host's work.  N stays a cap.
+    uint32_t cpu_moe_share = 0;
+    // Worker threads for --cpu-moe.  0 picks half the hardware threads (the physical-core count on an SMT
+    // part, which is what the kernel's measurement used on this 28-core/56-thread box).
+    uint32_t cpu_moe_threads = 0;
+    // --cpu-moe-check: on the first three prefill layers, recompute up to two GPU-owned experts on the CPU for
+    // their first eight tokens and print the two partials' scale, max difference, relative and exact count.
+    bool cpu_moe_check = false;
+    // --cpu-moe-decode (opt-in): hand the host its share in decode too, and in prefill blocks of kGemvMaxTok
+    // tokens or fewer (a short prompt never reaches the block path).  Those steps take the per-pair fallback,
+    // which writes zeros for the host's pairs, and the scatter below fills them from the pinned rows, so the
+    // result is the same tail reduce as a mixed prefill block.  Off by default: decode and short blocks keep
+    // the plain path byte-identical.
+    bool cpu_moe_decode = false;
     // --pf-time (diagnostic, opt-in): per layer, the time from the router's sync to the container's last byte
     // (staging: the host table build plus every copy queued by stage_blob) and from there to the routed MoE
     // kernel's end.  Prints one line per layer; the default path records no events.
@@ -431,6 +528,13 @@ struct Options {
     // the cache used to be reserved beside the whole container -- the chunk grows by the cache's bytes.  Off by
     // default and the default path is unchanged.
     bool expert_loan = false;
+    // --stage-pipeline (opt-in, needs 2+ stages and more than one chunk): the prefill chunks flow through the
+    // stages concurrently instead of one stage after another.  Each layer is issued in two phases -- a front
+    // (engram, attention, the router) that every stage enqueues before any stage is awaited, and a back (expert
+    // staging and the routed MoE) that runs once the router's selection has been read back -- so the four
+    // devices' kernels run at the same time and the host's waits overlap them.  Chunk k passes from stage s to
+    // s + 1 through a ring of pinned hand-off slots.  Off by default; the serial path is unchanged.
+    bool stage_pipeline = false;
 };
 
 // ---- The runner -----------------------------------------------------------------------------------------------
@@ -503,16 +607,29 @@ private:
 
     bool block(const int32_t* ids, uint32_t n, bool head, bool head_all, std::string& err);
     bool layer(uint32_t il, std::string& err);
+    // --stage-pipeline: one layer in two host phases.  front() issues everything through the router and queues
+    // the selection's readback on the stage's stream; back() waits for that readback, stages the experts and
+    // runs the routed MoE and the layer's tail.  layer() is front() then back() and is the serial path's unit.
+    bool layer_front(uint32_t il, std::string& err);
+    bool layer_back(uint32_t il, std::string& err);
+    bool prefill_pipeline(const std::vector<int32_t>& prompt, std::string& err);
     bool hc_half(uint32_t il, bool attn_half, std::string& err);
     bool attn(uint32_t il, std::string& err);
     bool compress_source(uint32_t il, uint32_t ratio, std::string& err);
     bool index_source(uint32_t il, uint32_t ratio, std::string& err);
     bool moe(uint32_t il, std::string& err);
+    // ---- CPU MoE (--cpu-moe) ----
+    bool cpu_moe_open(std::string& err);                        // once: open every layer on the RAM image
+    bool cpu_moe_buffers(uint32_t n, std::string& err);         // pinned host buffers for this block
+    bool cpu_moe_plan(uint32_t il, uint32_t n, std::string& err);   // ownership, -1 marks, jobs
+    // CPU vs GPU partials; `sorted` says the GPU arm left them in sorted-slot order (partial_ arm) rather
+    // than at the pair index (per-pair arm), in which case d_inv maps a pair to its slot.
+    bool cpu_moe_check_layer(uint32_t il, uint32_t n, bool sorted, const int32_t* d_inv, std::string& err);
     bool engram_layer(uint32_t il, std::string& err);
     // ---- Engram feed (P7, opt-in): the reference's prepare / wait / prefetch_next ----
     bool engram_feed_prepare(uint32_t pos0, const int32_t* ids, uint32_t n, std::string& err);
     void engram_feed_prefetch(uint32_t pos0, const int32_t* hist, const int32_t* ids, uint32_t n);
-    bool engram_feed_wait(uint32_t ei, std::string& err);
+    bool engram_feed_wait(uint32_t ei, uint32_t pos0, uint32_t n, uint32_t& slot, std::string& err);
     bool engram_feed_start(uint32_t ei, int slot, uint32_t pos0, const int32_t* hist, size_t hist_len,
                            const int32_t* ids, uint32_t n);
     void engram_feed_close();
@@ -529,7 +646,7 @@ private:
     int draft_round(int32_t tok, uint32_t pos_main, std::string& err);
     bool spec_snapshot(uint32_t n, std::string& err);
     bool spec_rollback(uint32_t keep, std::string& err);
-    void probe(const char* tag, void* d, uint64_t n_floats);
+    void probe(const char* tag, const void* d, uint64_t n_floats, uint32_t pos0);
     float theta_of(uint32_t ratio) const {
         return ratio ? static_cast<float>(geo.compress_rope_freq_base) : static_cast<float>(geo.rope_freq_base);
     }
@@ -554,11 +671,13 @@ private:
     uint32_t cpend_[64] {};                     // per ratio>1 kv source: pending rows
     int engram_of_[64];                         // per layer: engram table index, or -1
     uint32_t kcap_ = 0, cand_bs_ = 0, cand_src_layer_ = 0;
+    uint32_t dump_il_ = ~0u;   // STRATA_V4_DUMP_IL: one layer to probe under --trace (measurement only)
     int cand_owner_ = -1, idx_owner_ = -1;
     uint32_t idx_topk_ = 0;
     uint32_t n_past_ = 0;
     bool state_ready_ = false;    // --serve: the one state allocation is in place (see prepare_request)
     uint32_t state_total_ = 0;    // the token count it was sized for
+    bool cancelled_ = false;      // the request was cut short by SIGUSR1 (--serve); see run()
 
     LayerW L_[64];
     void* tok_embd_ = nullptr;
@@ -674,30 +793,74 @@ private:
     std::vector<float> probe_host_;
     std::vector<int64_t> erow_ids_;
     std::vector<uint8_t> eraw_host_;
-    // The feed's two host buffers per engram layer, the row ids computed on the main thread (the hash is
+    // The feed's host buffers per engram layer and the row ids computed on the main thread (the hash is
     // stateful and stays there), and the payload the worker reads.  One job per (layer, slot); an event per
     // (layer, slot), recorded after the slot's upload, keeps a worker from overwriting a buffer whose H2D may
-    // still be reading it.  `cur` is the slot the block in hand uses, -1 until the first prepare.
+    // still be reading it.  Slots are keyed by the block they hold, not by a current index: the pipeline has
+    // several blocks in flight (a chunk's L14 rows wait while later chunks are prepared), so prepare() finds an
+    // existing key or a free slot, and wait() matches the calling block's (pos0, n).
     struct FeedJob {
         std::thread th;
         bool running = false;
         bool done = false;   // `pos0`/`n` rows are in the slot
+        bool live = false;   // some block in flight still needs this slot's rows
         uint32_t pos0 = 0, n = 0;
         bool ok = true;
         std::string err;
     };
-    std::vector<std::array<FeedJob, 2>> efeed_;
-    std::vector<std::array<std::vector<uint8_t>, 2>> efeed_raw_;
-    std::vector<std::array<std::vector<int64_t>, 2>> efeed_ids_;
-    std::vector<std::array<cudaEvent_t, 2>> efeed_ev_;
-    std::vector<std::array<bool, 2>> efeed_ev_set_;
-    std::vector<int> efeed_cur_;
+    std::vector<std::vector<FeedJob>> efeed_;                 // [engram layer][slot]
+    std::vector<std::vector<std::vector<uint8_t>>> efeed_raw_;
+    std::vector<std::vector<std::vector<int64_t>>> efeed_ids_;
+    std::vector<std::vector<cudaEvent_t>> efeed_ev_;
+    std::vector<std::vector<bool>> efeed_ev_set_;
     std::vector<int> efeed_dev_;
+    uint32_t feed_slots_ = 0;
     std::vector<int32_t> pos_host_;
     std::vector<int32_t> dpos_host_;   // the block's positions, kept apart from pos_host_ (compress_source's scratch)
     std::vector<int32_t> sel_host_;
     std::vector<uint32_t> uniq_;
     std::vector<float> logits_host_;
+
+    // ---- CPU MoE (--cpu-moe) ----
+    // One layer: the expanded codebook and all 384 experts' three matrices, opened once on the RAM image.
+    // Matrix pointers stay inside the image, which lives for the run; cb is fixed-size before any Matrix
+    // points at it.
+    struct CpuLayer {
+        std::vector<uint16_t> cb;            // nc*8 bf16 (E4M3 is exact in bf16)
+        std::vector<dsv4cpu::Matrix> m;      // experts*3: gate, up, down per expert
+        bool ready = false;
+    };
+    std::vector<CpuLayer> cpu_layers_;
+    std::unique_ptr<dsv4cpu::JobPool> cpu_pool_;
+    uint32_t cpu_threads_ = 0;
+    float* cpu_x_host_ = nullptr;        // pinned: the block's activations, n * E_ floats
+    uint64_t cpu_x_cap_ = 0;             // floats it holds
+    uint16_t* cpu_out_host_ = nullptr;   // pinned and mapped: CPU partial rows, bf16, rows * E_
+    uint16_t* cpu_out_dev_ = nullptr;    // the same buffer's device view (the scatter kernel reads it)
+    uint64_t cpu_out_rows_ = 0;          // rows it holds
+    // The batched split arm returns without synchronizing, so its wall time is taken between two events on the
+    // layer's stream: the entry's launches to the last down-stage kernel.  One pair per stage: a stage runs on its
+    // own device, and an event created under one device's context cannot be recorded under another's.
+    cudaEvent_t cpu_ev_[8][2] = {};
+    int32_t* cpu_pair_dev_[8] {};        // per stage: the pair index of each CPU row (cap_ * KU_ ints)
+    std::vector<int32_t> cpu_sel_keep_;  // the router's selection before the CPU pairs are marked -1
+    std::vector<int32_t> cpu_pair_host_; // this layer: CPU row -> (token * KU_ + k)
+    std::vector<uint32_t> cpu_count_;    // per expert: this block's pairs
+    std::vector<uint8_t> cpu_owner_;     // per expert: 1 when the CPU computes it
+    std::vector<uint32_t> cpu_toks_;     // the jobs' token lists, job by job
+    std::vector<uint32_t> cpu_job_off_;  // job j's first token in cpu_toks_
+    std::vector<uint32_t> cpu_job_rows_; // job j's first output row
+    std::vector<dsv4cpu::Job> cpu_jobs_;
+    // --cpu-moe-check: the GPU-owned experts the CPU recomputes, and where their rows and pairs are.
+    struct CpuCheck {
+        uint32_t job = 0, row = 0, pair = 0;
+    };
+    std::vector<CpuCheck> cpu_check_;
+    uint32_t cpu_checked_ = 0;
+    // report counters (one line after the prefill)
+    uint64_t cpu_rows_total_ = 0, cpu_pairs_total_ = 0;
+    double cpu_sec_total_ = 0.0, cpu_arm_sec_total_ = 0.0;
+    bool cpu_note_ = false;
     // P6 sampling: the sorted (score, id) work list and the seeded xorshift128+ state.  The readback that feeds
     // it is the one the argmax path already does, so a sampled step costs the sort, not another transfer.
     std::vector<std::pair<float, uint32_t>> samp_work_;
@@ -726,6 +889,72 @@ private:
     std::vector<uint8_t> seen_exp_;   // (layer, expert) slots staged at least once (--ledger's repeat count)
     uint64_t st_blocks_pre_ = 0, st_blocks_dec_ = 0;
     bool in_decode_ = false;
+
+    // ---- P9 stage pipeline (opt-in) ----
+    // Per-stage progress through the chunk list and the scalars a layer mutates on the host; bind_stage swaps
+    // the buffers, this record swaps the rest, so a stage resumes exactly where it left off.
+    struct StageRun {
+        uint32_t next_chunk = 0;   // the next chunk this stage starts (chunks flow through it in order)
+        int chunk = -1;            // the chunk in hand, -1 when idle
+        uint32_t il = 0;           // the next layer of `chunk`
+        bool front_out = false;    // front() was issued for `il`; back() is due
+        uint32_t cur_n = 0, cur_pos0 = 0;
+        int idx_owner = -1, cand_owner = -1;
+        uint32_t idx_topk = 0, mainh_wrote = 0;
+        cudaEvent_t sel_ev = nullptr;   // the router selection's readback of the front in flight
+    };
+    // One hand-off ring per seam.  The producer queues its hidden state and premix into slot chunk % ring and
+    // records `done`; the consumer waits for `done`, copies to its device and records `taken`, which frees the
+    // slot.  The buffers are pinned when the driver allows it, so neither copy blocks the host.
+    struct SeamSlot {
+        float* hc = nullptr;     // cap rows, HC * E each
+        float* prem = nullptr;   // cap rows, HC each
+        std::vector<float> hc_v, prem_v;   // the pageable fallback when cudaHostAlloc fails
+        bool hc_pinned = false, prem_pinned = false;
+        int chunk = -1;          // the chunk this slot holds, -1 = free
+        bool done_set = false, taken_set = false;
+        cudaEvent_t done = nullptr, taken = nullptr;
+    };
+    std::vector<StageRun> run_;                 // [stage] progress through the chunk list
+    std::vector<std::vector<SeamSlot>> seam_;   // [seam][slot]
+    uint32_t seam_ring_ = 0;
+    std::vector<std::vector<int32_t>> pipe_sel_host_;   // per stage: the router readback
+    std::vector<std::vector<int32_t>> pipe_pos_host_;   // per stage: the chunk's positions
+    std::vector<std::vector<int32_t>> pipe_gpos_host_;  // per stage: the compressor's group positions
+    std::vector<std::vector<uint8_t>> pipe_stage_;      // per stage: stage_blob's host staging
+    void pipe_close();
+
+    // ---- cross-seam source state (a balanced split) ----
+    // A stage whose first layer is not itself a compressed-cache source reads the source above it from another
+    // device.  What crosses: the source's compressed KV (xcomp_), its index key cache (xik_, every index-source
+    // layer scores against the kv source's keys), the latest top-k selection (uploaded into the stage's own
+    // idx_), the candidate block list when the candidate source is upstream (xcand_), and that source's live
+    // group count (xsrc_ng_).  The pipeline fills the mirrors per chunk through xfer_ (a host ring); the serial
+    // and decode paths fill them synchronously when the source layer runs.
+    static constexpr uint32_t kNoSrc = ~0u;
+    std::vector<uint32_t> xsrc_;      // [stage] the source layer this stage reads from an earlier stage
+    std::vector<uint32_t> xsrc_ng_;   // [stage] that source's live group count, the chunk in hand
+    std::vector<uint8_t*> xcomp_;     // [stage] the source's compressed KV mirror on this device
+    std::vector<uint8_t*> xik_;       // [stage] the source's index key cache mirror
+    std::vector<int32_t*> xcand_;     // [stage] the candidate list mirror (candidate source upstream)
+    std::vector<uint8_t> xcand_st_;   // [stage] 1 when this stage reads a foreign candidate list
+    bool cand_foreign_ = false;       // the bound stage's xcand_st_ entry
+    struct XferSlot {
+        uint8_t* comp = nullptr;    // ngg * kDeepseek4CkvBytes
+        uint8_t* ik = nullptr;      // ngg * kDeepseek4IdxkBytes
+        int32_t* idx = nullptr;     // cap rows of topk_cap_ ints (the producer's latest selection)
+        int32_t* cand = nullptr;    // cap rows of (1 + kcap_) ints, when the candidate source is upstream
+        std::vector<uint8_t> comp_v, ik_v;
+        std::vector<int32_t> idx_v, cand_v;
+        bool comp_pinned = false, ik_pinned = false, idx_pinned = false, cand_pinned = false;
+        uint32_t ng = 0, n = 0;     // the chunk this slot carries
+        int chunk = -1;
+        bool done_set = false, taken_set = false;
+        cudaEvent_t done = nullptr, taken = nullptr;
+    };
+    std::vector<std::vector<XferSlot>> xfer_;   // [consumer stage][slot]
+    uint32_t xfer_ring_ = 0;
+    bool pipe_attn_ = false;   // prefill_pipeline owns the mirrors while it runs
 
     // ---- P7 expert cache (opt-in) ----
     // Fixed-size slots per stage, one slot per cached expert payload.  `exp_cache_.size() == nstages_`; an empty
@@ -815,7 +1044,7 @@ void* Runner::load_tensor(const std::string& name, uint32_t type, const char* wh
     return upload(host.data(), bytes, what);
 }
 
-void Runner::probe(const char* tag, void* d, uint64_t n_floats) {
+void Runner::probe(const char* tag, const void* d, uint64_t n_floats, uint32_t pos0) {
     if (probe_host_.size() < n_floats) probe_host_.resize(static_cast<size_t>(n_floats));
     const cudaError_t e = cudaMemcpyAsync(probe_host_.data(), d, n_floats * sizeof(float),
                                           cudaMemcpyDeviceToHost, stream_);
@@ -832,7 +1061,36 @@ void Runner::probe(const char* tag, void* d, uint64_t n_floats) {
         const float a = v < 0 ? -v : v;
         if (a > mx) mx = a;
     }
-    std::fprintf(stderr, "  [trace] %s max %.6g nonfinite %" PRIu64 "\n", tag, static_cast<double>(mx), nf);
+    std::fprintf(stderr, "  [trace] %s max %.6g nonfinite %" PRIu64 " pos0 %u rows %" PRIu64 "\n", tag,
+                 static_cast<double>(mx), nf, pos0, HC_ != 0 ? n_floats / (uint64_t(HC_) * E_) : 0);
+    // STRATA_V4_DUMP=<tag>: also write the probed tensor to /tmp/dsv4probe_<tag>_<pos0>.bin (a measurement hook;
+    // nothing is written unless the variable names this tag).
+    if (const char* dt = std::getenv("STRATA_V4_DUMP"); dt != nullptr && std::strcmp(dt, tag) == 0) {
+        std::string fn(tag);
+        for (char& ch : fn)
+            if (ch == ' ') ch = '_';
+        fn = "/tmp/dsv4probe_" + fn + "_" + std::to_string(pos0) + ".bin";
+        if (FILE* f = std::fopen(fn.c_str(), "wb")) {
+            std::fwrite(probe_host_.data(), sizeof(float), static_cast<size_t>(n_floats), f);
+            std::fclose(f);
+        }
+    }
+    // A hash of each aligned 1024-row window, keyed by its absolute window index: a chunked run's block covers
+    // a different row range than a one-chunk run, and the absolute index is what lines the two up.
+    const uint64_t rowf = uint64_t(HC_) * E_;
+    if (rowf == 0 || n_floats % rowf != 0) return;
+    const uint64_t nrow = n_floats / rowf;
+    for (uint64_t w = 0; w * 1024u + 1024u <= uint64_t(pos0) + nrow; ++w) {
+        const uint64_t a = w * 1024u;
+        if (a < pos0 || a - pos0 + 1024u > nrow) continue;
+        const uint32_t* p = reinterpret_cast<const uint32_t*>(probe_host_.data() + (a - pos0) * rowf);
+        uint64_t h = 1469598103934665603ull;
+        for (uint64_t i = 0; i < 1024u * rowf; ++i) {
+            h ^= p[i];
+            h *= 1099511628211ull;
+        }
+        std::fprintf(stderr, "  [trace] %s W%" PRIu64 " %016" PRIx64 "\n", tag, w, h);
+    }
 }
 
 // Point every shared forward buffer at stage s's copies and make s's device current.  The swap-carrying members
@@ -841,6 +1099,7 @@ void Runner::probe(const char* tag, void* d, uint64_t n_floats) {
 void Runner::bind_stage(uint32_t s) {
     const Stage& g = st_[s];
     stage_cur_ = s;
+    cand_foreign_ = s < xcand_st_.size() && xcand_st_[s] != 0;
     cudaSetDevice(g.dev);
     stream_ = g.stream;
     d_tok_ = g.d_tok;
@@ -1166,16 +1425,30 @@ bool Runner::open(const Options& o, std::string& err) {
         err = "--dspark runs on one device: its capture and rollback span every layer";
         return false;
     }
+    if (opt_.stage_pipeline) {
+        if (nstages_ < 2) {
+            err = "--stage-pipeline needs 2 or more stages (--devices gpu0,gpu1,...)";
+            return false;
+        }
+        if (opt_.pf_time) {
+            err = "--pf-time times the serial path's barriers and cannot be combined with --stage-pipeline";
+            return false;
+        }
+    }
     stage_first_.assign(nstages_ + 1, 0);
     stage_first_[nstages_] = nlayers_;
     if (nstages_ > 1) {
         std::vector<uint32_t> legal;
         for (uint32_t b = 1; b < nlayers_; ++b) {
             bool ok = true;
-            for (uint32_t il = b; il < nlayers_ && ok; ++il) {
-                if (kv_src_[il] < b || idx_src_[il] < b) ok = false;
-                else if (il > cand_src_layer_ && cand_src_layer_ < b) ok = false;
-            }
+            // --stage-pipeline carries a source layer's compressed KV and its top-k selection across the seam
+            // (xsrc_), so its cuts may fall anywhere.  The serial and decode paths still need every source and
+            // all of its consumers on one device.
+            if (!opt_.stage_pipeline)
+                for (uint32_t il = b; il < nlayers_ && ok; ++il) {
+                    if (kv_src_[il] < b || idx_src_[il] < b) ok = false;
+                    else if (il > cand_src_layer_ && cand_src_layer_ < b) ok = false;
+                }
             if (ok) legal.push_back(b);
         }
         const uint32_t K = nstages_ - 1;
@@ -1193,6 +1466,11 @@ bool Runner::open(const Options& o, std::string& err) {
             for (size_t i = 0; i < legal.size(); ++i)
                 for (size_t p = 0; p < i; ++p) {
                     if (dp[j - 1][p] == kInf) continue;
+                    // The mirror chain is one stage deep: a stage reads its source's compressed KV, index keys,
+                    // top-k selection and candidate list from the stage just before it, never from further back.
+                    const uint32_t cb = legal[i], cp = legal[p];
+                    if (kv_src_[cb] < cp) continue;
+                    if (kcap_ != 0 && cand_src_layer_ < cb && cand_src_layer_ < cp) continue;
                     const uint64_t m = std::max(dp[j - 1][p], static_cast<uint64_t>(legal[i] - legal[p]));
                     if (m < dp[j][i]) { dp[j][i] = m; par[j][i] = static_cast<int>(p); }
                 }
@@ -1209,6 +1487,69 @@ bool Runner::open(const Options& o, std::string& err) {
             bi = par[j][bi];
         }
     }
+    // STRATA_V4_STAGE_CUTS=8,14,20 overrides the split (a measurement/debug lever: the cuts still have to be
+    // legal for the mode, and the run must return the same ids as the split the DP would have picked).
+    if (const char* sc = std::getenv("STRATA_V4_STAGE_CUTS"); sc != nullptr && nstages_ > 1) {
+        std::vector<uint32_t> cuts;
+        cuts.push_back(0);
+        const char* p = sc;
+        while (*p != '\0') {
+            char* end = nullptr;
+            const long v = std::strtol(p, &end, 10);
+            if (end == p || v <= 0 || v >= static_cast<long>(nlayers_)) {
+                err = "STRATA_V4_STAGE_CUTS: \"" + std::string(sc) + "\" is not a list of layer numbers";
+                return false;
+            }
+            cuts.push_back(static_cast<uint32_t>(v));
+            p = *end == ',' ? end + 1 : end;
+        }
+        cuts.push_back(nlayers_);
+        if (cuts.size() != nstages_ + 1) {
+            err = "STRATA_V4_STAGE_CUTS: " + std::to_string(cuts.size() - 2) + " cut(s) for " +
+                  std::to_string(nstages_) + " stage(s)";
+            return false;
+        }
+        for (uint32_t j = 1; j <= nstages_; ++j) {
+            if (cuts[j] <= cuts[j - 1]) {
+                err = "STRATA_V4_STAGE_CUTS: the cuts must rise";
+                return false;
+            }
+            stage_first_[j] = cuts[j];
+        }
+        for (uint32_t j = 1; j < nstages_; ++j) {
+            const uint32_t b = cuts[j], a = cuts[j - 1];
+            bool ok = true;
+            if (opt_.stage_pipeline) {
+                ok = kv_src_[b] >= a && (kcap_ == 0 || cand_src_layer_ >= b || cand_src_layer_ >= a);
+            } else
+                for (uint32_t il = b; il < nlayers_ && ok; ++il) {
+                    if (kv_src_[il] < b || idx_src_[il] < b) ok = false;
+                    else if (il > cand_src_layer_ && cand_src_layer_ < b) ok = false;
+                }
+            if (!ok) {
+                err = "STRATA_V4_STAGE_CUTS: cut " + std::to_string(b) + " is not legal for this mode";
+                return false;
+            }
+        }
+    }
+    // STRATA_V4_DUMP_IL=<n>: under --trace, also probe layer n's attention cache, selection, attention and MoE
+    // outputs (the STRATA_V4_DUMP tag names which one is written to /tmp).
+    if (const char* d = std::getenv("STRATA_V4_DUMP_IL"); d != nullptr) {
+        const long v = std::strtol(d, nullptr, 10);
+        if (v >= 0 && v < static_cast<long>(nlayers_)) dump_il_ = static_cast<uint32_t>(v);
+    }
+    // Which stage reads a source layer from an earlier device.  A stage that starts on a source (or owns one
+    // before its first consumer layer) reads its own cache instead.  A stage past the candidate source reads
+    // that source's candidate list from an earlier device too.
+    xsrc_.assign(nstages_, kNoSrc);
+    xsrc_ng_.assign(nstages_, 0);
+    xcand_st_.assign(nstages_, 0);
+    if (opt_.stage_pipeline)
+        for (uint32_t s = 1; s < nstages_; ++s) {
+            const uint32_t b = stage_first_[s];
+            if (!is_kv_src_[b]) xsrc_[s] = kv_src_[b];
+            if (kcap_ != 0 && cand_src_layer_ < b) xcand_st_[s] = 1;
+        }
 
     st_.assign(nstages_, Stage{});
     for (uint32_t s = 0; s < nstages_; ++s) {
@@ -1226,6 +1567,10 @@ bool Runner::open(const Options& o, std::string& err) {
             map += (s ? ", " : "") + std::to_string(stage_first_[s]) + ".." +
                    std::to_string(stage_first_[s + 1] - 1) + " on gpu " + std::to_string(st_[s].dev);
         std::fprintf(stderr, "[v41] stages: %s\n", map.c_str());
+        for (uint32_t s = 1; s < nstages_; ++s)
+            if (xsrc_[s] != kNoSrc)
+                std::fprintf(stderr, "[v41] seam %u: stage %u reads source L%u from gpu %u\n", s - 1, s, xsrc_[s],
+                             st_[stage_of(xsrc_[s])].dev);
     }
     bind_stage(0);
     return true;
@@ -1312,6 +1657,10 @@ bool Runner::load_weights(std::string& err) {
     // The expert containers: header, slot table and one payload header per layer (the payload bytes stream later).
     for (uint32_t il = 0; il < nlayers_; ++il)
         if (!load_blob(il, err)) return false;
+
+    // --cpu-moe (opt-in): open every layer's experts on the host side of the RAM image, now that the blobs are
+    // parsed and the image is resident.
+    if (opt_.cpu_moe != 0 && !cpu_moe_open(err)) return false;
 
     // DSpark (opt-in): the three towers, then the draft state.  Both read the geometry open() validated.
     if (opt_.dspark) {
@@ -1425,7 +1774,11 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
     std::vector<bool> used(b.experts, false);
     for (uint32_t i = 0; i < n_pairs; ++i) {
         const int32_t e = sel[i];
-        if (e < 0 || static_cast<uint32_t>(e) >= b.experts) {
+        // --cpu-moe marks the pairs the host computes; they need no payload in the device container (the arm
+        // writes zeros for a negative selection, and the host's rows are scattered into partial_ after it).
+        // Without --cpu-moe the selection has no negatives, so this skip changes nothing.
+        if (e < 0) continue;
+        if (static_cast<uint32_t>(e) >= b.experts) {
             err = "router selected expert " + std::to_string(e) + " outside 0.." + std::to_string(b.experts);
             return false;
         }
@@ -1457,8 +1810,12 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
     if (ram == nullptr)
         for (uint32_t e : uniq_)
             for (uint32_t w = 0; w < 3; ++w) need += b.span[static_cast<size_t>(e) * 3 + w];
-    if (stage_.size() < need) stage_.resize(static_cast<size_t>(need));
-    uint8_t* p = stage_.data();
+    // The upload below is asynchronous, so under --stage-pipeline each stage assembles into its own vector: the
+    // next layer's staging may run on another device while this upload is still reading.  The serial path keeps
+    // the shared one (the router's readback drains it before the next call).
+    std::vector<uint8_t>& staging = pipe_stage_.empty() ? stage_ : pipe_stage_[stage_cur_];
+    if (staging.size() < need) staging.resize(static_cast<size_t>(need));
+    uint8_t* p = staging.data();
     std::memset(p, 0, static_cast<size_t>(table_end));
     wr32(p, d4::kBlobMagic);
     wr32(p + 4, b.ver);
@@ -1471,7 +1828,8 @@ bool Runner::stage_blob_b(const Blob& b, uint32_t layer_id, const int32_t* sel, 
     // of the main layers' slots and, with --expert-loan, out of the pool's header.)
     const bool caching = !opt_.expert_cache_mib.empty() && b.experts == NE_ && layer_id < nlayers_ &&
                          &b == &blob_[layer_id] && stage_cur_ < exp_cache_dev_.size() &&
-                         exp_cache_dev_[stage_cur_] != nullptr && exp_cache_slots_[stage_cur_] != 0;
+                         exp_cache_dev_[stage_cur_] != nullptr && exp_cache_slots_[stage_cur_] != 0 &&
+                         (!opt_.expert_cache_decode_only || n_pairs <= KU_);
     uint8_t* cbase = caching ? exp_cache_dev_[stage_cur_] : nullptr;   // the pool base under --expert-loan
     auto& cmap = exp_cache_[stage_cur_];
     std::vector<uint64_t> pinned;   // slots this container points at: never evicted by its own misses
@@ -1711,9 +2069,16 @@ bool Runner::load_engram(std::string& err) {
     for (size_t i = 0; i < layers; ++i) {
         shard_[i] = std::make_unique<d4::EngramShard>();
         std::string e;
-        if (!d4::open_engram_table(geo, i, opt_.engram_dir, *shard_[i], e)) {
+        const double t_open = now_sec();
+        if (!d4::open_engram_table(geo, i, opt_.engram_dir, *shard_[i], e, opt_.engram_scale_cache)) {
             err = "engram table " + std::to_string(i) + ": " + e;
             return false;
+        }
+        if (opt_.engram_scale_cache) {
+            const d4::EngramTable& t = geo.engram_tables[i];
+            const double mib = static_cast<double>(t.rows) * (geo.engram_head_dim / 32) / 1048576.0;
+            std::fprintf(stderr, "[v41] engram table %zu: scale plane cached, %.1f MiB in %.1f ms\n", i, mib,
+                         (now_sec() - t_open) * 1e3);
         }
     }
     // The four cap-sized row buffers are allocated by alloc_state, once the auto chunk has picked the block: the
@@ -2291,6 +2656,9 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
     if (topk_cap_ == 0) { err = "indexer_top_k is zero"; return false; }
 
     win_.assign(nlayers_, nullptr);
+    xcomp_.assign(nstages_, nullptr);
+    xik_.assign(nstages_, nullptr);
+    xcand_.assign(nstages_, nullptr);
     comp_kv_.assign(nlayers_, nullptr);
     index_k_.assign(nlayers_, nullptr);
     cpre_kv_.assign(nlayers_, nullptr);
@@ -2391,7 +2759,11 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
             if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { err = last_error; return false; }
             const uint64_t budget = static_cast<uint64_t>(static_cast<double>(free_b) * 0.9);
             auto fits = [&](uint64_t cap) {
-                const uint64_t uniq = std::min<uint64_t>(NE_, 24 + cap / 3);   // the container's experts
+                // --reserve-container sizes the container for every expert, so the estimate is the worst case
+                // rather than the measured "near a quarter of the rows" one the lazy path uses.
+                const uint64_t uniq = opt_.reserve_container
+                                          ? uint64_t(NE_)
+                                          : std::min<uint64_t>(NE_, 24 + cap / 3);   // the container's experts
                 if (loan_ && cache_b != 0) {
                     // The pool is the container: its slots and (when the layer selects more experts than it has
                     // slots) its spill live in one buffer, so the reserve is max(slots, uniq) strides plus the
@@ -2451,6 +2823,10 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
         glog_ = static_cast<float*>(dev(uint64_t(cap_) * NE_ * 4, "router logits"));
         sel_ = static_cast<int32_t*>(dev(uint64_t(cap_) * KU_ * 4, "router sel"));
         rw_ = static_cast<float*>(dev(uint64_t(cap_) * KU_ * 4, "router w"));
+        // --cpu-moe: one pair index per host partial row, uploaded per layer (the scatter's map).
+        cpu_pair_dev_[s] = opt_.cpu_moe != 0
+                               ? static_cast<int32_t*>(dev(uint64_t(cap_) * KU_ * 4, "cpu moe pair map"))
+                               : nullptr;
         partial_ = static_cast<float*>(dev(uint64_t(cap_) * KU_ * E_ * 4, "moe partial"));
         sg_ = static_cast<float*>(dev(uint64_t(cap_) * FF_ * 4, "shared gate"));
         su_ = static_cast<float*>(dev(uint64_t(cap_) * FF_ * 4, "shared up"));
@@ -2504,6 +2880,15 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
             }
             if (win_[il] == nullptr) { err = last_error; return false; }
         }
+        if (xsrc_[s] != kNoSrc) {
+            xcomp_[s] = static_cast<uint8_t*>(dev(ngg * k::kDeepseek4CkvBytes, "cross-stage compressed kv"));
+            xik_[s] = static_cast<uint8_t*>(dev(ngg * k::kDeepseek4IdxkBytes, "cross-stage index keys"));
+            if (xcomp_[s] == nullptr || xik_[s] == nullptr) { err = last_error; return false; }
+        }
+        if (xcand_st_[s] != 0) {
+            xcand_[s] = static_cast<int32_t*>(dev(uint64_t(cap_) * (1u + kcap_) * 4, "cross-stage candidates"));
+            if (xcand_[s] == nullptr) { err = last_error; return false; }
+        }
         if (d_tok_ == nullptr || d_pos_ == nullptr || d_prem_ == nullptr || x_ == nullptr || hc_ == nullptr ||
             hc2_ == nullptr || xn_ == nullptr || mix_ == nullptr || pre_ == nullptr || post_ == nullptr ||
             comb_ == nullptr || qr_ == nullptr || qrn_ == nullptr || q_ == nullptr || kvv_ == nullptr ||
@@ -2516,8 +2901,61 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
             err = last_error;
             return false;
         }
+        // --reserve-container: allocate the container and the index scratch a full chunk can need here, before the
+        // cache, so a request never calls cudaMalloc with the state and cache already resident.  The container's
+        // worst case is every expert of the stage's largest layer; the scratch's is cap_ rows over ngg groups
+        // (what ensure_index_scratch would otherwise grow to on the first big block).  Under --expert-loan the
+        // container lives in the pool below, whose span covers every expert in this mode.
+        if (opt_.reserve_container) {
+            if (!loan_) {
+                uint64_t worst = 0;
+                for (uint32_t il = stage_first_[s]; il < stage_first_[s + 1]; ++il) {
+                    const Blob& b = blob_[il];
+                    if (b.experts != NE_) continue;
+                    uint64_t bytes = 16 + uint64_t(b.experts) * 24 + b.cb_len;
+                    for (uint32_t e = 0; e < b.experts; ++e) {
+                        const size_t i = static_cast<size_t>(e) * 3;
+                        bytes += b.span[i] + b.span[i + 1] + b.span[i + 2];
+                    }
+                    if (opt_.moe_prefill) bytes += 8u;   // the batched arm's tail read
+                    worst = std::max(worst, bytes);
+                }
+                if (worst != 0) {
+                    blob_dev_ = dev(worst, "expert container (reserved)");
+                    if (blob_dev_ == nullptr) {
+                        err = last_error +
+                              " (stage " + std::to_string(s) + ": lower --chunk or --serve-ctx, or leave the "
+                              "container lazy without --reserve-container)";
+                        return false;
+                    }
+                    blob_dcap_ = worst;
+                    std::fprintf(stderr,
+                                 "[v41] expert container: stage %u reserved %.1f MiB (all %u experts)\n", s,
+                                 static_cast<double>(worst) / (1024.0 * 1024.0),
+                                 static_cast<uint32_t>(NE_));
+                }
+            }
+            bool has_idx_src = false;
+            for (uint32_t il = stage_first_[s]; il < stage_first_[s + 1]; ++il)
+                if (is_idx_src_[il]) has_idx_src = true;
+            if (has_idx_src) {
+                const uint32_t rows = std::max<uint32_t>(cap_, opt_.dspark ? cap2_ : 0u);
+                if (!ensure_index_scratch(rows, static_cast<uint32_t>(ngg), err)) return false;
+            }
+        }
+        {
+            // The number the cache has to fit inside.  Without --reserve-container this is only the state; with
+            // it, the full-chunk container and index scratch are already resident, so the cache is sized around
+            // the worst case a prompt can ask for.
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            std::fprintf(stderr, "[v41] stage %u: %.0f MiB free before the expert cache%s\n", s,
+                         static_cast<double>(free_b) / (1024.0 * 1024.0),
+                         opt_.reserve_container ? " (state + full-chunk reserve)" : " (state)");
+        }
         // The expert cache (opt-in) rides on top of the state: whole payload slots, so a hit is one copy.
         if (!opt_.expert_cache_mib.empty() && exp_cache_stride_ != 0) {
+            const char* const adm = opt_.expert_cache_decode_only ? " (decode only)" : "";
             const size_t pick = opt_.expert_cache_mib.size() == 1
                                     ? 0
                                     : std::min<size_t>(s, opt_.expert_cache_mib.size() - 1);
@@ -2526,24 +2964,37 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
             if (slots != 0 && loan_) {
                 // The pool is the container: the header, the cached slots, then the spill that answers a layer
                 // whose selected experts exceed the slots.  The auto chunk reserved max(slots, uniq) strides.
-                const uint64_t uniq_est = std::min<uint64_t>(NE_, 24 + cap_ / 3);
+                const uint64_t uniq_est = opt_.reserve_container
+                                              ? uint64_t(NE_)
+                                              : std::min<uint64_t>(NE_, 24 + cap_ / 3);
                 const uint64_t span = std::max(slots, uniq_est);
                 const uint64_t pool = loan_hdr_[s] + span * exp_cache_stride_ + (opt_.moe_prefill ? 8u : 0u);
                 exp_cache_dev_[s] = static_cast<uint8_t*>(dev(pool, "expert pool"));
-                if (exp_cache_dev_[s] == nullptr) { err = last_error; return false; }
+                if (exp_cache_dev_[s] == nullptr) {
+                    err = last_error + " (stage " + std::to_string(s) +
+                          ": lower this stage's --expert-cache-mib; the state and the prompt reserve are already "
+                          "resident)";
+                    return false;
+                }
                 exp_cache_slots_[s] = slots;
                 loan_span_[s] = span;
                 std::fprintf(stderr,
                              "[v41] expert loan: stage %u %u MiB = %" PRIu64 " slot(s) of %" PRIu64 " B + %" PRIu64
-                             " B header, %.0f MiB pool (container and cache in one)\n",
+                             " B header, %.0f MiB pool (container and cache in one)%s\n",
                              s, mib, slots, exp_cache_stride_, loan_hdr_[s],
-                             static_cast<double>(pool) / (1024.0 * 1024.0));
+                             static_cast<double>(pool) / (1024.0 * 1024.0), adm);
             } else if (slots != 0) {
                 exp_cache_dev_[s] = static_cast<uint8_t*>(dev(slots * exp_cache_stride_, "expert cache"));
-                if (exp_cache_dev_[s] == nullptr) { err = last_error; return false; }
+                if (exp_cache_dev_[s] == nullptr) {
+                    err = last_error + " (stage " + std::to_string(s) +
+                          ": lower this stage's --expert-cache-mib; the state and the prompt reserve are already "
+                          "resident)";
+                    return false;
+                }
                 exp_cache_slots_[s] = slots;
-                std::fprintf(stderr, "[v41] expert cache: stage %u %u MiB = %" PRIu64 " slot(s) of %" PRIu64 " B\n",
-                             s, mib, slots, exp_cache_stride_);
+                std::fprintf(stderr,
+                             "[v41] expert cache: stage %u %u MiB = %" PRIu64 " slot(s) of %" PRIu64 " B%s\n",
+                             s, mib, slots, exp_cache_stride_, adm);
             } else if (loan_) {
                 std::fprintf(stderr, "[v41] expert loan: stage %u has no slot at %u MiB; the container stays\n", s,
                              mib);
@@ -2585,6 +3036,17 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
                                              sz.items) / (1024.0 * 1024.0), pf.pairs_cap,
                          nc_max == 8192u ? 13u : 12u);
         }
+        {
+            // What a request can still allocate from: diagnostics for the serving config, and the number the
+            // --reserve-container promise is about.  A few MiB are normal; under 8 MiB used to mean the first
+            // 1024-row block's scratch allocation would fail.
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            std::fprintf(stderr, "[v41] stage %u: state + cache%s%s resident, %.0f MiB free\n", s,
+                         opt_.reserve_container ? " + full-chunk reserve" : "",
+                         opt_.moe_prefill ? " + moe scratch" : "",
+                         static_cast<double>(free_b) / (1024.0 * 1024.0));
+        }
         save_stage();
     }
     pm_host_.resize(static_cast<size_t>(cap_) * HC_);
@@ -2598,20 +3060,27 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
             const size_t layers = geo.engram_layer_ids.size();
             const size_t raw_sz = static_cast<size_t>(uint64_t(cap_) * eng_cols_ * eng_stride);
             const size_t id_sz = static_cast<size_t>(uint64_t(cap_) * eng_cols_);
+            // One buffer per block that can be in hand at once: the block being fed, the one being uploaded, the
+            // next one read ahead, and -- under --stage-pipeline -- the blocks the stages behind are still
+            // working through.  Each buffer is cap_ rows, so this is the feed's memory for the run.
+            feed_slots_ = static_cast<uint32_t>(std::min<size_t>(6, std::max<size_t>(4, nstages_ + 2)));
             efeed_.resize(layers);
             efeed_raw_.resize(layers);
             efeed_ids_.resize(layers);
             efeed_ev_.resize(layers);
             efeed_ev_set_.resize(layers);
-            efeed_cur_.assign(layers, -1);
             efeed_dev_.resize(layers);
             for (size_t ei = 0; ei < layers; ++ei) {
                 const uint32_t il = static_cast<uint32_t>(geo.engram_layer_ids[ei]);
                 efeed_dev_[ei] = st_[stage_of(il)].dev;
-                for (int s = 0; s < 2; ++s) {
+                efeed_[ei].resize(feed_slots_);
+                efeed_raw_[ei].resize(feed_slots_);
+                efeed_ids_[ei].resize(feed_slots_);
+                efeed_ev_[ei].assign(feed_slots_, nullptr);
+                efeed_ev_set_[ei].assign(feed_slots_, false);
+                for (uint32_t s = 0; s < feed_slots_; ++s) {
                     efeed_raw_[ei][s].resize(raw_sz);
                     efeed_ids_[ei][s].resize(id_sz);
-                    efeed_ev_set_[ei][s] = false;
                     cudaSetDevice(efeed_dev_[ei]);
                     if (cudaEventCreateWithFlags(&efeed_ev_[ei][s], cudaEventDisableTiming) != cudaSuccess) {
                         err = "engram feed: cannot create the buffer event";
@@ -2620,8 +3089,8 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
                 }
             }
             cudaSetDevice(st_[0].dev);
-            std::fprintf(stderr, "[v41] engram feed: %zu layer(s), two %u-row buffers each, prefetch on\n", layers,
-                         cap_);
+            std::fprintf(stderr, "[v41] engram feed: %zu layer(s), %u %u-row buffer(s) each, prefetch on\n", layers,
+                         feed_slots_, cap_);
         }
     }
     sel_host_.resize(static_cast<size_t>(cap_) * KU_);
@@ -2631,6 +3100,138 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
         handoff_hc_.resize(static_cast<size_t>(cap_) * HC_ * E_);
         handoff_prem_.resize(static_cast<size_t>(cap_) * HC_);
     }
+    // ---- P9: the pipelined prefill's per-stage scratch and the seam rings (opt-in) ----
+    // The host buffers a stage may still be reading when another stage runs: the router's selection, the
+    // positions, the compressor's group positions and the expert container's staging bytes.
+    if (opt_.stage_pipeline) {
+        pipe_sel_host_.assign(nstages_, {});
+        pipe_pos_host_.assign(nstages_, {});
+        pipe_gpos_host_.assign(nstages_, {});
+        pipe_stage_.assign(nstages_, {});
+        for (uint32_t s = 0; s < nstages_; ++s) {
+            pipe_sel_host_[s].resize(static_cast<size_t>(cap_) * KU_);
+            pipe_pos_host_[s].resize(cap_);
+            pipe_gpos_host_[s].resize(cap_);
+        }
+        run_.assign(nstages_, StageRun{});
+        for (uint32_t s = 0; s < nstages_; ++s) {
+            cudaSetDevice(st_[s].dev);
+            if (cudaEventCreateWithFlags(&run_[s].sel_ev, cudaEventDisableTiming) != cudaSuccess) {
+                err = "stage pipeline: cannot create a selection event";
+                return false;
+            }
+        }
+        if (nstages_ > 1) {
+            // The ring holds at least two chunks per seam, three while the budget allows; a slot is one chunk's
+            // hidden state (cap rows of HC * E floats) plus its premix.
+            const uint64_t hc_bytes = uint64_t(cap_) * HC_ * E_ * 4;
+            const uint64_t prem_bytes = uint64_t(cap_) * HC_ * 4;
+            const uint64_t seams = nstages_ - 1;
+            uint64_t ring = 1610612736ull / (seams * (hc_bytes + prem_bytes));
+            if (ring < 2) ring = 2;
+            if (ring > 3) ring = 3;
+            seam_ring_ = static_cast<uint32_t>(ring);
+            seam_.assign(seams, std::vector<SeamSlot>(seam_ring_));
+            for (uint32_t s = 0; s < seams; ++s) {
+                for (auto& sl : seam_[s]) {
+                    cudaSetDevice(st_[s].dev);
+                    if (cudaEventCreateWithFlags(&sl.done, cudaEventDisableTiming) != cudaSuccess) {
+                        err = "stage pipeline: cannot create a hand-off event";
+                        return false;
+                    }
+                    void* p = nullptr;
+                    if (cudaHostAlloc(&p, static_cast<size_t>(hc_bytes), cudaHostAllocPortable) == cudaSuccess) {
+                        sl.hc = static_cast<float*>(p);
+                        sl.hc_pinned = true;
+                    } else {
+                        (void)cudaGetLastError();
+                        sl.hc_v.resize(static_cast<size_t>(cap_) * HC_ * E_);
+                        sl.hc = sl.hc_v.data();
+                    }
+                    p = nullptr;
+                    if (cudaHostAlloc(&p, static_cast<size_t>(prem_bytes), cudaHostAllocPortable) == cudaSuccess) {
+                        sl.prem = static_cast<float*>(p);
+                        sl.prem_pinned = true;
+                    } else {
+                        (void)cudaGetLastError();
+                        sl.prem_v.resize(static_cast<size_t>(cap_) * HC_);
+                        sl.prem = sl.prem_v.data();
+                    }
+                }
+                for (auto& sl : seam_[s]) {
+                    cudaSetDevice(st_[s + 1].dev);
+                    if (cudaEventCreateWithFlags(&sl.taken, cudaEventDisableTiming) != cudaSuccess) {
+                        err = "stage pipeline: cannot create a hand-off event";
+                        return false;
+                    }
+                }
+            }
+            const double mib = static_cast<double>((hc_bytes + prem_bytes) * seam_ring_ * seams) / (1024.0 * 1024.0);
+            std::fprintf(stderr, "[v41] stage pipeline: %u seam(s) x %u slot(s), %.1f MiB a slot (%.1f MiB)\n",
+                         static_cast<uint32_t>(seams), seam_ring_,
+                         static_cast<double>(hc_bytes + prem_bytes) / (1024.0 * 1024.0), mib);
+        }
+        // Cross-seam source state: one host ring per consuming stage.  The producer of a source is at most one
+        // chunk ahead of its consumer, so two slots would do; three keep a stale slot from ever stalling it.
+        uint32_t xfers = 0;
+        bool any_cand = false;
+        for (uint32_t s = 1; s < nstages_; ++s) {
+            if (xsrc_[s] != kNoSrc) ++xfers;
+            if (xcand_st_[s] != 0) any_cand = true;
+        }
+        if (xfers != 0) {
+            const uint64_t comp_bytes = ngg * k::kDeepseek4CkvBytes;
+            const uint64_t ik_bytes = ngg * k::kDeepseek4IdxkBytes;
+            const uint64_t idx_bytes = uint64_t(cap_) * topk_cap_ * 4;
+            const uint64_t cand_bytes = kcap_ != 0 ? uint64_t(cap_) * (1u + kcap_) * 4 : 0;
+            xfer_ring_ = 3;
+            xfer_.assign(nstages_, {});
+            for (uint32_t s = 1; s < nstages_; ++s) {
+                if (xsrc_[s] == kNoSrc) continue;
+                xfer_[s].assign(xfer_ring_, XferSlot{});
+                const uint32_t pdev = st_[stage_of(xsrc_[s])].dev;
+                const bool with_cand = xcand_st_[s] != 0;
+                for (auto& xs : xfer_[s]) {
+                    cudaSetDevice(pdev);
+                    if (cudaEventCreateWithFlags(&xs.done, cudaEventDisableTiming) != cudaSuccess) {
+                        err = "stage pipeline: cannot create a cache hand-off event";
+                        return false;
+                    }
+                    auto pin = [&](uint64_t bytes, void** p, bool* pinned, auto& fallback) {
+                        if (cudaHostAlloc(p, static_cast<size_t>(bytes), cudaHostAllocPortable) == cudaSuccess) {
+                            *pinned = true;
+                            return true;
+                        }
+                        (void)cudaGetLastError();
+                        fallback.resize(static_cast<size_t>(bytes));
+                        *p = fallback.data();
+                        return true;
+                    };
+                    void* p = nullptr;
+                    if (!pin(comp_bytes, &p, &xs.comp_pinned, xs.comp_v)) return false;
+                    xs.comp = static_cast<uint8_t*>(p);
+                    if (!pin(ik_bytes, &p, &xs.ik_pinned, xs.ik_v)) return false;
+                    xs.ik = static_cast<uint8_t*>(p);
+                    if (!pin(idx_bytes, &p, &xs.idx_pinned, xs.idx_v)) return false;
+                    xs.idx = static_cast<int32_t*>(p);
+                    if (with_cand) {
+                        if (!pin(cand_bytes, &p, &xs.cand_pinned, xs.cand_v)) return false;
+                        xs.cand = static_cast<int32_t*>(p);
+                    }
+                    cudaSetDevice(st_[s].dev);
+                    if (cudaEventCreateWithFlags(&xs.taken, cudaEventDisableTiming) != cudaSuccess) {
+                        err = "stage pipeline: cannot create a cache hand-off event";
+                        return false;
+                    }
+                }
+            }
+            std::fprintf(stderr, "[v41] source mirrors: %u stage(s), %.1f MiB a slot%s, %u slot(s)\n", xfers,
+                         static_cast<double>(comp_bytes + ik_bytes + idx_bytes + (any_cand ? cand_bytes : 0)) /
+                             (1024.0 * 1024.0),
+                         any_cand ? " (+candidates)" : "", xfer_ring_);
+        }
+        cudaSetDevice(st_[0].dev);
+    }
     std::fprintf(stderr, "[v41] state: chunk %u, groups cap %" PRIu64 ", topk cap %u, window %u\n", cap_, ngg,
                  topk_cap_, SWA_);
     if (opt_.chunk == 0)
@@ -2639,17 +3240,22 @@ bool Runner::alloc_state(uint32_t total, std::string& err) {
 }
 
 bool Runner::ensure_index_scratch(uint32_t rows, uint32_t ng, std::string& err) {
-    if (iscore_ != nullptr && ng <= iscap_ && rows <= isrows_ && (cand_ != nullptr || kcap_ == 0)) return true;
+    // The candidate list is only read and written by the stage that owns its source layer; a stage past the seam
+    // reads the source's mirror (xcand_) and never touches this buffer.  Allocating it there wasted 8 MiB on
+    // every stage of a four-stage run, which is what a tight serving config cannot spare.
+    const bool own_cand = kcap_ != 0 && stage_of(cand_src_layer_) == stage_cur_;
+    if (iscore_ != nullptr && ng <= iscap_ && rows <= isrows_ && (cand_ != nullptr || !own_cand || cand_foreign_))
+        return true;
     const uint32_t want = std::min<uint32_t>(std::max<uint32_t>(iscap_ ? iscap_ * 2u : ng, ng), ctx_);
     const uint32_t rr = std::max<uint32_t>(rows, kDecRows);
     if (iscore_ != nullptr) cudaFree(iscore_);
     if (cand_ != nullptr) cudaFree(cand_);
     if (iscratch_ != nullptr) cudaFree(iscratch_);
     iscore_ = static_cast<float*>(dev(uint64_t(rr) * want * 4, "indexer scores"));
-    cand_ = kcap_ != 0 ? static_cast<int32_t*>(dev(uint64_t(rr) * (1u + kcap_) * 4, "candidate blocks")) : nullptr;
+    cand_ = own_cand ? static_cast<int32_t*>(dev(uint64_t(rr) * (1u + kcap_) * 4, "candidate blocks")) : nullptr;
     nbc_ = static_cast<uint32_t>((uint64_t(want) + cand_bs_ - 1) / cand_bs_) + 1;
     iscratch_ = static_cast<float*>(dev(uint64_t(rr) * nbc_ * 5, "candidate scratch"));
-    if (iscore_ == nullptr || (kcap_ != 0 && cand_ == nullptr) || iscratch_ == nullptr) { err = last_error; return false; }
+    if (iscore_ == nullptr || (own_cand && cand_ == nullptr) || iscratch_ == nullptr) { err = last_error; return false; }
     iscap_ = want;
     isrows_ = rr;
     return true;
@@ -2667,13 +3273,15 @@ bool Runner::engram_layer(uint32_t il, std::string& err) {
     cudaError_t ce = cudaSuccess;
     if (opt_.engram_feed) {
         // The rows were read by the feed (prepare started them, or a previous block's prefetch did); this layer
-        // only waits for them and uploads.  The event marks the slot free for the worker's next read.
-        if (!engram_feed_wait(static_cast<uint32_t>(ei), err)) return false;
-        const size_t slot = static_cast<size_t>(efeed_cur_[static_cast<size_t>(ei)]);
+        // only waits for them and uploads.  The event marks the slot free for the worker's next read, and `live`
+        // clears now: this block is the slot's last use.
+        uint32_t slot = 0;
+        if (!engram_feed_wait(static_cast<uint32_t>(ei), cur_pos0_, cur_n_, slot, err)) return false;
         ce = cudaMemcpyAsync(eraw_, efeed_raw_[static_cast<size_t>(ei)][slot].data(),
                              static_cast<size_t>(raw_bytes), cudaMemcpyHostToDevice, stream_);
         if (ce == cudaSuccess) ce = cudaEventRecord(efeed_ev_[static_cast<size_t>(ei)][slot], stream_);
         efeed_ev_set_[static_cast<size_t>(ei)][slot] = true;
+        efeed_[static_cast<size_t>(ei)][slot].live = false;
     } else {
         for (uint32_t i = 0; i < n; ++i) {
             hash_.rows_masked(hist_.data(), hist_.size(), nullptr, 0, static_cast<int64_t>(cur_pos0_ + i), ei,
@@ -2720,7 +3328,15 @@ bool Runner::engram_layer(uint32_t il, std::string& err) {
 // Two slots of one layer can read at once (the first block's prepare and its prefetch): EngramShard's Unix
 // path is pread-only, so that is safe; its Windows FILE* path would need a lock and the feed stays off there.
 
-Runner::~Runner() { engram_feed_close(); }   // cudaEvent_t handles die with their contexts at process exit
+Runner::~Runner() {
+    // cudaEvent_t handles die with their contexts at process exit; the host pool and its pinned buffers are
+    // this process's and are released here (the workers are joined first, so nothing reads them after).
+    cpu_pool_.reset();
+    if (cpu_out_host_ != nullptr) { cudaFreeHost(cpu_out_host_); cpu_out_host_ = nullptr; cpu_out_dev_ = nullptr; }
+    if (cpu_x_host_ != nullptr) { cudaFreeHost(cpu_x_host_); cpu_x_host_ = nullptr; }
+    engram_feed_close();
+    pipe_close();
+}
 
 // --pf-time: print the pending layer's staging/kernel split.  Only called with that stage's stream synced and
 // its device still current.
@@ -2762,7 +3378,7 @@ void Runner::engram_feed_close() {
             }
         }
     for (size_t ei = 0; ei < efeed_ev_.size(); ++ei)
-        for (int s = 0; s < 2; ++s) {
+        for (size_t s = 0; s < efeed_ev_[ei].size(); ++s) {
             if (efeed_ev_[ei][s] == nullptr) continue;
             cudaSetDevice(efeed_dev_[ei]);
             cudaEventDestroy(efeed_ev_[ei][s]);
@@ -2792,6 +3408,7 @@ bool Runner::engram_feed_start(uint32_t ei, int slot, uint32_t pos0, const int32
     j.pos0 = pos0;
     j.n = n;
     j.done = false;
+    j.live = true;
     const size_t rows = static_cast<size_t>(n) * cols;
     j.th = std::thread([this, ei, slot, rows]() {
         FeedJob& jj = efeed_[ei][static_cast<size_t>(slot)];
@@ -2859,36 +3476,23 @@ bool Runner::engram_feed_prepare(uint32_t pos0, const int32_t* ids, uint32_t n, 
     if (!opt_.engram_feed || !engram_on_) return true;
     for (size_t ei = 0; ei < efeed_.size(); ++ei) {
         auto& jobs = efeed_[ei];
+        bool have = false;
+        for (const FeedJob& j : jobs)
+            if ((j.running || j.done) && j.live && j.pos0 == pos0 && j.n == n) { have = true; break; }
+        if (have) continue;
         int slot = -1;
-        for (int s = 0; s < 2; ++s) {
-            const FeedJob& j = jobs[static_cast<size_t>(s)];
-            if ((j.running || j.done) && j.pos0 == pos0 && j.n == n) { slot = s; break; }
+        for (size_t s = 0; s < jobs.size(); ++s)
+            if (!jobs[s].running && !jobs[s].live) { slot = static_cast<int>(s); break; }
+        if (slot < 0) {
+            err = "engram feed: every buffer still holds a block in flight";
+            return false;
         }
-        if (slot >= 0) {
-            FeedJob& j = jobs[static_cast<size_t>(slot)];
-            if (j.running) {
-                j.th.join();
-                j.running = false;
-                if (!j.ok) { err = "engram feed: " + j.err; return false; }
-            }
-            j.done = true;
-        } else {
-            // No prefetched rows for this block: read them here.  The read overlaps the layers before the
-            // engram layer; wait() joins it there.
-            const int cur = efeed_cur_[ei];
-            slot = cur < 0 ? 0 : 1 - cur;
-            FeedJob& j = jobs[static_cast<size_t>(slot)];
-            if (j.running) {   // a stale read of another block; its rows are not this block's
-                j.th.join();
-                j.running = false;
-            }
-            j.done = false;
-            if (!engram_feed_start(static_cast<uint32_t>(ei), slot, pos0, hist_.data(), hist_.size(), ids, n)) {
-                err = "engram feed: cannot start the read";
-                return false;
-            }
+        // No prefetched rows for this block: read them here.  The read overlaps the layers before the engram
+        // layer; wait() joins it there.
+        if (!engram_feed_start(static_cast<uint32_t>(ei), slot, pos0, hist_.data(), hist_.size(), ids, n)) {
+            err = "engram feed: cannot start the read";
+            return false;
         }
-        efeed_cur_[ei] = slot;
     }
     return true;
 }
@@ -2896,30 +3500,44 @@ bool Runner::engram_feed_prepare(uint32_t pos0, const int32_t* ids, uint32_t n, 
 void Runner::engram_feed_prefetch(uint32_t pos0, const int32_t* hist, const int32_t* ids, uint32_t n) {
     if (!opt_.engram_feed || !engram_on_ || n == 0) return;
     for (size_t ei = 0; ei < efeed_.size(); ++ei) {
-        const int cur = efeed_cur_[ei];
-        if (cur < 0) continue;   // prepare has not run yet
-        const int slot = 1 - cur;
-        FeedJob& j = efeed_[ei][static_cast<size_t>(slot)];
-        if (j.running) continue;   // the other slot is still being read; this block will be read at prepare
-        if (j.done && j.pos0 == pos0 && j.n == n) continue;
-        j.done = false;
+        auto& jobs = efeed_[ei];
+        bool have = false;
+        for (const FeedJob& j : jobs)
+            if ((j.running || j.done) && j.live && j.pos0 == pos0 && j.n == n) { have = true; break; }
+        if (have) continue;
+        int slot = -1;
+        for (size_t s = 0; s < jobs.size(); ++s)
+            if (!jobs[s].running && !jobs[s].live) { slot = static_cast<int>(s); break; }
+        if (slot < 0) continue;   // every slot busy; prepare() reads this block when it starts
         // A failure leaves the job object clean and the next prepare reads the block synchronously.
         (void)engram_feed_start(static_cast<uint32_t>(ei), slot, pos0, hist, pos0, ids, n);
     }
 }
 
-bool Runner::engram_feed_wait(uint32_t ei, std::string& err) {
-    FeedJob& j = efeed_[ei][static_cast<size_t>(efeed_cur_[ei])];
+bool Runner::engram_feed_wait(uint32_t ei, uint32_t pos0, uint32_t n, uint32_t& slot, std::string& err) {
+    auto& jobs = efeed_[static_cast<size_t>(ei)];
+    int pick = -1;
+    for (int pass = 0; pass < 2 && pick < 0; ++pass)
+        for (size_t s = 0; s < jobs.size(); ++s) {
+            const FeedJob& j = jobs[s];
+            if (!(j.running || j.done) || j.pos0 != pos0 || j.n != n) continue;
+            if (pass == 0 && !j.live) continue;   // prefer a slot no upload has consumed yet
+            pick = static_cast<int>(s);
+            break;
+        }
+    if (pick < 0) {
+        err = "engram feed: no buffer holds this block's rows";
+        return false;
+    }
+    FeedJob& j = jobs[static_cast<size_t>(pick)];
     if (j.running) {
         j.th.join();
         j.running = false;
         if (j.ok) j.done = true;
     }
     if (!j.ok) { err = "engram feed: " + j.err; return false; }
-    if (!j.done || j.pos0 != cur_pos0_ || j.n != cur_n_) {
-        err = "engram feed: the rows in hand are not this block's";
-        return false;
-    }
+    if (!j.done) { err = "engram feed: the rows in hand are not this block's"; return false; }
+    slot = static_cast<uint32_t>(pick);
     return true;
 }
 
@@ -3011,8 +3629,11 @@ bool Runner::compress_source(uint32_t il, uint32_t ratio, std::string& err) {
     ng_src_[il] = g0 + ng_new;
     if (ng_new == 0) return true;
 
-    for (uint32_t g = 0; g < ng_new; ++g) pos_host_[g] = static_cast<int32_t>((g0 + g) * ratio);
-    cudaError_t ce = cudaMemcpyAsync(posg_, pos_host_.data(), uint64_t(ng_new) * 4, cudaMemcpyHostToDevice, stream_);
+    // The positions ride an async H2D.  Under --stage-pipeline another stage may be filling its own copy while
+    // that upload is in flight, so each stage keeps one; the serial path uses the shared vector as before.
+    int32_t* gpos = pipe_gpos_host_.empty() ? pos_host_.data() : pipe_gpos_host_[stage_cur_].data();
+    for (uint32_t g = 0; g < ng_new; ++g) gpos[g] = static_cast<int32_t>((g0 + g) * ratio);
+    cudaError_t ce = cudaMemcpyAsync(posg_, gpos, uint64_t(ng_new) * 4, cudaMemcpyHostToDevice, stream_);
     if (ce != cudaSuccess) { err = std::string("group positions upload: ") + cudaGetErrorString(ce); return false; }
 
     const float theta = theta_of(ratio);
@@ -3057,7 +3678,11 @@ bool Runner::index_source(uint32_t il, uint32_t ratio, std::string& err) {
     const LayerW& l = L_[il];
     const uint32_t n = cur_n_;
     const uint32_t src = kv_src_[il];
-    const uint32_t ng = ng_src_[src];
+    // The index key cache belongs to the kv source, which an earlier stage may own: read this stage's mirror of
+    // it, and the group count that came with the same chunk's copy, instead of the shared (stale) counters.
+    const bool xk = xsrc_[stage_cur_] != kNoSrc && src == xsrc_[stage_cur_];
+    const uint32_t ng = xk ? xsrc_ng_[stage_cur_] : ng_src_[src];
+    const uint8_t* idxk = xk ? xik_[stage_cur_] : index_k_[src];
     idx_owner_ = static_cast<int>(il);
     if (ng == 0) {
         idx_topk_ = 0;
@@ -3092,19 +3717,32 @@ bool Runner::index_source(uint32_t il, uint32_t ratio, std::string& err) {
         err = "indexer weight scale failed";
         return false;
     }
-    const bool uses_cand = kcap_ > 0 && il > cand_src_layer_ && cand_owner_ >= 0 && cand_ != nullptr;
+    // A stage whose candidate source is upstream scores inside this stage's mirror of that list instead of a
+    // local one (cand_ is allocated only on the source's own stage).
+    int32_t* cbase = cand_foreign_ ? xcand_[stage_cur_] : cand_;
+    const bool uses_cand = kcap_ > 0 && il > cand_src_layer_ && cand_owner_ >= 0 && cbase != nullptr;
     const bool is_cand = kcap_ > 0 && il == cand_src_layer_ && cand_ != nullptr;
     const uint32_t topk = std::min<uint32_t>(static_cast<uint32_t>(geo.indexer_top_k), ng);
     for (uint32_t b0 = 0; b0 < n; b0 += rb) {
         const uint32_t nr = std::min(rb, n - b0);
         const float* iq_b = iq_ + uint64_t(b0) * IH_ * IK_;
         const float* iw_b = iw_ + uint64_t(b0) * IH_;
-        int32_t* cd_b = cand_ != nullptr ? cand_ + uint64_t(b0) * (1u + kcap_) : nullptr;
+        int32_t* cd_b = cbase != nullptr ? cbase + uint64_t(b0) * (1u + kcap_) : nullptr;
         int32_t* ix_b = idx_ + uint64_t(b0) * topk;
         const int32_t* cl = uses_cand ? cd_b : nullptr;
-        if (!k::deepseek4_indexer_score(iscore_, iq_b, index_k_[src], iw_b, cl, cur_pos0_ + b0, ng, nr, IH_, IK_,
+        if (!k::deepseek4_indexer_score(iscore_, iq_b, idxk, iw_b, cl, cur_pos0_ + b0, ng, nr, IH_, IK_,
                                         ratio, cand_bs_, kcap_, nullptr, stream_)) {
-            err = "deepseek4_indexer_score failed";
+            int isc_dev = -2, idxk_dev = -2;
+            cudaPointerAttributes pa{};
+            if (cudaPointerGetAttributes(&pa, iscore_) == cudaSuccess) isc_dev = pa.device;
+            (void)cudaGetLastError();
+            if (cudaPointerGetAttributes(&pa, idxk) == cudaSuccess) idxk_dev = pa.device;
+            (void)cudaGetLastError();
+            err = "deepseek4_indexer_score failed at L" + std::to_string(il) + " on gpu " +
+                  std::to_string(st_[stage_cur_].dev) + " (pos0 " + std::to_string(cur_pos0_ + b0) + ", nr " +
+                  std::to_string(nr) + ", ng " + std::to_string(ng) + ", topk " + std::to_string(topk) +
+                  ", iscore dev " + std::to_string(isc_dev) + ", idxk dev " + std::to_string(idxk_dev) +
+                  ", iscap " + std::to_string(iscap_) + ", isrows " + std::to_string(isrows_) + ")";
             return false;
         }
         if (is_cand && !k::deepseek4_candidate_blocks(cd_b, iscore_, iscratch_, nr, cur_pos0_ + b0, ng, ratio, kcap_,
@@ -3154,20 +3792,83 @@ bool Runner::attn(uint32_t il, std::string& err) {
                                      cudaMemcpyDeviceToDevice, stream_);
     if (ce != cudaSuccess) { err = std::string("window append: ") + cudaGetErrorString(ce); return false; }
     uint32_t ng = 0, topk = 0;
+    // A stage past a source seam reads the source's compressed KV from its own mirror (xcomp_) instead of the
+    // producer's buffer; the selection is this chunk's in either case, because a consumer stage's start_chunk
+    // uploads the producer's latest selection into its own idx_.  Every other layer reads its stage's own cache.
+    const uint32_t ksrc = kv_src_[il];
+    const bool xsrc = xsrc_[stage_cur_] != kNoSrc && ksrc == xsrc_[stage_cur_];
+    const uint8_t* ckv = xsrc ? xcomp_[stage_cur_] : comp_kv_[ksrc];
+    const int32_t* ix = idx_;
     if (ratio) {
         if (is_kv_src_[il] && !compress_source(il, ratio, err)) return false;
         if (is_idx_src_[il] && !index_source(il, ratio, err)) return false;
-        ng = ng_src_[kv_src_[il]];
+        ng = xsrc ? xsrc_ng_[stage_cur_] : ng_src_[ksrc];
         if (ng) {
             if (idx_owner_ < 0) { err = "compressed layer has no topk"; return false; }
-            topk = idx_topk_;
+            topk = std::min<uint32_t>(static_cast<uint32_t>(geo.indexer_top_k), ng);
+        }
+    }
+    // The serial and decode paths carry cross-seam source state to its consumers here, synchronously: the copy
+    // is taken the moment the source layer has written it on this stage's stream.  What moves: a kv source's
+    // compressed KV and index key cache (with its live group count), an index source's selection, and the
+    // candidate source's list.  The pipelined prefill does the same through its chunk ring instead (pipe_attn_).
+    if (!pipe_attn_ && nstages_ > 1 && (is_kv_src_[il] || is_idx_src_[il])) {
+        for (uint32_t s2 = 1; s2 < nstages_; ++s2) {
+            if (s2 == stage_cur_ || s2 >= xfer_.size() || xfer_[s2].empty()) continue;
+            const bool mcomp = is_kv_src_[il] && xsrc_[s2] == il;
+            const bool midx = is_idx_src_[il] && idx_src_[stage_first_[s2]] == il;
+            const bool mcand = is_kv_src_[il] && il == cand_src_layer_ && xcand_st_[s2] != 0;
+            if (!mcomp && !midx && !mcand) continue;
+            const uint32_t ngm = ng_src_[ksrc];   // an index source that is not a kv source has no count of its own
+            const uint32_t tkm = idx_topk_ > 0 ? static_cast<uint32_t>(idx_topk_) : 0;
+            const uint64_t cb = uint64_t(ngm) * k::kDeepseek4CkvBytes;
+            const uint64_t kb = uint64_t(ngm) * k::kDeepseek4IdxkBytes;
+            const uint64_t ib = uint64_t(n) * tkm * 4;
+            const uint64_t db = uint64_t(n) * (1u + kcap_) * 4;
+            XferSlot& xs = xfer_[s2][0];
+            cudaError_t ce2 = cudaSuccess;
+            if (mcomp) {
+                ce2 = cudaMemcpyAsync(xs.comp, comp_kv_[il], cb, cudaMemcpyDeviceToHost, stream_);
+                if (ce2 == cudaSuccess)
+                    ce2 = cudaMemcpyAsync(xs.ik, index_k_[il], kb, cudaMemcpyDeviceToHost, stream_);
+            }
+            if (ce2 == cudaSuccess && midx && ib != 0)
+                ce2 = cudaMemcpyAsync(xs.idx, idx_, ib, cudaMemcpyDeviceToHost, stream_);
+            if (ce2 == cudaSuccess && mcand)
+                ce2 = cudaMemcpyAsync(xs.cand, cand_, db, cudaMemcpyDeviceToHost, stream_);
+            if (ce2 == cudaSuccess) ce2 = cudaStreamSynchronize(stream_);
+            if (ce2 != cudaSuccess) {
+                err = std::string("seam cache read: ") + cudaGetErrorString(ce2);
+                return false;
+            }
+            cudaSetDevice(st_[s2].dev);
+            if (mcomp) {
+                ce2 = cudaMemcpyAsync(xcomp_[s2], xs.comp, cb, cudaMemcpyHostToDevice, st_[s2].stream);
+                if (ce2 == cudaSuccess)
+                    ce2 = cudaMemcpyAsync(xik_[s2], xs.ik, kb, cudaMemcpyHostToDevice, st_[s2].stream);
+            }
+            if (ce2 == cudaSuccess && midx && ib != 0)
+                ce2 = cudaMemcpyAsync(st_[s2].idx, xs.idx, ib, cudaMemcpyHostToDevice, st_[s2].stream);
+            if (ce2 == cudaSuccess && mcand)
+                ce2 = cudaMemcpyAsync(xcand_[s2], xs.cand, db, cudaMemcpyHostToDevice, st_[s2].stream);
+            cudaSetDevice(st_[stage_cur_].dev);
+            if (ce2 != cudaSuccess) {
+                err = std::string("seam cache write: ") + cudaGetErrorString(ce2);
+                return false;
+            }
+            if (mcomp) xsrc_ng_[s2] = ngm;
         }
     }
     const bool compressed = ng != 0 && topk != 0;
+    if (opt_.trace && il == dump_il_) {
+        probe(("L" + std::to_string(il) + " ckv").c_str(), ckv,
+              uint64_t(ng) * k::kDeepseek4CkvBytes / 4, cur_pos0_);
+        probe(("L" + std::to_string(il) + " idx").c_str(), ix, uint64_t(n) * topk, cur_pos0_);
+    }
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(HD_)));
     if (opt_.pf_time) cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][7], stream_);
-    if (!k::deepseek4_sparse_attn(o_, q_, win_[il], compressed ? comp_kv_[kv_src_[il]] : nullptr,
-                                  compressed ? idx_ : nullptr, static_cast<const float*>(l.sinks), n, cur_pos0_,
+    if (!k::deepseek4_sparse_attn(o_, q_, win_[il], compressed ? ckv : nullptr,
+                                  compressed ? ix : nullptr, static_cast<const float*>(l.sinks), n, cur_pos0_,
                                   SWA_, ng, topk, H_, HD_, scale, 0, true, 0, stream_)) {
         err = "deepseek4_sparse_attn failed";
         return false;
@@ -3186,6 +3887,321 @@ bool Runner::attn(uint32_t il, std::string& err) {
         err = "attn output path failed";
         return false;
     }
+    return true;
+}
+
+// ---- CPU MoE (--cpu-moe) ---------------------------------------------------------------------------------------
+//
+// The Qwen/Maya-style split applied to the routed VQ experts: each layer's (token, expert) pairs are divided
+// between the host and the GPUs by expert, the host computes its share directly out of the pinned RAM image
+// with the AVX2 kernel in cpu_vq_moe.cpp, and the device's arm folds both halves together (the batched arm's
+// reduce when --moe-prefill is on, the tail otherwise).  Every layer is opened once (its codebook expanded to
+// bf16 and its 384 experts' three matrices parsed), since the image never moves.
+
+bool Runner::cpu_moe_open(std::string& err) {
+    const uint8_t* ram = parts_.ram_base();
+    if (ram == nullptr) {
+        err = "--cpu-moe needs --ram-image: the host computes out of the resident image";
+        return false;
+    }
+    if (opt_.stage_pipeline && !opt_.cpu_moe_decode) {
+        // The pipelined prefill runs layer_front/layer_back, which have no host arm; the host's share would only
+        // be computed in the serial single-chunk fallback, so a --cpu-moe without --cpu-moe-decode would start the
+        // pool and then compute nothing for a multi-chunk prompt.  Requiring the decode switch makes the intent
+        // explicit.  Decode itself goes through block()->layer()->moe(), the serial path's arm, one stage at a
+        // time, so the host buffers are not shared with another stage.
+        err = "--cpu-moe needs --cpu-moe-decode with --stage-pipeline: the pipelined prefill has no host arm, so "
+              "the host's share would be decode-only";
+        return false;
+    }
+    cpu_threads_ = opt_.cpu_moe_threads != 0
+                       ? opt_.cpu_moe_threads
+                       : std::max(1u, std::thread::hardware_concurrency() / 2u);   // physical cores on an SMT part
+    cpu_layers_.clear();
+    cpu_layers_.resize(nlayers_);
+    uint32_t nc13 = 0, nc12 = 0;
+    for (uint32_t il = 0; il < nlayers_; ++il) {
+        const Blob& b = blob_[il];
+        if (!b.v3) {
+            err = "cpu moe: layer " + std::to_string(il) + " is a v2 container; --cpu-moe wants the v3 payloads";
+            return false;
+        }
+        if (b.experts != NE_) {
+            err = "cpu moe: layer " + std::to_string(il) + " carries " + std::to_string(b.experts) +
+                  " experts, expected " + std::to_string(NE_);
+            return false;
+        }
+        CpuLayer& cl = cpu_layers_[il];
+        const k::Deepseek4VqMatrix g0 = k::deepseek4_vq_parse(ram + b.abs, b.size, 0, 0, FF_, E_);
+        if (!g0.ok) {
+            err = "cpu moe: layer " + std::to_string(il) + " expert 0 gate refused (vq error " +
+                  std::to_string(g0.err) + ")";
+            return false;
+        }
+        cl.cb.resize(static_cast<size_t>(g0.nc) * 8);
+        dsv4cpu::expand_codebook(g0.codebook, g0.nc, true, cl.cb.data());
+        cl.m.resize(static_cast<size_t>(b.experts) * 3);
+        for (uint32_t e = 0; e < b.experts; ++e) {
+            for (uint32_t w = 0; w < 3; ++w) {
+                const uint32_t rows = w < 2 ? FF_ : E_;
+                const uint32_t cols = w < 2 ? E_ : FF_;
+                const k::Deepseek4VqMatrix mm = k::deepseek4_vq_parse(ram + b.abs, b.size, e, w, rows, cols);
+                if (!mm.ok) {
+                    err = "cpu moe: layer " + std::to_string(il) + " expert " + std::to_string(e) + " matrix " +
+                          std::to_string(w) + " refused (vq error " + std::to_string(mm.err) + ")";
+                    return false;
+                }
+                dsv4cpu::Layout lay;
+                lay.codebook = mm.codebook;
+                lay.gains = mm.gains;
+                lay.stream = mm.stream;
+                lay.plane = mm.plane;
+                lay.rows = mm.rows;
+                lay.cols = mm.cols;
+                lay.nc = mm.nc;
+                lay.v3 = mm.v3 != 0;
+                dsv4cpu::open_matrix(lay, cl.cb.data(), &cl.m[static_cast<size_t>(e) * 3 + w]);
+            }
+        }
+        cl.ready = true;
+        if (g0.nc > 4096) ++nc13; else ++nc12;
+    }
+    cpu_pool_.reset(new dsv4cpu::JobPool(cpu_threads_));
+    std::fprintf(stderr,
+                 "[v41] cpu moe: %u layer(s) opened on the RAM image (%u at 13-bit, %u at 12-bit), %u worker(s)\n",
+                 nlayers_, nc13, nc12, cpu_threads_);
+    return true;
+}
+
+// The pinned buffers for one block: the activations the CPU reads (device -> host on the layer's stream) and
+// the partial rows it writes.  The output buffer is mapped so the scatter kernel reads it where it sits; both
+// grow only when a block is wider than any before it.
+bool Runner::cpu_moe_buffers(uint32_t n, std::string& err) {
+    // --cpu-moe-check's shadow jobs write up to two experts' eight rows after the host's, so the allocation
+    // carries those too; they are never read by the scatter.
+    const uint64_t rows = static_cast<uint64_t>(n) * KU_ + (opt_.cpu_moe_check ? 16u : 0u);
+    // A previous block's kernels on any stage may still be reading the mapped output or the activation
+    // buffer when a wider block asks for a reallocation (a serve request can re-enter with a larger prompt,
+    // and the stage hand-off drains only the stream it leaves).  Drain every stage's device before unmapping.
+    const bool grow_out = cpu_out_host_ == nullptr || rows > cpu_out_rows_;
+    const bool grow_x = cpu_x_host_ == nullptr || n > cpu_x_cap_;
+    if (grow_out || grow_x) {
+        int cur = 0;
+        (void)cudaGetDevice(&cur);
+        for (uint32_t s = 0; s < nstages_; ++s) {
+            if (cudaSetDevice(st_[s].dev) == cudaSuccess) (void)cudaDeviceSynchronize();
+        }
+        (void)cudaSetDevice(cur);
+    }
+    if (grow_out) {
+        if (cpu_out_host_ != nullptr) {
+            cudaFreeHost(cpu_out_host_);
+            cpu_out_host_ = nullptr;
+            cpu_out_dev_ = nullptr;
+        }
+        void* p = nullptr;
+        const size_t bytes = static_cast<size_t>(rows) * E_ * 2;
+        cudaError_t ce = cudaHostAlloc(&p, bytes, cudaHostAllocMapped | cudaHostAllocPortable);
+        if (ce != cudaSuccess) {
+            err = std::string("cpu moe: pinned output allocation failed: ") + cudaGetErrorString(ce);
+            return false;
+        }
+        cpu_out_host_ = static_cast<uint16_t*>(p);
+        ce = cudaHostGetDevicePointer(reinterpret_cast<void**>(&cpu_out_dev_), cpu_out_host_, 0);
+        if (ce != cudaSuccess) {
+            err = std::string("cpu moe: mapped output pointer failed: ") + cudaGetErrorString(ce);
+            return false;
+        }
+        cpu_out_rows_ = rows;
+    }
+    if (grow_x) {
+        if (cpu_x_host_ != nullptr) cudaFreeHost(cpu_x_host_);
+        void* p = nullptr;
+        const cudaError_t ce = cudaHostAlloc(&p, static_cast<size_t>(n) * E_ * 4, cudaHostAllocPortable);
+        if (ce != cudaSuccess) {
+            err = std::string("cpu moe: pinned activation allocation failed: ") + cudaGetErrorString(ce);
+            return false;
+        }
+        cpu_x_host_ = static_cast<float*>(p);
+        cpu_x_cap_ = n;
+    }
+    return true;
+}
+
+// Divide this layer: the N most-selected experts become the host's, their pairs are marked -1 in sel_host_,
+// and one job per host expert is built over that expert's tokens (in job-block order, so each job's output is
+// a contiguous run of cpu_out_host_).  Under --cpu-moe-check two GPU-owned experts are recomputed too, for
+// their first eight tokens only, as shadow rows the scatter does not touch.
+bool Runner::cpu_moe_plan(uint32_t il, uint32_t n, std::string& err) {
+    CpuLayer& cl = cpu_layers_[il];
+    if (!cl.ready) { err = "cpu moe: layer " + std::to_string(il) + " was not opened"; return false; }
+    const uint32_t np = n * KU_;
+    cpu_sel_keep_.assign(sel_host_.begin(), sel_host_.begin() + np);
+
+    cpu_count_.assign(NE_, 0);
+    for (uint32_t i = 0; i < np; ++i) {
+        const int32_t e = cpu_sel_keep_[i];
+        if (e >= 0 && static_cast<uint32_t>(e) < NE_) ++cpu_count_[static_cast<size_t>(e)];
+    }
+    std::vector<uint32_t> order(NE_);
+    for (uint32_t e = 0; e < NE_; ++e) order[e] = e;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](uint32_t a, uint32_t b) { return cpu_count_[a] > cpu_count_[b]; });
+    uint32_t n_cpu = std::min(opt_.cpu_moe, NE_);
+    if (opt_.cpu_moe_share != 0 && n_cpu != 0) {
+        // --cpu-moe-share: walk the hottest experts until the host has its percentage of this block's pairs.
+        // The expert count stays a cap.  Ceil, so a small share still takes the hottest expert rather than none.
+        const uint32_t target = static_cast<uint32_t>((uint64_t(np) * opt_.cpu_moe_share + 99u) / 100u);
+        uint32_t cum = 0, pick = 0;
+        while (pick < n_cpu && cum < target) cum += cpu_count_[order[pick++]];
+        n_cpu = pick;
+    }
+    cpu_owner_.assign(NE_, 0);
+    for (uint32_t j = 0; j < n_cpu; ++j) cpu_owner_[order[j]] = 1;
+
+    cpu_jobs_.clear();
+    cpu_job_off_.clear();
+    cpu_job_rows_.clear();
+    cpu_toks_.clear();
+    cpu_pair_host_.clear();
+    cpu_check_.clear();
+
+    std::vector<uint32_t> expert_job(NE_, ~0u);
+    uint32_t row = 0;
+    for (uint32_t j = 0; j < n_cpu; ++j) {
+        const uint32_t e = order[j];
+        if (cpu_count_[e] == 0) continue;
+        dsv4cpu::Job job;
+        job.gate = &cl.m[static_cast<size_t>(e) * 3];
+        job.up = job.gate + 1;
+        job.down = job.gate + 2;
+        job.n_tok = cpu_count_[e];
+        job.out = cpu_out_host_ + static_cast<size_t>(row) * E_;
+        job.out_stride = E_;
+        expert_job[e] = static_cast<uint32_t>(cpu_jobs_.size());
+        cpu_job_off_.push_back(static_cast<uint32_t>(cpu_toks_.size()));
+        cpu_job_rows_.push_back(row);
+        cpu_toks_.resize(cpu_toks_.size() + job.n_tok);
+        cpu_jobs_.push_back(job);
+        row += job.n_tok;
+    }
+    const uint32_t own_jobs = static_cast<uint32_t>(cpu_jobs_.size());
+    // Fill the token lists (job-block order) and mark the host's pairs.
+    std::vector<uint32_t> fill(cpu_job_off_);
+    cpu_pair_host_.resize(row);
+    for (uint32_t t = 0; t < n; ++t) {
+        for (uint32_t k = 0; k < KU_; ++k) {
+            const uint32_t i = t * KU_ + k;
+            const int32_t e = cpu_sel_keep_[i];
+            if (e < 0 || static_cast<uint32_t>(e) >= NE_ || !cpu_owner_[static_cast<size_t>(e)]) continue;
+            const uint32_t j = expert_job[static_cast<size_t>(e)];
+            cpu_toks_[fill[j]++] = t;
+            sel_host_[i] = -1;
+        }
+    }
+    // Row -> pair, in the same job-block order the outputs are written in.
+    std::vector<uint32_t> cur(cpu_job_rows_);
+    for (uint32_t t = 0; t < n; ++t) {
+        for (uint32_t k = 0; k < KU_; ++k) {
+            const uint32_t i = t * KU_ + k;
+            const int32_t e = cpu_sel_keep_[i];
+            if (e < 0 || static_cast<uint32_t>(e) >= NE_ || !cpu_owner_[static_cast<size_t>(e)]) continue;
+            const uint32_t j = expert_job[static_cast<size_t>(e)];
+            cpu_pair_host_[cur[j]++] = static_cast<int32_t>(i);
+        }
+    }
+
+    // Shadow jobs (--cpu-moe-check): up to two GPU-owned experts, first eight tokens, rows after the host's.
+    // Prefill only: the check documents the block path, and a decode plan would spend work on every token.
+    if (opt_.cpu_moe_check && !in_decode_ && cpu_checked_ < 3) {
+        uint32_t picked = 0;
+        for (uint32_t j = n_cpu; j < NE_ && picked < 2; ++j) {
+            const uint32_t e = order[j];
+            if (cpu_count_[e] == 0) continue;
+            std::vector<uint32_t> toks;
+            std::vector<uint32_t> pairs;
+            for (uint32_t t = 0; t < std::min(8u, n) && toks.size() < 8; ++t) {
+                for (uint32_t k = 0; k < KU_; ++k) {
+                    const uint32_t i = t * KU_ + k;
+                    if (cpu_sel_keep_[i] == static_cast<int32_t>(e)) {
+                        toks.push_back(t);
+                        pairs.push_back(i);
+                    }
+                }
+            }
+            if (toks.empty()) continue;
+            dsv4cpu::Job job;
+            job.gate = &cl.m[static_cast<size_t>(e) * 3];
+            job.up = job.gate + 1;
+            job.down = job.gate + 2;
+            job.n_tok = static_cast<uint32_t>(toks.size());
+            job.out = cpu_out_host_ + static_cast<size_t>(row) * E_;
+            job.out_stride = E_;
+            const uint32_t job_index = static_cast<uint32_t>(cpu_jobs_.size());
+            cpu_job_off_.push_back(static_cast<uint32_t>(cpu_toks_.size()));
+            cpu_job_rows_.push_back(row);
+            cpu_toks_.insert(cpu_toks_.end(), toks.begin(), toks.end());
+            cpu_jobs_.push_back(job);
+            for (size_t r = 0; r < pairs.size(); ++r) cpu_check_.push_back(CpuCheck{job_index, row + static_cast<uint32_t>(r), pairs[r]});
+            row += job.n_tok;
+            ++picked;
+        }
+    }
+
+    // The token pointers must not move after this point (the vector is not touched again while jobs run).
+    for (size_t j = 0; j < cpu_jobs_.size(); ++j)
+        cpu_jobs_[j].toks = cpu_toks_.data() + cpu_job_off_[j];
+    if (!cpu_note_) {
+        cpu_note_ = true;
+        const uint32_t own = static_cast<uint32_t>(cpu_pair_host_.size());
+        std::fprintf(stderr,
+                     "[v41] cpu moe: L%02u: %u of %u pairs on %u expert(s), %u job(s); %u pair(s) to the GPUs\n", il,
+                     own, np, own_jobs, static_cast<uint32_t>(cpu_jobs_.size()), np - own);
+    }
+    return true;
+}
+
+// Compare the CPU's shadow rows with the arm's partial rows for the same (token, expert) pairs.
+bool Runner::cpu_moe_check_layer(uint32_t il, uint32_t n, bool sorted, const int32_t* d_inv, std::string& err) {
+    (void)n;
+    std::vector<float> gpu(E_);
+    double amax = 0.0, dmax = 0.0;
+    size_t cnt = 0, exact = 0;
+    for (const CpuCheck& c : cpu_check_) {
+        uint64_t slot = c.pair;
+        if (sorted) {
+            int32_t p = -1;
+            const cudaError_t ie = cudaMemcpy(&p, d_inv + c.pair, 4, cudaMemcpyDeviceToHost);
+            if (ie != cudaSuccess || p < 0) {
+                err = "cpu moe check: no sorted slot for a shadow pair";
+                return false;
+            }
+            slot = static_cast<uint64_t>(p);
+        }
+        const cudaError_t ce = cudaMemcpy(gpu.data(), partial_ + slot * E_, static_cast<size_t>(E_) * 4,
+                                          cudaMemcpyDeviceToHost);
+        if (ce != cudaSuccess) {
+            err = std::string("cpu moe check: readback failed: ") + cudaGetErrorString(ce);
+            return false;
+        }
+        const uint16_t* cpu = cpu_out_host_ + static_cast<size_t>(c.row) * E_;
+        for (uint32_t o = 0; o < E_; ++o) {
+            const uint32_t u = static_cast<uint32_t>(cpu[o]) << 16;
+            float a;
+            std::memcpy(&a, &u, 4);
+            amax = std::max(amax, static_cast<double>(std::fabs(gpu[o])));
+            const double d = static_cast<double>(std::fabs(a - gpu[o]));
+            dmax = std::max(dmax, d);
+            ++cnt;
+            if (d == 0.0) ++exact;
+        }
+    }
+    ++cpu_checked_;
+    std::fprintf(stderr,
+                 "[v41] cpu moe check L%02u: ref max %.4g, max|d| %.4g, rel %.2g, exact %.1f%% (%zu row(s))%s\n",
+                 il, amax, dmax, amax > 0.0 ? dmax / amax : dmax,
+                 100.0 * static_cast<double>(exact) / static_cast<double>(cnt ? cnt : 1), cnt,
+                 amax > 0.0 && dmax > amax * 0.05 ? "  <- mismatch" : "");
     return true;
 }
 
@@ -3210,6 +4226,16 @@ bool Runner::moe(uint32_t il, std::string& err) {
         err = "deepseek4_router failed";
         return false;
     }
+    // --cpu-moe: the host computes its share of this layer's experts, so the block's activations are copied to
+    // pinned host memory on the same stream as the selection readback (one sync covers both).  The workers then
+    // run while the per-pair GPU arm blocks its stream below.  Off for decode and blocks of kGemvMaxTok or fewer,
+    // which keep the plain path, unless --cpu-moe-decode asks for those steps too.
+    const bool cpu_arm = opt_.cpu_moe != 0 && (n > kGemvMaxTok || opt_.cpu_moe_decode);
+    if (cpu_arm && !cpu_moe_buffers(n, err)) return false;
+    if (cpu_arm) {
+        const cudaError_t xe = cudaMemcpyAsync(cpu_x_host_, xn_, uint64_t(n) * E_ * 4, cudaMemcpyDeviceToHost, stream_);
+        if (xe != cudaSuccess) { err = std::string("cpu moe activation readback: ") + cudaGetErrorString(xe); return false; }
+    }
     cudaError_t ce = cudaMemcpyAsync(sel_host_.data(), sel_, uint64_t(n) * KU_ * 4, cudaMemcpyDeviceToHost, stream_);
     if (ce != cudaSuccess) { err = std::string("selection readback: ") + cudaGetErrorString(ce); return false; }
     if (cudaStreamSynchronize(stream_) != cudaSuccess) { err = "selection readback sync failed"; return false; }
@@ -3219,14 +4245,61 @@ bool Runner::moe(uint32_t il, std::string& err) {
         pf_flush();
         cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][1], stream_);
     }
+    if (cpu_arm) {
+        // Divide the layer: mark the CPU's pairs -1 (stage_blob skips them, the arm writes zeros for them) and
+        // send the marked selection back before the arm reads it.
+        if (!cpu_moe_plan(il, n, err)) return false;
+        const cudaError_t se = cudaMemcpyAsync(sel_, sel_host_.data(), uint64_t(n) * KU_ * 4, cudaMemcpyHostToDevice,
+                                               stream_);
+        if (se != cudaSuccess) { err = std::string("cpu moe selection upload: ") + cudaGetErrorString(se); return false; }
+    }
     if (!stage_blob(il, sel_host_.data(), n * KU_, err)) return false;
     if (opt_.pf_time) cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][2], stream_);
     const bool tail = n <= kGemvMaxTok;
     bool used_prefill = false;
+    // --cpu-moe: start the host's share first.  The arm below is the same one a full-prefill layer uses; with the
+    // host owning some pairs it takes the split entry, which does not synchronize, so its three stage launches
+    // overlap the host workers.  (The per-pair fallback writes zeros for the host's pairs; the scatter below
+    // overwrites them.)
+    double arm_t0 = now_sec();
+    uint32_t cpu_rows = 0;
+    cudaEvent_t* const cpu_ev = cpu_ev_[stage_cur_];
+    if (cpu_arm && !tail && opt_.moe_prefill) {
+        // The split entry does not synchronize, so its wall time is bracketed by two stream events.  This runs
+        // before the host pool starts, so a failed record leaves no worker running.
+        if (cpu_ev[0] == nullptr) {
+            const cudaError_t e0 = cudaEventCreate(&cpu_ev[0]);
+            const cudaError_t e1 = e0 == cudaSuccess ? cudaEventCreate(&cpu_ev[1]) : e0;
+            if (e0 != cudaSuccess || e1 != cudaSuccess) {
+                err = std::string("cpu moe: timing event creation failed: ") +
+                      cudaGetErrorString(e0 != cudaSuccess ? e0 : e1);
+                return false;
+            }
+        }
+        const cudaError_t re = cudaEventRecord(cpu_ev[0], stream_);
+        if (re != cudaSuccess) {
+            err = std::string("cpu moe: timing event record failed: ") + cudaGetErrorString(re);
+            return false;
+        }
+    }
+    if (cpu_arm && !cpu_jobs_.empty()) cpu_pool_->run(cpu_jobs_.data(), static_cast<uint32_t>(cpu_jobs_.size()),
+                                                      cpu_x_host_, E_, clamp_);
     if (!tail && opt_.moe_prefill) {
-        used_prefill = k::deepseek4_routed_moe_prefill(
-            y_, partial_, layer_container_, stage_used_, E_, FF_, E_, sel_host_.data(), rw_, KU_, clamp_, xn_, n, NE_,
-            blob_[il].nc, blob_[il].v3 ? 1u : 0u, &st_[stage_cur_].pf, stream_);
+        used_prefill = cpu_arm
+                           ? k::deepseek4_routed_moe_prefill_partial(
+                                 partial_, layer_container_, stage_used_, E_, FF_, E_, sel_host_.data(), KU_, clamp_,
+                                 xn_, n, NE_, blob_[il].nc, blob_[il].v3 ? 1u : 0u, &st_[stage_cur_].pf, stream_)
+                           : k::deepseek4_routed_moe_prefill(
+                                 y_, partial_, layer_container_, stage_used_, E_, FF_, E_, sel_host_.data(), rw_, KU_,
+                                 clamp_, xn_, n, NE_, blob_[il].nc, blob_[il].v3 ? 1u : 0u, &st_[stage_cur_].pf,
+                                 stream_);
+        if (used_prefill && cpu_ev[1] != nullptr) {
+            const cudaError_t re = cudaEventRecord(cpu_ev[1], stream_);
+            if (re != cudaSuccess) {
+                err = std::string("cpu moe: timing event record failed: ") + cudaGetErrorString(re);
+                return false;
+            }
+        }
         if (!used_prefill && !pf_note_) {
             pf_note_ = true;
             std::fprintf(stderr, "[v41] moe prefill: declined at L%02u (%u tokens); the per-pair arm answers\n", il,
@@ -3234,10 +4307,70 @@ bool Runner::moe(uint32_t il, std::string& err) {
         }
     }
     if (!used_prefill &&
-        !k::deepseek4_routed_moe(tail ? nullptr : y_, partial_, layer_container_, stage_used_, E_, FF_, E_, sel_, rw_, KU_,
-                                 clamp_, xn_, n, blob_[il].nc, blob_[il].v3 ? 1u : 0u, nullptr, stream_)) {
+        !k::deepseek4_routed_moe((tail || cpu_arm) ? nullptr : y_, partial_, layer_container_, stage_used_, E_, FF_, E_,
+                                 sel_, rw_, KU_, clamp_, xn_, n, blob_[il].nc, blob_[il].v3 ? 1u : 0u, nullptr,
+                                 stream_)) {
         err = "deepseek4_routed_moe failed";
         return false;
+    }
+    if (cpu_arm) {
+        double arm_sec = now_sec() - arm_t0;
+        cpu_rows = static_cast<uint32_t>(cpu_pair_host_.size());
+        if (!cpu_jobs_.empty()) cpu_pool_->wait();
+        // --cpu-moe-check: the arm's reference partials are on the device now, so compare before filling.  The
+        // batched arm leaves them at sorted slots, the per-pair arm at the pair index.
+        if (opt_.cpu_moe_check && cpu_checked_ < 3 && !cpu_check_.empty() &&
+            !cpu_moe_check_layer(il, n, used_prefill, used_prefill ? st_[stage_cur_].pf.inv : nullptr, err))
+            return false;
+        if (used_prefill) {
+            // The split entry returned at enqueue time; its end event marks the last down-stage kernel, which is
+            // the GPU share's wall time (the fill and reduce below are after it).
+            float ms = 0.0f;
+            if (cudaEventSynchronize(cpu_ev[1]) == cudaSuccess &&
+                cudaEventElapsedTime(&ms, cpu_ev[0], cpu_ev[1]) == cudaSuccess)
+                arm_sec = static_cast<double>(ms) * 1e-3;
+        }
+        if (used_prefill) {
+            // The batched arm planned every pair: the host's pairs are slots after the sorted GPU rows, and the
+            // reduce sums all of them.  Fill the slots from the pinned rows; the kernel maps pair -> slot through
+            // the device's inv, so no host-side copy of the sort is needed.
+            if (cpu_pair_dev_[stage_cur_] == nullptr) { err = "cpu moe: this stage has no pair buffer"; return false; }
+            const cudaError_t pe = cudaMemcpyAsync(cpu_pair_dev_[stage_cur_], cpu_pair_host_.data(),
+                                                   uint64_t(cpu_rows) * 4, cudaMemcpyHostToDevice, stream_);
+            if (pe != cudaSuccess) { err = std::string("cpu moe pair upload: ") + cudaGetErrorString(pe); return false; }
+            if (!k::deepseek4_routed_moe_prefill_fill_cpu(partial_, st_[stage_cur_].pf.inv, cpu_pair_dev_[stage_cur_],
+                                                          cpu_out_dev_, cpu_rows, E_, stream_)) {
+                err = "cpu moe: host row fill failed";
+                return false;
+            }
+            if (!k::deepseek4_routed_moe_prefill_reduce(y_, partial_, st_[stage_cur_].pf.inv, rw_, KU_, n, E_,
+                                                        stream_)) {
+                err = "cpu moe: prefill reduce failed";
+                return false;
+            }
+        } else if (cpu_rows != 0) {
+            // The per-pair arm's stream is drained (that entry synchronizes), so its zeros for the CPU pairs are
+            // already in partial_; scatter the host's bf16 rows over them.  The kernel reads the pinned, mapped
+            // host buffer directly, so a row costs one PCIe read rather than a staging copy.
+            if (cpu_pair_dev_[stage_cur_] == nullptr) { err = "cpu moe: this stage has no pair buffer"; return false; }
+            const cudaError_t pe = cudaMemcpyAsync(cpu_pair_dev_[stage_cur_], cpu_pair_host_.data(),
+                                                   uint64_t(cpu_rows) * 4, cudaMemcpyHostToDevice, stream_);
+            if (pe != cudaSuccess) { err = std::string("cpu moe pair upload: ") + cudaGetErrorString(pe); return false; }
+            // grid.y is capped at 65535 blocks, so a very wide block (> ~10.9k tokens at top-6) scatters in
+            // row groups.  The source row and its pair index both start at r0.
+            constexpr uint32_t kRowGroup = 65535u;
+            for (uint32_t r0 = 0; r0 < cpu_rows; r0 += kRowGroup) {
+                const uint32_t nr = (cpu_rows - r0 < kRowGroup) ? (cpu_rows - r0) : kRowGroup;
+                cpu_moe_scatter_kernel<<<dim3((E_ + 255u) / 256u, nr), 256, 0, stream_>>>(
+                    partial_, cpu_out_dev_ + static_cast<uint64_t>(r0) * E_,
+                    cpu_pair_dev_[stage_cur_] + r0, nr, E_);
+                if (cudaGetLastError() != cudaSuccess) { err = "cpu moe scatter failed"; return false; }
+            }
+        }
+        cpu_rows_total_ += cpu_rows;
+        cpu_pairs_total_ += uint64_t(n) * KU_;
+        cpu_sec_total_ += cpu_jobs_.empty() ? 0.0 : cpu_pool_->last_sec();
+        cpu_arm_sec_total_ += arm_sec;
     }
     if (opt_.pf_time) {
         cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][3], stream_);
@@ -3249,9 +4382,11 @@ bool Runner::moe(uint32_t il, std::string& err) {
         pf_ev_bytes_ = stage_read_;   // bytes this layer pulled, not the container's size (a hit pulls none)
         pf_ev_pending_ = true;
     }
-    if (used_prefill && opt_.moe_prefill_check && pf_checked_ < 3) {
+    if (used_prefill && !cpu_arm && opt_.moe_prefill_check && pf_checked_ < 3) {
         // --moe-prefill-check: the per-pair arm on this block's first kGemvMaxTok tokens, into attn_out_ (free
         // until the next layer's attention).  That entry synchronizes, so both outputs are complete on return.
+        // (--cpu-moe layers are left out: the per-pair reference would compute only the GPU's pairs, so the two
+        // sides would not describe the same sum.  --cpu-moe-check compares those rows instead.)
         if (!k::deepseek4_routed_moe(attn_out_, partial_, layer_container_, stage_used_, E_, FF_, E_, sel_, rw_, KU_,
                                      clamp_, xn_, kGemvMaxTok, blob_[il].nc, blob_[il].v3 ? 1u : 0u, nullptr,
                                      stream_)) {
@@ -3282,7 +4417,12 @@ bool Runner::moe(uint32_t il, std::string& err) {
                      100.0 * static_cast<double>(exact) / static_cast<double>(cnt), kGemvMaxTok,
                      dmax > amax * 0.05f ? "  <- mismatch" : "");
     }
-    if (tail) {
+    if (tail || (cpu_arm && !used_prefill)) {
+        // The tail is the per-pair partials' reduce (+ the shared expert, one bf16 round).  It is what the
+        // mixed CPU/GPU layer needs on the per-pair arm: the device's rows and the host's scattered rows are one
+        // partial_ array by the time it runs, and its k order is the add/round path's, so the result is the same
+        // value.  The batched split arm instead ends with its own reduce over the pair space (host slots
+        // included), so that layer takes the add/round path below like any other prefill layer.
         if (!k::deepseek4_moe_tail(y_, partial_, rw_, so_, n, KU_, E_, stream_)) {
             err = "deepseek4_moe_tail failed";
             return false;
@@ -3329,7 +4469,8 @@ bool Runner::layer(uint32_t il, std::string& err) {
         }
         mainh_wrote_ = rows;
     }
-    if (opt_.trace) probe(("L" + std::to_string(il) + " hc_in").c_str(), hc_, uint64_t(cur_n_) * HC_ * E_);
+    if (opt_.trace) probe(("L" + std::to_string(il) + " hc_in").c_str(), hc_, uint64_t(cur_n_) * HC_ * E_,
+                          cur_pos0_);
     if (!hc_half(il, true, err)) return false;
     if (opt_.pf_time) cudaEventRecord(pf_ev_[stage_cur_][pf_slot_][5], stream_);
     if (!attn(il, err)) return false;
@@ -3341,13 +4482,204 @@ bool Runner::layer(uint32_t il, std::string& err) {
     std::swap(hc_, hc2_);
     if (!hc_half(il, false, err)) return false;
     if (!moe(il, err)) return false;
+    if (opt_.trace && il == dump_il_)
+        probe(("L" + std::to_string(il) + " moe").c_str(), y_, uint64_t(cur_n_) * E_, cur_pos0_);
     if (!k::deepseek4_hc_post(y_, hc_, post_, comb_, hc2_, E_, HC_, cur_n_, stream_)) {
         err = "hc_post (ffn) failed";
         return false;
     }
     std::swap(hc_, hc2_);
-    if (opt_.trace) probe(("L" + std::to_string(il) + " hc_out").c_str(), hc_, uint64_t(cur_n_) * HC_ * E_);
+    if (opt_.trace) probe(("L" + std::to_string(il) + " hc_out").c_str(), hc_, uint64_t(cur_n_) * HC_ * E_,
+                          cur_pos0_);
     return true;
+}
+
+// ---- P9: the two host phases of a layer, and the pipelined prefill ----------------------------------------------
+//
+// The serial path runs one stage to its end, then the next; on four devices that leaves three idle while the
+// host waits on fourth's router readback.  The pipeline keeps one chunk in every stage: a stage issues a layer's
+// front (engram, attention, shared expert and the router) and moves on, and the front's selection readback lands
+// in that stage's own host buffer behind an event.  The back (expert staging, the routed MoE and the layer's
+// tail) runs when the event says the selection is complete.  Within a stage everything stays on its stream in
+// layer order, so each layer still sees the previous one's output; across stages the four GPUs run at once.
+//
+// A stage's exit hands the chunk's hidden state and premix to the next through a ring of pinned slots.  The
+// producer queues the copies on its stream and records `done`; the consumer starts the chunk only when `done`
+// is complete, queues its H2D and records `taken`; the producer reuses a slot only after that `taken` is done.
+// Every host-side scratch a stage may still have in flight (the router's selection, the positions, the expert
+// staging buffer) is per stage for the same reason.
+
+bool Runner::layer_front(uint32_t il, std::string& err) {
+    const uint32_t n = cur_n_;
+    if (engram_of_[il] >= 0 && engram_on_ && !engram_layer(il, err)) return false;
+    // DSpark: capture the target layers' attention input (the hc four-route mean, after the engram and before the
+    // layer) into the main-hidden ring.  --stage-pipeline is multi-stage, where --dspark is refused, so this is
+    // the serial path's behaviour kept in one place.
+    if (mtp_on_ && mtp_slot_[il] >= 0) {
+        const uint32_t rows = cur_n_ < mainh_cap_ ? cur_n_ : mainh_cap_;
+        const uint32_t src0 = cur_n_ - rows;
+        if (!k::deepseek4_hc_mean(mainh_, hc_, E_, HC_, rows, src0, static_cast<uint32_t>(mtp_slot_[il]),
+                                  mtp_n_target_, cur_pos0_ + src0, mainh_cap_, stream_)) {
+            err = "main-hidden capture failed";
+            return false;
+        }
+        mainh_wrote_ = rows;
+    }
+    if (opt_.trace) probe(("L" + std::to_string(il) + " hc_in").c_str(), hc_, uint64_t(cur_n_) * HC_ * E_,
+                          cur_pos0_);
+    if (!hc_half(il, true, err)) return false;
+    if (!attn(il, err)) return false;
+    if (opt_.trace && il == dump_il_)
+        probe(("L" + std::to_string(il) + " attn").c_str(), attn_out_, uint64_t(cur_n_) * E_, cur_pos0_);
+    if (!k::deepseek4_hc_post(attn_out_, hc_, post_, comb_, hc2_, E_, HC_, cur_n_, stream_)) {
+        err = "hc_post (attn) failed";
+        return false;
+    }
+    std::swap(hc_, hc2_);
+    if (!hc_half(il, false, err)) return false;
+    // Shared expert and router.  The shared expert does not depend on the selection, so it belongs to the front;
+    // the routed MoE, which does, is the back.
+    const LayerW& l = L_[il];
+    if (!k::deepseek4_matmul_q4k(sg_, l.shexp_gate, xn_, E_, FF_, n, true, stream_) ||
+        !k::deepseek4_matmul_q4k(su_, l.shexp_up, xn_, E_, FF_, n, true, stream_) ||
+        !k::deepseek4_swiglu(sh_, sg_, su_, uint64_t(n) * FF_, clamp_, stream_) ||
+        !k::deepseek4_matmul_q4k(so_, l.shexp_down, sh_, FF_, E_, n, true, stream_)) {
+        err = "shared expert failed";
+        return false;
+    }
+    if (!k::deepseek4_matmul_bf16(glog_, static_cast<const uint16_t*>(l.gate_inp), xn_, E_, NE_, n, false, stream_)) {
+        err = "router gate failed";
+        return false;
+    }
+    if (!k::deepseek4_router(sel_, rw_, glog_, static_cast<const float*>(l.exp_bias), nullptr, nullptr, n, NE_, KU_,
+                             route_scale_, stream_)) {
+        err = "deepseek4_router failed";
+        return false;
+    }
+    // The readback is queued, not waited: the event is recorded after it on this stream, and the scheduler
+    // checks the event before running the back.
+    const cudaError_t ce = cudaMemcpyAsync(pipe_sel_host_[stage_cur_].data(), sel_, uint64_t(n) * KU_ * 4,
+                                           cudaMemcpyDeviceToHost, stream_);
+    if (ce != cudaSuccess) { err = std::string("selection readback: ") + cudaGetErrorString(ce); return false; }
+    return true;
+}
+
+bool Runner::layer_back(uint32_t il, std::string& err) {
+    const uint32_t n = cur_n_;
+    const cudaError_t ce = cudaEventSynchronize(run_[stage_cur_].sel_ev);
+    if (ce != cudaSuccess) { err = std::string("selection readback wait: ") + cudaGetErrorString(ce); return false; }
+    const int32_t* sel = pipe_sel_host_[stage_cur_].data();
+    if (!stage_blob(il, sel, n * KU_, err)) return false;
+    const bool tail = n <= kGemvMaxTok;
+    bool used_prefill = false;
+    if (!tail && opt_.moe_prefill) {
+        used_prefill = k::deepseek4_routed_moe_prefill(
+            y_, partial_, layer_container_, stage_used_, E_, FF_, E_, sel, rw_, KU_, clamp_, xn_, n, NE_, blob_[il].nc,
+            blob_[il].v3 ? 1u : 0u, &st_[stage_cur_].pf, stream_);
+        if (!used_prefill && !pf_note_) {
+            pf_note_ = true;
+            std::fprintf(stderr, "[v41] moe prefill: declined at L%02u (%u tokens); the per-pair arm answers\n", il,
+                         n);
+        }
+    }
+    if (!used_prefill &&
+        !k::deepseek4_routed_moe(tail ? nullptr : y_, partial_, layer_container_, stage_used_, E_, FF_, E_, sel_, rw_, KU_,
+                                 clamp_, xn_, n, blob_[il].nc, blob_[il].v3 ? 1u : 0u, nullptr, stream_)) {
+        err = "deepseek4_routed_moe failed";
+        return false;
+    }
+    if (used_prefill && opt_.moe_prefill_check && pf_checked_ < 3) {
+        // --moe-prefill-check: the per-pair arm on this block's first kGemvMaxTok tokens, into attn_out_ (free
+        // until the next layer's attention).  That entry synchronizes, so both outputs are complete on return.
+        if (!k::deepseek4_routed_moe(attn_out_, partial_, layer_container_, stage_used_, E_, FF_, E_, sel_, rw_, KU_,
+                                     clamp_, xn_, kGemvMaxTok, blob_[il].nc, blob_[il].v3 ? 1u : 0u, nullptr,
+                                     stream_)) {
+            err = "moe prefill check: the per-pair reference failed";
+            return false;
+        }
+        const size_t cnt = static_cast<size_t>(kGemvMaxTok) * E_;
+        std::vector<float> a(cnt), b(cnt);
+        if (cudaMemcpy(a.data(), y_, cnt * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(b.data(), attn_out_, cnt * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = "moe prefill check: readback failed";
+            return false;
+        }
+        float amax = 0.0f, dmax = 0.0f;
+        size_t exact = 0;
+        for (size_t i = 0; i < cnt; ++i) {
+            amax = std::max(amax, std::fabs(b[i]));
+            const float d = std::fabs(a[i] - b[i]);
+            dmax = std::max(dmax, d);
+            if (d == 0.0f) ++exact;
+        }
+        ++pf_checked_;
+        std::fprintf(stderr,
+                     "[v41] moe prefill check L%02u: ref max %.4g, max|d| %.4g, rel %.2g, exact %.1f%% (%u "
+                     "tokens)%s\n",
+                     il, static_cast<double>(amax), static_cast<double>(dmax),
+                     static_cast<double>(amax > 0.0f ? dmax / amax : dmax),
+                     100.0 * static_cast<double>(exact) / static_cast<double>(cnt), kGemvMaxTok,
+                     dmax > amax * 0.05f ? "  <- mismatch" : "");
+    }
+    if (tail) {
+        if (!k::deepseek4_moe_tail(y_, partial_, rw_, so_, n, KU_, E_, stream_)) {
+            err = "deepseek4_moe_tail failed";
+            return false;
+        }
+    } else {
+        if (!k::deepseek4_add(y_, so_, uint64_t(n) * E_, stream_) ||
+            !k::deepseek4_round_bf16(y_, uint64_t(n) * E_, stream_)) {
+            err = "moe add/round failed";
+            return false;
+        }
+    }
+    if (opt_.trace && il == dump_il_)
+        probe(("L" + std::to_string(il) + " moe").c_str(), y_, uint64_t(cur_n_) * E_, cur_pos0_);
+    if (!k::deepseek4_hc_post(y_, hc_, post_, comb_, hc2_, E_, HC_, cur_n_, stream_)) {
+        err = "hc_post (ffn) failed";
+        return false;
+    }
+    std::swap(hc_, hc2_);
+    if (opt_.trace) probe(("L" + std::to_string(il) + " hc_out").c_str(), hc_, uint64_t(cur_n_) * HC_ * E_,
+                          cur_pos0_);
+    return true;
+}
+
+void Runner::pipe_close() {
+    for (size_t s = 0; s < run_.size() && s < st_.size(); ++s) {
+        if (run_[s].sel_ev == nullptr) continue;
+        cudaSetDevice(st_[s].dev);
+        cudaEventDestroy(run_[s].sel_ev);
+        run_[s].sel_ev = nullptr;
+    }
+    for (size_t s = 0; s < seam_.size() && s + 1 < st_.size(); ++s)
+        for (auto& sl : seam_[s]) {
+            cudaSetDevice(st_[s].dev);
+            if (sl.done != nullptr) { cudaEventDestroy(sl.done); sl.done = nullptr; }
+            if (sl.hc_pinned) { cudaFreeHost(sl.hc); sl.hc = nullptr; }
+            if (sl.prem_pinned) { cudaFreeHost(sl.prem); sl.prem = nullptr; }
+            cudaSetDevice(st_[s + 1].dev);
+            if (sl.taken != nullptr) { cudaEventDestroy(sl.taken); sl.taken = nullptr; }
+        }
+    seam_.clear();
+    for (size_t s = 1; s < xfer_.size() && s < st_.size(); ++s) {
+        uint32_t src_stage = 0;
+        if (s < xsrc_.size() && xsrc_[s] != kNoSrc) {
+            while (src_stage + 1 < nstages_ && xsrc_[s] >= stage_first_[src_stage + 1]) ++src_stage;
+            cudaSetDevice(st_[src_stage].dev);
+        }
+        for (auto& xs : xfer_[s]) {
+            if (xs.done != nullptr) { cudaEventDestroy(xs.done); xs.done = nullptr; }
+            if (xs.comp_pinned && xs.comp != nullptr) { cudaFreeHost(xs.comp); xs.comp = nullptr; }
+            if (xs.ik_pinned && xs.ik != nullptr) { cudaFreeHost(xs.ik); xs.ik = nullptr; }
+            if (xs.idx_pinned && xs.idx != nullptr) { cudaFreeHost(xs.idx); xs.idx = nullptr; }
+            if (xs.cand_pinned && xs.cand != nullptr) { cudaFreeHost(xs.cand); xs.cand = nullptr; }
+        }
+        cudaSetDevice(st_[s].dev);
+        for (auto& xs : xfer_[s])
+            if (xs.taken != nullptr) { cudaEventDestroy(xs.taken); xs.taken = nullptr; }
+    }
+    xfer_.clear();
 }
 
 void Runner::reseed() {
@@ -3548,6 +4880,409 @@ bool Runner::block(const int32_t* ids, uint32_t n, bool head, bool head_all, std
     return true;
 }
 
+// ---- P9: the pipelined prefill ---------------------------------------------------------------------------------
+//
+// The serial path runs stage 0 to its end, then stage 1, and so on; while the host waits for one stage's router
+// readback the other three devices are idle.  Here the chunks flow through the stages instead: every stage holds
+// a different chunk, issues a layer's front and moves on, and the four devices' kernels run at once.  The
+// scheduler is one host thread; the only waits are event queries, so the host's work never serializes the GPUs.
+bool Runner::prefill_pipeline(const std::vector<int32_t>& prompt, std::string& err) {
+    if (engram_on_ && !opt_.engram_feed) {
+        err = "--stage-pipeline needs --engram-feed: the engram rows' host buffers are per stage under it";
+        return false;
+    }
+    const uint32_t np = static_cast<uint32_t>(prompt.size());
+    const uint32_t S = nstages_;
+    // The chunk list, trimmed exactly as the serial loop trims its blocks (a tail shorter than the window would
+    // start its attention with nothing to attend to, so it is folded into the block before it).
+    struct Chunk {
+        uint32_t pos0 = 0, n = 0;
+        bool last = false;
+    };
+    std::vector<Chunk> chunks;
+    for (uint32_t c0 = 0; c0 < np;) {
+        uint32_t nc = std::min<uint32_t>(np - c0, cap_);
+        const uint32_t rest = np - c0 - nc;
+        if (rest > 0 && rest < SWA_ && nc > SWA_) nc -= SWA_ - rest;
+        Chunk ch;
+        ch.pos0 = c0;
+        ch.n = nc;
+        ch.last = c0 + nc >= np;
+        chunks.push_back(ch);
+        c0 += nc;
+    }
+    if (chunks.size() <= 1) {
+        // Nothing to overlap: the ordinary block, feed and head included.
+        if (cancel_requested()) { cancelled_ = true; return true; }
+        if (!engram_feed_prepare(0, prompt.data(), np, err)) return false;
+        return block(prompt.data(), np, true, false, err);
+    }
+    // The whole prompt is the engram history from here on; the feed's workers read their windows out of it.
+    hist_.assign(np, 0);
+    std::memcpy(hist_.data(), prompt.data(), size_t(np) * 4);
+    // Every chunk starts from the identity premix.  It is the same for all of them, so it is filled once and
+    // never rewritten while an upload may be reading it.
+    for (uint32_t i = 0; i < cap_; ++i)
+        for (uint32_t c = 0; c < HC_; ++c) pm_host_[static_cast<size_t>(i) * HC_ + c] = (c == 0) ? 1.0f : 0.0f;
+
+    for (auto& r : run_) {
+        const cudaEvent_t ev = r.sel_ev;   // the event belongs to the stage, not the run
+        r = StageRun{};
+        r.sel_ev = ev;
+    }
+    double t_pipe = 0.0;
+    int bound = -1;
+    auto visit = [&](uint32_t s) {
+        if (bound == static_cast<int>(s)) return;
+        if (bound >= 0) save_stage();
+        bind_stage(s);
+        bound = static_cast<int>(s);
+    };
+    auto load = [&](StageRun& r) {
+        cur_n_ = r.cur_n;
+        cur_pos0_ = r.cur_pos0;
+        idx_owner_ = r.idx_owner;
+        cand_owner_ = r.cand_owner;
+        idx_topk_ = r.idx_topk;
+        mainh_wrote_ = r.mainh_wrote;
+    };
+    auto store = [&](StageRun& r) {
+        r.cur_n = cur_n_;
+        r.cur_pos0 = cur_pos0_;
+        r.idx_owner = idx_owner_;
+        r.cand_owner = cand_owner_;
+        r.idx_topk = idx_topk_;
+        r.mainh_wrote = mainh_wrote_;
+    };
+    // Stage s may begin chunk c when the stage before it has finished that chunk and its hand-off copies are
+    // complete.  `next_chunk` moves only after the producer records `done`, so the event it names is this chunk's.
+    int wait_dbg = 0;
+    int xfer_dbg = 0;
+    auto wait_reason = [&](uint32_t s, uint32_t c, const char* why, cudaError_t q) {
+        if (wait_dbg >= 12) return;
+        ++wait_dbg;
+        std::fprintf(stderr, "[v41] wait: stage %u chunk %u: %s (%s)\n", s, c, why, cudaGetErrorString(q));
+    };
+    auto chunk_ready = [&](uint32_t s) {
+        const StageRun& r = run_[s];
+        if (r.next_chunk >= chunks.size()) return false;
+        if (s == 0) return true;
+        if (run_[s - 1].next_chunk <= r.next_chunk) return false;
+        const SeamSlot& sl = seam_[s - 1][r.next_chunk % seam_ring_];
+        if (!sl.done_set) { wait_reason(s, r.next_chunk, "seam done not set", cudaSuccess); return false; }
+        cudaError_t q = cudaEventQuery(sl.done);
+        if (q != cudaSuccess) {
+            wait_reason(s, r.next_chunk, "seam done pending", q);
+            (void)cudaGetLastError();   // "not ready" is an answer, not an error
+            return false;
+        }
+        if (xsrc_[s] != kNoSrc) {
+            const XferSlot& xs = xfer_[s][r.next_chunk % xfer_ring_];
+            if (!xs.done_set) { wait_reason(s, r.next_chunk, "source done not set", cudaSuccess); return false; }
+            q = cudaEventQuery(xs.done);
+            if (q != cudaSuccess) {
+                wait_reason(s, r.next_chunk, "source done pending", q);
+                (void)cudaGetLastError();   // "not ready" is an answer, not an error
+                return false;
+            }
+        }
+        return true;
+    };
+    auto start_chunk = [&](uint32_t s) -> bool {
+        StageRun& r = run_[s];
+        const uint32_t c = r.next_chunk;
+        const Chunk& ch = chunks[c];
+        r.chunk = static_cast<int>(c);
+        r.il = stage_first_[s];
+        r.cur_n = ch.n;
+        r.cur_pos0 = ch.pos0;
+        r.idx_owner = -1;
+        r.cand_owner = -1;
+        r.idx_topk = 0;
+        r.mainh_wrote = 0;
+        visit(s);
+        load(r);
+        for (uint32_t i = 0; i < ch.n; ++i) pipe_pos_host_[s][i] = static_cast<int32_t>(ch.pos0 + i);
+        cudaError_t ce = cudaSuccess;
+        if (s == 0) {
+            // This chunk's engram reads start here (or were started by the previous chunk's prefetch), and the
+            // next chunk's start now: they run under the whole pipeline.
+            if (!engram_feed_prepare(ch.pos0, prompt.data() + ch.pos0, ch.n, err)) return false;
+            if (c + 1 < chunks.size()) {
+                const Chunk& nx = chunks[c + 1];
+                engram_feed_prefetch(nx.pos0, prompt.data(), prompt.data() + nx.pos0, nx.n);
+            }
+            ce = cudaMemcpyAsync(d_tok_, prompt.data() + ch.pos0, uint64_t(ch.n) * 4, cudaMemcpyHostToDevice,
+                                 stream_);
+            if (ce == cudaSuccess)
+                ce = cudaMemcpyAsync(d_pos_, pipe_pos_host_[s].data(), uint64_t(ch.n) * 4, cudaMemcpyHostToDevice,
+                                     stream_);
+            if (ce == cudaSuccess)
+                ce = cudaMemcpyAsync(d_prem_, pm_host_.data(), uint64_t(ch.n) * HC_ * 4, cudaMemcpyHostToDevice,
+                                     stream_);
+            if (ce != cudaSuccess) {
+                err = std::string("pipeline block inputs upload: ") + cudaGetErrorString(ce);
+                return false;
+            }
+            if (!k::deepseek4_embed_q4k(x_, d_tok_, tok_embd_, V_, ch.n, E_, stream_) ||
+                !k::deepseek4_expand_hc(hc_, x_, E_, HC_, ch.n, stream_)) {
+                err = "embed/expand failed";
+                return false;
+            }
+        } else {
+            // The producer's copies were done when chunk_ready said so; these land ahead of the chunk's first
+            // layer on this stage's stream, and `taken` frees the slot once they complete.
+            SeamSlot& sl = seam_[s - 1][c % seam_ring_];
+            ce = cudaMemcpyAsync(hc_, sl.hc, uint64_t(ch.n) * HC_ * E_ * 4, cudaMemcpyHostToDevice, stream_);
+            if (ce == cudaSuccess)
+                ce = cudaMemcpyAsync(d_prem_, sl.prem, uint64_t(ch.n) * HC_ * 4, cudaMemcpyHostToDevice, stream_);
+            if (ce == cudaSuccess)
+                ce = cudaMemcpyAsync(d_pos_, pipe_pos_host_[s].data(), uint64_t(ch.n) * 4, cudaMemcpyHostToDevice,
+                                     stream_);
+            if (ce == cudaSuccess) ce = cudaEventRecord(sl.taken, stream_);
+            if (ce != cudaSuccess) {
+                err = std::string("pipeline seam upload: ") + cudaGetErrorString(ce);
+                return false;
+            }
+            sl.taken_set = true;
+            // The cross-seam source state for this stage's first layers (its `done` was queried above): the
+            // source's compressed KV and index keys with its group count, the selection this stage's chunk
+            // starts from, and the candidate list when the candidate source is upstream.
+            if (xsrc_[s] != kNoSrc) {
+                XferSlot& xs = xfer_[s][c % xfer_ring_];
+                const uint32_t tkm = std::min<uint32_t>(static_cast<uint32_t>(geo.indexer_top_k), xs.ng);
+                ce = cudaMemcpyAsync(xcomp_[s], xs.comp, uint64_t(xs.ng) * k::kDeepseek4CkvBytes,
+                                     cudaMemcpyHostToDevice, stream_);
+                if (ce == cudaSuccess)
+                    ce = cudaMemcpyAsync(xik_[s], xs.ik, uint64_t(xs.ng) * k::kDeepseek4IdxkBytes,
+                                         cudaMemcpyHostToDevice, stream_);
+                if (ce == cudaSuccess && xs.n * tkm != 0)
+                    ce = cudaMemcpyAsync(idx_, xs.idx, uint64_t(xs.n) * tkm * 4, cudaMemcpyHostToDevice,
+                                         stream_);
+                if (ce == cudaSuccess && xs.cand != nullptr)
+                    ce = cudaMemcpyAsync(xcand_[s], xs.cand, uint64_t(xs.n) * (1u + kcap_) * 4,
+                                         cudaMemcpyHostToDevice, stream_);
+                if (ce == cudaSuccess) ce = cudaEventRecord(xs.taken, stream_);
+                if (ce != cudaSuccess) {
+                    err = std::string("pipeline source cache upload: ") + cudaGetErrorString(ce);
+                    return false;
+                }
+                xsrc_ng_[s] = xs.ng;
+                r.idx_owner = static_cast<int>(idx_src_[stage_first_[s]]);
+                if (xs.cand != nullptr) r.cand_owner = static_cast<int>(cand_src_layer_);
+                xs.taken_set = true;
+            }
+        }
+        return true;
+    };
+    auto finish_chunk = [&](uint32_t s) -> bool {
+        StageRun& r = run_[s];
+        const uint32_t c = static_cast<uint32_t>(r.chunk);
+        const Chunk& ch = chunks[c];
+        visit(s);
+        load(r);
+        cudaError_t ce = cudaSuccess;
+        if (s + 1 < S) {
+            SeamSlot& sl = seam_[s][c % seam_ring_];
+            // Reusing a slot whose consumer may still be copying out of it.  The ring holds at least two chunks,
+            // so this is rare and the copy it waits on was queued chunks ago.
+            if (sl.taken_set && cudaEventQuery(sl.taken) != cudaSuccess) {
+                (void)cudaGetLastError();
+                cudaEventSynchronize(sl.taken);
+            }
+            sl.chunk = static_cast<int>(c);
+            ce = cudaMemcpyAsync(sl.hc, hc_, uint64_t(ch.n) * HC_ * E_ * 4, cudaMemcpyDeviceToHost, stream_);
+            if (ce == cudaSuccess)
+                ce = cudaMemcpyAsync(sl.prem, d_prem_, uint64_t(ch.n) * HC_ * 4, cudaMemcpyDeviceToHost, stream_);
+            if (ce == cudaSuccess) ce = cudaEventRecord(sl.done, stream_);
+            if (ce != cudaSuccess) {
+                err = std::string("pipeline seam read: ") + cudaGetErrorString(ce);
+                return false;
+            }
+            sl.done_set = true;
+            sl.taken_set = false;
+        }
+        // Cross-seam sources this stage owns: the source layer ran earlier in this chunk, so its cache and its
+        // selection are complete on this stream when the reads queued here run.
+        for (uint32_t s2 = 1; s2 < S; ++s2) {
+            if (xsrc_[s2] == kNoSrc || stage_of(xsrc_[s2]) != s) continue;
+            XferSlot& xs = xfer_[s2][c % xfer_ring_];
+            if (xs.taken_set && cudaEventQuery(xs.taken) != cudaSuccess) {
+                (void)cudaGetLastError();
+                cudaEventSynchronize(xs.taken);
+            }
+            const uint32_t ngx = ng_src_[xsrc_[s2]];
+            const uint32_t tkx = std::min<uint32_t>(static_cast<uint32_t>(geo.indexer_top_k), ngx);
+            xs.ng = ngx;
+            xs.n = ch.n;
+            xs.chunk = static_cast<int>(c);
+            ce = cudaMemcpyAsync(xs.comp, comp_kv_[xsrc_[s2]], uint64_t(ngx) * k::kDeepseek4CkvBytes,
+                                 cudaMemcpyDeviceToHost, stream_);
+            if (ce == cudaSuccess)
+                ce = cudaMemcpyAsync(xs.ik, index_k_[xsrc_[s2]], uint64_t(ngx) * k::kDeepseek4IdxkBytes,
+                                     cudaMemcpyDeviceToHost, stream_);
+            if (ce == cudaSuccess && ch.n * tkx != 0)
+                ce = cudaMemcpyAsync(xs.idx, idx_, uint64_t(ch.n) * tkx * 4, cudaMemcpyDeviceToHost, stream_);
+            if (ce == cudaSuccess && xs.cand != nullptr && cand_ != nullptr)
+                ce = cudaMemcpyAsync(xs.cand, cand_, uint64_t(ch.n) * (1u + kcap_) * 4, cudaMemcpyDeviceToHost,
+                                     stream_);
+            if (ce == cudaSuccess) ce = cudaEventRecord(xs.done, stream_);
+            if (ce != cudaSuccess) {
+                err = std::string("pipeline source cache read: ") + cudaGetErrorString(ce);
+                return false;
+            }
+            xs.done_set = true;
+            xs.taken_set = false;
+            if (xfer_dbg < 8) {
+                std::fprintf(stderr, "[v41] xfer: stage %u queued chunk %u (slot %u, ng %u, %u rows) for stage %u\n",
+                             s, c, c % xfer_ring_, xs.ng, xs.n, s2);
+                ++xfer_dbg;
+            }
+        }
+        if (s + 1 == S) {
+            if (ch.last) {
+                // head: hc_pre (fused with the output norm) -> the last row's output projection
+                if (!k::deepseek4_hc_pre(hc_, d_prem_, static_cast<const float*>(out_norm_), x_, xn_, E_, HC_,
+                                         rms_eps_, ch.n, stream_)) {
+                    err = "head hc_pre failed";
+                    return false;
+                }
+                if (!k::deepseek4_matmul_q4k(logits_, out_w_, xn_ + uint64_t(ch.n - 1) * E_, E_, V_, 1, false,
+                                             stream_)) {
+                    err = "head projection failed";
+                    return false;
+                }
+            }
+            if (np >= 64 || opt_.trace)
+                std::fprintf(stderr, "[v41] prefill %u/%u (%.1fs)\r", ch.pos0 + ch.n, np, now_sec() - t_pipe);
+        }
+        store(r);
+        r.chunk = -1;
+        r.front_out = false;
+        r.next_chunk = c + 1;
+        return true;
+    };
+
+    t_pipe = now_sec();
+    // The mirrors are the pipeline's as long as it owns the seam; an early return must hand them back, or a
+    // later serial or decode pass would skip the synchronous seam copies it still needs.
+    struct AttnMirrorGuard {
+        bool& f;
+        ~AttnMirrorGuard() { f = false; }
+    } attn_mirror_guard{pipe_attn_};
+    pipe_attn_ = true;
+    bool all_done = false;
+    bool cancelled = false;
+    while (!all_done) {
+        // --serve cancel: leave at a chunk boundary.  Whatever is queued is drained below before the next
+        // request can reuse the same host mirrors and device buffers.
+        if (cancel_requested()) { cancelled = true; break; }
+        bool progress = false;
+        // A front for every stage that can issue one, before any stage is waited on.
+        for (uint32_t s = 0; s < S; ++s) {
+            StageRun& r = run_[s];
+            if (r.front_out) continue;
+            if (r.chunk < 0) {
+                if (!chunk_ready(s)) continue;
+                if (!start_chunk(s)) return false;
+            }
+            visit(s);
+            load(r);
+            if (!layer_front(r.il, err)) return false;
+            const cudaError_t q = cudaEventRecord(r.sel_ev, stream_);
+            if (q != cudaSuccess) {
+                err = std::string("pipeline selection event: ") + cudaGetErrorString(q);
+                return false;
+            }
+            store(r);
+            r.front_out = true;
+            progress = true;
+        }
+        // Then the backs whose selection has arrived, and the next front of that stage straight away.
+        for (uint32_t s = 0; s < S; ++s) {
+            StageRun& r = run_[s];
+            if (!r.front_out) continue;
+            if (cudaEventQuery(r.sel_ev) != cudaSuccess) {
+                (void)cudaGetLastError();
+                continue;
+            }
+            visit(s);
+            load(r);
+            if (!layer_back(r.il, err)) return false;
+            ++r.il;
+            store(r);
+            r.front_out = false;
+            progress = true;
+            if (r.il >= stage_first_[s + 1]) {
+                if (!finish_chunk(s)) return false;
+            }
+        }
+        all_done = true;
+        for (const StageRun& r : run_)
+            if (r.next_chunk < chunks.size()) {
+                all_done = false;
+                break;
+            }
+        if (all_done) break;
+        if (!progress) {
+            // Every remaining stage is waiting on a GPU event whose work is already queued (the front sweep above
+            // issues every front it can), so one blocking wait ends the stall.
+            bool blocked = false;
+            for (uint32_t s = 0; s < S && !blocked; ++s)
+                if (run_[s].front_out) {
+                    cudaEventSynchronize(run_[s].sel_ev);
+                    blocked = true;
+                }
+            if (!blocked) {
+                // No front is outstanding: every stage sits between chunks, and the event it waits on was
+                // recorded by a producer that has already finished its chunk.  Those copies are still draining
+                // on the producer's stream, so one blocking wait on the earliest such hand-off ends the stall
+                // as well.  The first stuck stage in order is the one whose producer finished that chunk.
+                for (uint32_t s = 1; s < S && !blocked; ++s) {
+                    const StageRun& r = run_[s];
+                    if (r.chunk >= 0 || r.next_chunk >= chunks.size()) continue;
+                    if (run_[s - 1].next_chunk <= r.next_chunk) continue;
+                    const SeamSlot& sl = seam_[s - 1][r.next_chunk % seam_ring_];
+                    if (!sl.done_set) continue;
+                    cudaError_t q = cudaEventSynchronize(sl.done);
+                    if (xsrc_[s] != kNoSrc) {
+                        const XferSlot& xs = xfer_[s][r.next_chunk % xfer_ring_];
+                        if (!xs.done_set) continue;
+                        const cudaError_t q2 = cudaEventSynchronize(xs.done);
+                        if (q == cudaSuccess) q = q2;
+                    }
+                    if (q != cudaSuccess) {
+                        err = std::string("pipeline hand-off wait: ") + cudaGetErrorString(q);
+                        return false;
+                    }
+                    blocked = true;
+                }
+            }
+            if (!blocked) {
+                err = "pipeline: no stage can run (a hand-off event is missing)";
+                return false;
+            }
+        }
+    }
+    if (cancelled) {
+        // Drain what is already on each stage's stream.  The request is abandoned, so n_past_ and the seam are
+        // not advanced; the next prepare_request resets the host-side state and the feed joins its workers.
+        for (uint32_t s = 0; s < S; ++s) {
+            visit(s);
+            cudaDeviceSynchronize();
+        }
+        cancelled_ = true;
+        if (np >= 64 || opt_.trace) std::fprintf(stderr, "\n[v41] prefill cancelled (prompt %u tokens)\n", np);
+        return true;
+    }
+    if (np >= 64 || opt_.trace) std::fprintf(stderr, "\n");
+    pipe_attn_ = false;
+    visit(S - 1);
+    save_stage();   // the last stage's grown buffers and container survive into the decode, as in block()
+    n_past_ = np;
+    return true;
+}
+
 // One allocation for a resident process, a fresh per-request state for every run.  The one-shot path allocates
 // exactly as before; --serve sizes the state once (see warm) and refuses a request above --serve-ctx.
 bool Runner::prepare_request(uint32_t total, std::string& err) {
@@ -3574,6 +5309,7 @@ bool Runner::prepare_request(uint32_t total, std::string& err) {
     // a longer previous prompt must not leak into the n-gram window.
     n_past_ = 0;
     in_decode_ = false;
+    cancelled_ = false;
     for (uint32_t i = 0; i < 64; ++i) {
         ng_src_[i] = 0;
         cpend_[i] = 0;
@@ -3588,7 +5324,11 @@ bool Runner::prepare_request(uint32_t total, std::string& err) {
                 j.th.join();
                 j.running = false;
             }
-    for (auto& c : efeed_cur_) c = -1;
+    for (auto& jobs : efeed_)
+        for (auto& j : jobs) {
+            j.live = false;
+            j.done = false;
+        }
     return true;
 }
 
@@ -3625,29 +5365,47 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
 
     const uint32_t np = static_cast<uint32_t>(prompt.size());
     const double t0 = now_sec();
-    for (uint32_t c0 = 0; c0 < np;) {
-        uint32_t nc = std::min<uint32_t>(np - c0, cap_);
-        const uint32_t rest = np - c0 - nc;
-        if (rest > 0 && rest < SWA_ && nc > SWA_) nc -= SWA_ - rest;
-        const bool last = c0 + nc >= np;
-        // The feed: this block's rows are already in hand (prefetched during the previous one); start the next
-        // block's reads now, so they run under this block's compute (the reference's prefetch_next(c1, ...)).
-        if (!engram_feed_prepare(c0, prompt.data() + c0, nc, err)) return false;
-        if (!last) {
-            const uint32_t c1 = c0 + nc;
-            uint32_t n1 = std::min<uint32_t>(np - c1, cap_);
-            const uint32_t rest1 = np - c1 - n1;
-            if (rest1 > 0 && rest1 < SWA_ && n1 > SWA_) n1 -= SWA_ - rest1;
-            engram_feed_prefetch(c1, prompt.data(), prompt.data() + c1, n1);
+    if (opt_.stage_pipeline && nstages_ > 1) {
+        // --stage-pipeline: the chunks flow through the stages concurrently (its own feed start-up and progress).
+        if (!prefill_pipeline(prompt, err)) return false;
+    } else {
+        for (uint32_t c0 = 0; c0 < np;) {
+            if (cancel_requested()) { cancelled_ = true; break; }
+            uint32_t nc = std::min<uint32_t>(np - c0, cap_);
+            const uint32_t rest = np - c0 - nc;
+            if (rest > 0 && rest < SWA_ && nc > SWA_) nc -= SWA_ - rest;
+            const bool last = c0 + nc >= np;
+            // The feed: this block's rows are already in hand (prefetched during the previous one); start the
+            // next block's reads now, so they run under this block's compute (the reference's
+            // prefetch_next(c1, ...)).
+            if (!engram_feed_prepare(c0, prompt.data() + c0, nc, err)) return false;
+            if (!last) {
+                const uint32_t c1 = c0 + nc;
+                uint32_t n1 = std::min<uint32_t>(np - c1, cap_);
+                const uint32_t rest1 = np - c1 - n1;
+                if (rest1 > 0 && rest1 < SWA_ && n1 > SWA_) n1 -= SWA_ - rest1;
+                engram_feed_prefetch(c1, prompt.data(), prompt.data() + c1, n1);
+            }
+            if (!block(prompt.data() + c0, nc, last, false, err)) return false;
+            c0 += nc;
+            if (opt_.trace || np >= 64) std::fprintf(stderr, "[v41] prefill %u/%u (%.1fs)\r", c0, np, now_sec() - t0);
         }
-        if (!block(prompt.data() + c0, nc, last, false, err)) return false;
-        c0 += nc;
-        if (opt_.trace || np >= 64) std::fprintf(stderr, "[v41] prefill %u/%u (%.1fs)\r", c0, np, now_sec() - t0);
+        if (np >= 64 || opt_.trace) std::fprintf(stderr, "\n");
     }
-    if (np >= 64 || opt_.trace) std::fprintf(stderr, "\n");
     const double tp = now_sec() - t0;
-    std::fprintf(stderr, "[v41] prefill %u tokens in %.2fs (%.1f tok/s)\n", np, tp,
-                 tp > 0 ? static_cast<double>(np) / tp : 0.0);
+    if (cancelled_)
+        std::fprintf(stderr, "[v41] request cancelled by the client (%.2fs into the request)\n", tp);
+    else
+        std::fprintf(stderr, "[v41] prefill %u tokens in %.2fs (%.1f tok/s)\n", np, tp,
+                     tp > 0 ? static_cast<double>(np) / tp : 0.0);
+    if (opt_.cpu_moe != 0 && cpu_pairs_total_ != 0) {
+        std::fprintf(stderr,
+                     "[v41] cpu moe: %" PRIu64 " of %" PRIu64 " pairs on the host (%.1f%%), CPU %.2fs, GPU arm "
+                     "%.2fs (overlapped)\n",
+                     cpu_rows_total_, cpu_pairs_total_,
+                     100.0 * static_cast<double>(cpu_rows_total_) / static_cast<double>(cpu_pairs_total_),
+                     cpu_sec_total_, cpu_arm_sec_total_);
+    }
 
     if (!opt_.logits_out.empty()) {
         std::vector<float> buf(V_);
@@ -3663,7 +5421,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
     }
 
     std::vector<int32_t> generated;
-    if (gen > 0) {
+    if (gen > 0 && !cancelled_) {
         in_decode_ = true;
         int32_t t = pick_token(err);
         if (t < 0) return false;
@@ -3671,6 +5429,7 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
         // The DSpark summary counters (report-only; the token stream is what the gate reads).
         uint64_t rounds = 0, accepted = 0, drafted = 0, plain_steps = 0;
         for (uint32_t g = 0; g < gen;) {
+            if (cancel_requested()) { cancelled_ = true; break; }
             // The loop-top emit (the reference's core_v41_api.c:246): this token's successor is already decided.
             generated.push_back(t);
             ++g;
@@ -3766,9 +5525,10 @@ bool Runner::run(const std::vector<int32_t>& prompt, uint32_t gen, std::string& 
         }
         const double dt = now_sec() - td;
         const uint64_t n_emitted = generated.size();
-        std::fprintf(stderr, "[v41] generated %llu tokens in %.2fs (%.1f tok/s)\n",
+        std::fprintf(stderr, "[v41] generated %llu tokens in %.2fs (%.1f tok/s)%s\n",
                      static_cast<unsigned long long>(n_emitted), dt,
-                     dt > 0 ? static_cast<double>(n_emitted) / dt : 0.0);
+                     dt > 0 ? static_cast<double>(n_emitted) / dt : 0.0,
+                     cancelled_ ? " [cancelled]" : "");
         if (rounds || plain_steps) {
             std::fprintf(stderr, "[v41] DSpark: %llu round(s), %.2f accepted of %llu drafted (%.1f%%), %llu plain step(s)%s\n",
                          static_cast<unsigned long long>(rounds),
@@ -3914,16 +5674,27 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (a == "--expert-cache-decode-only") o.expert_cache_decode_only = true;
         else if (a == "--no-engram") o.engram = false;
         else if (a == "--engram-feed") o.engram_feed = true;
+        else if (a == "--engram-scale-cache") o.engram_scale_cache = true;
         else if (a == "--ram-image") o.ram_image = true;
         else if (a == "--moe-prefill") o.moe_prefill = true;
         else if (a == "--moe-prefill-check") o.moe_prefill_check = true;
+        else if (a == "--cpu-moe") o.cpu_moe = static_cast<uint32_t>(std::strtoul(next("--cpu-moe"), nullptr, 10));
+        else if (a == "--cpu-moe-share")
+            o.cpu_moe_share = static_cast<uint32_t>(std::strtoul(next("--cpu-moe-share"), nullptr, 10));
+        else if (a == "--cpu-moe-threads")
+            o.cpu_moe_threads = static_cast<uint32_t>(std::strtoul(next("--cpu-moe-threads"), nullptr, 10));
+        else if (a == "--cpu-moe-check") o.cpu_moe_check = true;
+        else if (a == "--cpu-moe-decode") o.cpu_moe_decode = true;
         else if (a == "--pf-time") o.pf_time = true;
         else if (a == "--dense-batch") o.dense_batch = true;
         else if (a == "--tc-gemm") { o.tc_gemm = true; o.dense_batch = true; }
         else if (a == "--attn-mma") o.attn_mma = true;
         else if (a == "--expert-loan") o.expert_loan = true;
+        else if (a == "--reserve-container") o.reserve_container = true;
+        else if (a == "--stage-pipeline") o.stage_pipeline = true;
         else if (a == "--serve") o.serve = true;
         else if (a == "--serve-ctx") o.serve_ctx = static_cast<uint32_t>(std::strtoul(next("--serve-ctx"), nullptr, 10));
         else if (a == "--no-check") o.check = false;
@@ -3937,6 +5708,9 @@ int main(int argc, char** argv) {
                          "               [--stop-eos] [--stream-ids] [--ledger] [--engram-feed]\n"
                          "               [--expert-cache-mib N[,N...]] [--ram-image]\n"
                          "               [--moe-prefill [--moe-prefill-check]]\n"
+                         "               [--cpu-moe N [--cpu-moe-share PCT] [--cpu-moe-threads T] [--cpu-moe-check]\n"
+                         "                [--cpu-moe-decode]]\n"
+                         "               [--stage-pipeline]\n"
                          "               [--serve --serve-ctx N]\n"
                          "  --devices        split the layers over these gpus, one stage each, layers in order;\n"
                          "                   the split only cuts at a compressed-cache seam and must return the\n"
@@ -3950,6 +5724,13 @@ int main(int argc, char** argv) {
                          "                   keep staged expert payloads in N MiB of device slots per stage (a comma\n"
                          "                   list gives one budget per stage); a hit copies from its slot instead of\n"
                          "                   reading the parts again.  Off by default.\n"
+                         "  --expert-cache-decode-only\n"
+                         "                   with --expert-cache-mib: look up and admit slots only in decode-sized\n"
+                         "                   blocks, so a prompt block does not evict the hot set decode reuses\n"
+                         "  --reserve-container\n"
+                         "                   size every stage's expert container and index scratch for a full\n"
+                         "                   chunk up front, before the cache, so no request allocates; the\n"
+                         "                   cache is then sized around the reserve (startup reports the fit)\n"
                          "  --expert-loan    with --expert-cache-mib: the pool is the layer's container (a hit's\n"
                          "                   table entry points into its slot, a miss lands straight in one), so the\n"
                          "                   chunk reserves the pool once instead of the container plus the cache\n"
@@ -3971,6 +5752,31 @@ int main(int argc, char** argv) {
                          "  --moe-prefill-check\n"
                          "                   with --moe-prefill: also run the per-pair arm on the first 8 tokens of\n"
                          "                   the first three layers and print ref max, max|d|, relative and exact%%\n"
+                         "  --cpu-moe N      needs --ram-image: each prefill layer's N most-selected routed experts\n"
+                         "                   are computed on the host out of the RAM image while the GPUs compute the\n"
+                         "                   rest; works with --moe-prefill (its reduce sums the host's slots) or on\n"
+                         "                   the per-pair arm (the tail sums both).  --cpu-moe-threads (0 = half the\n"
+                         "                   hardware threads) sets the worker count.  Decode and blocks of 8 tokens\n"
+                         "                   or fewer keep the plain path unless --cpu-moe-decode is given.  With\n"
+                         "                   --stage-pipeline the pipelined prefill has no host arm, so\n"
+                         "                   --cpu-moe-decode is required and the host's share is decode-only.  Off\n"
+                         "                   by default.\n"
+                         "  --cpu-moe-share PCT\n"
+                         "                   with --cpu-moe N: take the hottest experts until PCT (0..100) of the\n"
+                         "                   block's pairs are the host's, N staying a cap.  Expert skew is steep,\n"
+                         "                   so this tracks the host's work where the count does not.\n"
+                         "  --cpu-moe-check  on the first three prefill layers, recompute two GPU-owned experts on\n"
+                         "                   the CPU for their first eight tokens and print ref max, max|d|,\n"
+                         "                   relative and exact%%\n"
+                         "  --cpu-moe-decode with --cpu-moe N: hand the host its share in decode too, and in prefill\n"
+                         "                   blocks of 8 tokens or fewer, through the per-pair arm and the tail\n"
+                         "                   reduce.  One token's block is 6 pairs, so --cpu-moe-share's ceil\n"
+                         "                   gives one expert at any share up to 16%%.  Off by default.\n"
+                         "  --stage-pipeline with 2+ stages and more than one chunk: the chunks flow through the\n"
+                         "                   stages at once.  Every stage's front (attention and router) is issued\n"
+                         "                   before any stage is awaited, then each stage stages its experts and runs\n"
+                         "                   its MoE while the others compute; chunk hand-offs pass through pinned\n"
+                         "                   ring slots.  Off by default; the serial path is unchanged.\n"
                          "  --dspark         the MTP towers draft, the main forward verifies, the cache rolls back;\n"
                          "                   the greedy output must be byte-identical to the same run without it\n"
                          "  --dspark-verify  pin the verified rows per round (1..block, default: the whole block)\n"
@@ -3983,8 +5789,9 @@ int main(int argc, char** argv) {
                          "  --engram-feed    read the next block's engram rows while the current block computes\n"
                          "                   (the reference's prepare/wait/prefetch_next); off by default, and\n"
                          "                   the ids must not move\n"
-                         "  --engram-kick    with --engram-feed: the first block's rows start during the image load\n"
-                         "                   instead of at its prepare, so layer 1 no longer waits for a cold read\n"
+                         "  --engram-scale-cache\n"
+                         "                   read each engram table's scale plane into host RAM once (3.1 GB a\n"
+                         "                   table here), so a prompt row costs one random pread instead of two\n"
                          "  --serve          resident: load the weights once, size the state for --serve-ctx, print\n"
                          "                   ready, then answer one request per stdin line: ids=1,2,3 gen=16\n"
                          "                   temperature=1 top_p=1 min_p=0.05 top_k=0 seed=1 stop_eos=1.  Each\n"
@@ -4022,6 +5829,23 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "dsv4_run: --serve-ctx must be at least 1\n");
         return 2;
     }
+    if (o.cpu_moe_share > 100) {
+        std::fprintf(stderr, "dsv4_run: --cpu-moe-share is a percentage (0..100)\n");
+        return 2;
+    }
+    // A share with no expert count means "no cap": the per-layer pair walk stops at the share.
+    if (o.cpu_moe_share != 0 && o.cpu_moe == 0) o.cpu_moe = 0xFFFFFFFFu;
+    if (o.expert_cache_decode_only && o.expert_cache_mib.empty()) {
+        std::fprintf(stderr, "dsv4_run: --expert-cache-decode-only needs --expert-cache-mib\n");
+        return 2;
+    }
+    // Under --expert-loan the pool already reserves a full container's worth of strides, and a block that skips
+    // the cache would fall back to a second, separate container that budget never counts.  Refuse rather than
+    // discover the shortfall as an allocation failure at load.
+    if (o.expert_cache_decode_only && o.expert_loan) {
+        std::fprintf(stderr, "dsv4_run: --expert-cache-decode-only does not combine with --expert-loan yet\n");
+        return 2;
+    }
 
     Runner r;
     std::string err;
@@ -4046,6 +5870,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "dsv4_run: %s\n", err.c_str());
             return 2;
         }
+        // From here the server may ask for a cancel with SIGUSR1 (see g_cancel).  The handler is in place
+        // before `ready`, so the server never signals a process that would die on the default action.
+        install_cancel_handler();
         std::printf("ready\n");
         std::fflush(stdout);
         auto digits = [](const std::string& s) {
@@ -4124,12 +5951,16 @@ int main(int argc, char** argv) {
                 continue;
             }
             err.clear();
+            // A cancel that raced the previous request's end was ignored (g_in_request was 0); this request
+            // starts with a clean flag and becomes cancellable for its whole run.
+            begin_request();
             if (!r.run(ids, gen, err)) {
                 // A forward that failed may have left CUDA state unsafe to reuse; the supervisor restarts.
                 std::printf("error=%s\ndone\n", err.c_str());
                 std::fflush(stdout);
                 return 1;
             }
+            end_request();
         }
         return 0;
     }

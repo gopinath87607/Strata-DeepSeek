@@ -93,4 +93,35 @@ bool deepseek4_routed_moe_prefill(float* d_out, float* d_ys, const void* d_blob,
                                   uint32_t n_expert, uint32_t nc, uint32_t blob_v3,
                                   Deepseek4MoePrefillScratch* scratch, void* stream);
 
+// ---- The split entries, for a layer whose pair space is shared with the host (the --cpu-moe arm). ----------
+//
+// The same plan and three stages as the entry above, but instead of a reduce the function returns once the down
+// rows are in d_ys.  A selection entry that is negative (the driver marked the pair --cpu-moe) still receives a
+// slot in d_ys: the sorted GPU rows come first, then one slot per negative pair in pair order, and scratch->inv
+// names the slot.  No item is built for a host slot, so it stays untouched until the caller fills it with
+// deepseek4_routed_moe_prefill_fill_cpu; the reduce below then sums every pair, sorted and host-filled alike,
+// which makes the result the same expression the per-pair arm's tail computes.
+//
+// The caller can start its host workers before this entry and wait for them after it: the entry does not sync,
+// so the host's share overlaps the three stage launches.  It returns false before launching for the same
+// geometry/version reasons as the full entry.
+bool deepseek4_routed_moe_prefill_partial(float* d_ys, const void* d_blob, uint64_t blob_size, uint32_t in_dim,
+                                          uint32_t mid_dim, uint32_t out_dim, const int32_t* sel_host, uint32_t topk,
+                                          float clamp, const float* d_x, uint32_t n_tok, uint32_t n_expert,
+                                          uint32_t nc, uint32_t blob_v3, Deepseek4MoePrefillScratch* scratch,
+                                          void* stream);
+
+// Fill the host's slots: ys[inv[pair_of[r]]] = the bf16 row r of `rows`, which is a device-visible pointer to
+// pinned host memory (cudaHostAllocMapped).  n_rows host pairs were computed, one row each, and pair_of is their
+// original (t*topk+k) indices.  Launches on `stream`, no sync; nothing is written for r with no slot.
+bool deepseek4_routed_moe_prefill_fill_cpu(float* d_ys, const int32_t* d_inv, const int32_t* d_pair_of,
+                                           const uint16_t* d_rows, uint32_t n_rows, uint32_t out_dim,
+                                           void* stream);
+
+// The reduce the full entry ends with: out[t] = sum_k w[t][k] * ys[inv[t*topk+k]].  A negative inv entry is
+// skipped, so a plan without host slots behaves exactly as before; the split path's plan gives every pair a
+// slot.  Launches on `stream`, no sync.
+bool deepseek4_routed_moe_prefill_reduce(float* d_out, const float* d_ys, const int32_t* d_inv, const float* d_w,
+                                         uint32_t topk, uint32_t n_tok, uint32_t out_dim, void* stream);
+
 }  // namespace strata::kernels

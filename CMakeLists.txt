@@ -456,7 +456,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # GGUF through a parts-aware reader. Not a test: it wants the model and the two engram shards, so it is built
   # whenever the CUDA backend is on and is not registered with ctest.
   if(STRATA_ENABLE_CUDA)
-    add_executable(dsv4_run tools/dsv4/dsv4_run.cu)
+    # cpu_vq_moe.cpp is the host AVX2 arm of --cpu-moe (tools/dsv4/cpu_vq_moe.hpp); only that file takes the
+    # AVX2/FMA flags, as the CPU kernels' sources take theirs.
+    add_executable(dsv4_run tools/dsv4/dsv4_run.cu tools/dsv4/cpu_vq_moe.cpp)
+    if(MSVC)
+      set_source_files_properties(tools/dsv4/cpu_vq_moe.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    else()
+      set_source_files_properties(tools/dsv4/cpu_vq_moe.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+    endif()
     target_include_directories(dsv4_run PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(dsv4_run PRIVATE strata_kernels CUDA::cudart)
   endif()

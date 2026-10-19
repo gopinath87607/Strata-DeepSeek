@@ -42,11 +42,13 @@ import pathlib
 import queue
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -57,12 +59,39 @@ from strata_tokenizer import Tokenizer  # noqa: E402
 import dsml_render                       # noqa: E402
 from dsv4_prompt import EOS_LITERAL, USER_LITERAL, find_binary, first_part  # noqa: E402
 
+
+def _exit_note(proc):
+    """How a driver process ended, for a log line: 'exit code 1', 'killed by SIGSEGV', 'still running'."""
+    if proc is None:
+        return "no process"
+    rc = proc.poll()
+    if rc is None:
+        return "still running"
+    if rc < 0:
+        try:
+            return "killed by %s" % signal.Signals(-rc).name
+        except ValueError:
+            return "signal %d" % -rc
+    return "exit code %d" % rc
+
 DEFAULT_MODEL = "deepseek-v4.1-flash"
 DEFAULT_TEMPERATURE = 1.0   # parse.rs:18, the wire default
 DEFAULT_TOP_P = 1.0         # parse.rs:19
 DEFAULT_MIN_P = 0.05        # parse.rs:20 (the engine's own default is 0.0)
 DEFAULT_MAX_TOKENS = 4096   # this server's default; the reference host's own default is 393216
 DEFAULT_CTX = 1048576
+SSE_WRITE_TIMEOUT = 120.0   # seconds a single SSE write may block before the client is treated as gone
+
+
+def served_ctx(args):
+    """The token budget a request can really use.
+
+    The resident driver sizes its state at min(--ctx, --serve-ctx); the one-shot path runs with --ctx.
+    Reporting only --ctx would advertise a context the resident engine refuses.
+    """
+    if getattr(args, "no_resident", False):
+        return args.ctx
+    return min(args.ctx, args.serve_ctx)
 SPECIAL_STOPS = {EOS_LITERAL.encode(), USER_LITERAL.encode(), "<｜Assistant｜>".encode()}
 THINK_DIVIDER = "</think>"
 
@@ -359,16 +388,26 @@ class Engine:
             cmd += ["--devices", self.args.devices]
         if self.args.expert_cache_mib:
             cmd += ["--expert-cache-mib", self.args.expert_cache_mib]
+        if self.args.expert_cache_decode_only:
+            cmd.append("--expert-cache-decode-only")
+        if self.args.reserve_container:
+            cmd.append("--reserve-container")
         if self.args.gpu is not None:
             cmd += ["--gpu", str(self.args.gpu)]
         if self.args.no_engram:
             cmd.append("--no-engram")
         if self.args.engram_feed:
             cmd.append("--engram-feed")
+        if self.args.engram_scale_cache:
+            cmd.append("--engram-scale-cache")
         if self.args.ram_image:
             cmd.append("--ram-image")
         if self.args.moe_prefill:
             cmd.append("--moe-prefill")
+        if self.args.moe_prefill_check:
+            cmd.append("--moe-prefill-check")
+        if self.args.stage_pipeline:
+            cmd.append("--stage-pipeline")
         if self.args.pf_time:
             cmd.append("--pf-time")
         if self.args.dense_batch:
@@ -379,6 +418,16 @@ class Engine:
             cmd.append("--expert-loan")
         if self.args.attn_mma:
             cmd.append("--attn-mma")
+        if self.args.cpu_moe:
+            cmd += ["--cpu-moe", str(self.args.cpu_moe)]
+        if self.args.cpu_moe_share:
+            cmd += ["--cpu-moe-share", str(self.args.cpu_moe_share)]
+        if self.args.cpu_moe_threads:
+            cmd += ["--cpu-moe-threads", str(self.args.cpu_moe_threads)]
+        if self.args.cpu_moe_decode:
+            cmd.append("--cpu-moe-decode")
+        if self.args.cpu_moe_check:
+            cmd.append("--cpu-moe-check")
         return cmd
 
     def _kill(self):
@@ -405,6 +454,23 @@ class Engine:
                 proc.stdout.close()
             except OSError:
                 pass
+
+    def _cancel_engine(self):
+        """Ask a live driver to stop the current request without a reload.
+
+        On POSIX the driver's SIGUSR1 handler makes it end at the next token (or prefill chunk), print
+        `generated=` and `done`, and keep the model resident.  Platforms without SIGUSR1 fall back to the
+        drain deadline and, failing that, a restart.
+        """
+        if not hasattr(signal, "SIGUSR1"):
+            return
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.kill(proc.pid, signal.SIGUSR1)
+        except OSError:
+            pass
 
     def _read_lines(self, proc, q):
         """Feed the driver's stdout lines to a queue; None marks EOF.  One daemon thread per driver."""
@@ -449,6 +515,8 @@ class Engine:
                     self.proc, self.proc_ready = proc, True
                     return
                 if s.startswith("error="):
+                    sys.stderr.write("[serve] engine startup failed: %s\n" % s[len("error="):])
+                    sys.stderr.flush()
                     raise ApiError(500, s[len("error="):], "engine_error")
         finally:
             if self.proc is not proc:
@@ -464,6 +532,8 @@ class Engine:
                         proc.stdout.close()
                     except OSError:
                         pass
+        sys.stderr.write("[serve] the engine exited before it was ready (%s)\n" % _exit_note(proc))
+        sys.stderr.flush()
         raise ApiError(500, "the engine exited before it was ready", "engine_error")
 
     def warm(self):
@@ -522,7 +592,7 @@ class Engine:
                 self._generate_once(ids, max_tokens, sampling, tick)
             else:
                 self._generate_resident(ids, max_tokens, sampling, tick)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             self._fill_record(rec, at, t0)
             self.finished(rec, "disconnect")
             raise
@@ -575,7 +645,7 @@ class Engine:
             except ValueError:
                 pass
         cache_mib = sum(caches)
-        eng = {"model": self.args.model_id, "max_context": self.args.ctx,
+        eng = {"model": self.args.model_id, "max_context": served_ctx(self.args),
                "expert_cache_mib": cache_mib,
                "expert_slots": sum((m * 1048576) // self.SLOT_BYTES for m in caches),
                "images": False}
@@ -612,6 +682,8 @@ class Engine:
                     break
                 if s.startswith("error="):
                     err = s[len("error="):]
+                    sys.stderr.write("[serve] engine error: %s\n" % err)
+                    sys.stderr.flush()
                     continue
                 if s.startswith("generated="):
                     continue
@@ -619,9 +691,32 @@ class Engine:
                     on_token(int(s))
         finally:
             if not done:
-                # A client that hung up mid-answer leaves the driver generating; its leftover ids would be
-                # read as the next request's, so the driver goes with the connection.
-                self._kill()
+                # The client hung up (Stop) or the driver died.  A live driver is still generating; its leftover
+                # ids would be read as the next request's, so ask it to stop and drain to `done`, keeping the
+                # process.  Killing it would throw away the pinned image and force a full reload.
+                self._cancel_engine()
+                proc = self.proc
+                deadline = time.monotonic() + 600.0
+                while proc is not None and proc.poll() is None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        line = self.q.get(timeout=remaining)
+                    except queue.Empty:
+                        break
+                    if line is None:
+                        break
+                    if line.strip() == "done":
+                        done = True
+                        break
+                if done:
+                    sys.stderr.write("[serve] client disconnected; the engine stays resident\n")
+                else:
+                    self._kill()
+                    sys.stderr.write("[serve] the engine stopped answering (%s); it will be restarted (model reload)\n"
+                                     % _exit_note(proc))
+                sys.stderr.flush()
         if not done:
             raise ApiError(500, "the engine stopped answering", "engine_error")
         if err:
@@ -648,6 +743,10 @@ class Engine:
                 cmd += ["--devices", self.args.devices]
             if self.args.expert_cache_mib:
                 cmd += ["--expert-cache-mib", self.args.expert_cache_mib]
+            if self.args.expert_cache_decode_only:
+                cmd.append("--expert-cache-decode-only")
+            if self.args.reserve_container:
+                cmd.append("--reserve-container")
             cmd += ["--ctx", str(self.args.ctx)]
             if self.args.gpu is not None:
                 cmd += ["--gpu", str(self.args.gpu)]
@@ -655,10 +754,16 @@ class Engine:
                 cmd.append("--no-engram")
             if self.args.engram_feed:
                 cmd.append("--engram-feed")
+            if self.args.engram_scale_cache:
+                cmd.append("--engram-scale-cache")
             if self.args.ram_image:
                 cmd.append("--ram-image")
             if self.args.moe_prefill:
                 cmd.append("--moe-prefill")
+            if self.args.moe_prefill_check:
+                cmd.append("--moe-prefill-check")
+            if self.args.stage_pipeline:
+                cmd.append("--stage-pipeline")
             if self.args.pf_time:
                 cmd.append("--pf-time")
             if self.args.dense_batch:
@@ -669,6 +774,16 @@ class Engine:
                 cmd.append("--expert-loan")
             if self.args.attn_mma:
                 cmd.append("--attn-mma")
+            if self.args.cpu_moe:
+                cmd += ["--cpu-moe", str(self.args.cpu_moe)]
+            if self.args.cpu_moe_share:
+                cmd += ["--cpu-moe-share", str(self.args.cpu_moe_share)]
+            if self.args.cpu_moe_threads:
+                cmd += ["--cpu-moe-threads", str(self.args.cpu_moe_threads)]
+            if self.args.cpu_moe_decode:
+                cmd.append("--cpu-moe-decode")
+            if self.args.cpu_moe_check:
+                cmd.append("--cpu-moe-check")
             deadline = time.monotonic() + self.args.timeout
             proc = None
             try:
@@ -883,6 +998,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _sse_start(self):
+        # A client that stops reading without closing (a suspended laptop, a dropped link) would otherwise leave
+        # a write blocked until TCP gives up, with the engine still generating behind it.  Bound the write.
+        self.connection.settimeout(SSE_WRITE_TIMEOUT)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -944,7 +1062,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             # The web app reads these; the engine is text-only and has no image generator.
             self._json({"status": "ok", "model": self.server.args.model_id, "images": False,
-                        "image_generation": False, "max_context": self.server.args.ctx})
+                        "image_generation": False, "max_context": served_ctx(self.server.args)})
         elif path == "/metrics":
             self._json(self.server.engine.metrics())
         elif path in ("/config", "/settings", "/mcp"):
@@ -970,7 +1088,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "no such endpoint", "not_found_error")
         except ApiError as e:
             self._error(e, anthropic)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
         except Exception as e:   # a bug here must not take the server down
             self._error(ApiError(500, "server error: %s" % e, "server_error"), anthropic)
@@ -980,9 +1098,13 @@ class Handler(BaseHTTPRequestHandler):
     def _prepare(self, prompt, max_tokens):
         tok = self.server.tok
         ids = tok.encode(prompt, parse_special=True)
-        if len(ids) >= self.server.args.ctx:
+        # The resident engine sizes its state at --serve-ctx, which can be far below the model's --ctx (it is what
+        # fits the cards).  Checking only --ctx would accept a 100k-token prompt, pay the engine's load, and then
+        # have the engine reject it.  The one-shot path runs with --ctx, so it keeps the old limit.
+        ctx = served_ctx(self.server.args)
+        if len(ids) >= ctx:
             raise ApiError(400, "the prompt is longer than the context (%d tokens)" % len(ids), param="messages")
-        ct = self.server.args.ctx - len(ids)
+        ct = ctx - len(ids)
         if max_tokens > ct:
             max_tokens = ct
         return ids, max_tokens
@@ -1215,6 +1337,7 @@ def main(argv):
     ap = argparse.ArgumentParser(description="OpenAI/Anthropic serving in front of dsv4_run")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--open", action="store_true", help="open the chat page in the browser when the server starts")
     ap.add_argument("--api-key", default=None, help="require this key (Bearer or x-api-key)")
     ap.add_argument("--model", default="/mnt/nvme/DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf")
     ap.add_argument("--model-id", default=DEFAULT_MODEL, help="the id the wire answers with")
@@ -1230,14 +1353,44 @@ def main(argv):
                     help="P7 layer split: comma-separated gpu list, one stage each (e.g. 0,1,2,3)")
     ap.add_argument("--expert-cache-mib", default=None,
                     help="P7 expert cache: MiB of device slots per stage (a comma list gives one per stage)")
+    ap.add_argument("--expert-cache-decode-only", action="store_true",
+                    help="with --expert-cache-mib: look up and admit slots only in decode-sized blocks, so a "
+                         "prompt block does not evict the hot set the decode steps reuse")
+    ap.add_argument("--reserve-container", action="store_true",
+                    help="size every stage's expert container and index scratch for a full chunk at startup, "
+                         "before the cache, so a request never allocates (the fit is printed per stage)")
     ap.add_argument("--timeout", type=float, default=1800.0)
     ap.add_argument("--no-engram", action="store_true")
     ap.add_argument("--engram-feed", action="store_true",
                     help="P7 engram feed: read the next block's engram rows while the current block computes")
+    ap.add_argument("--engram-scale-cache", action="store_true",
+                    help="read each engram table's scale plane into host RAM once (3.1 GB a table here), so a "
+                         "prompt row costs one random pread instead of two")
     ap.add_argument("--moe-prefill", action="store_true",
                     help="hand a request's expert blocks to the driver's batched bf16 tensor-core arm")
+    ap.add_argument("--moe-prefill-check", action="store_true",
+                    help="with --moe-prefill: compare the batched arm against the per-pair arm on the first "
+                         "three layers and print the deltas")
+    ap.add_argument("--stage-pipeline", action="store_true",
+                    help="P7 pipeline: chunks flow through the stage GPUs at once (needs 2+ --devices and a "
+                         "--chunk smaller than the prompt; implies --engram-feed).  With --cpu-moe N it needs "
+                         "--cpu-moe-decode (the pipelined prefill has no host arm)")
     ap.add_argument("--pf-time", action="store_true",
                     help="diagnostic: ask the driver for a per-layer staging/MoE time line")
+    ap.add_argument("--cpu-moe", type=int, default=0, metavar="N",
+                    help="per prefill layer, compute the N most-selected routed experts on the host out of the "
+                         "RAM image while the GPUs compute the rest; needs --ram-image")
+    ap.add_argument("--cpu-moe-share", type=int, default=0, metavar="PCT",
+                    help="with --cpu-moe: take the hottest experts until PCT (0..100) of each block's pairs are "
+                         "the host's, N staying a cap")
+    ap.add_argument("--cpu-moe-threads", type=int, default=0,
+                    help="host worker threads for --cpu-moe (0 = half the hardware threads)")
+    ap.add_argument("--cpu-moe-decode", action="store_true",
+                    help="with --cpu-moe: also hand the host its share in decode and in blocks of 8 tokens or "
+                         "fewer (the per-pair arm plus the tail reduce)")
+    ap.add_argument("--cpu-moe-check", action="store_true",
+                    help="with --cpu-moe: recompute two GPU-owned experts on the host for the first three "
+                         "prefill layers and print the deltas")
     ap.add_argument("--dense-batch", action="store_true",
                     help="prompt-width dense matmuls use the driver's token-tiled q4_K/bf16 kernels")
     ap.add_argument("--tc-gemm", action="store_true",
@@ -1261,12 +1414,35 @@ def main(argv):
 
     if args.serve_ctx < 1:
         sys.exit("dsv4_server: --serve-ctx must be at least 1")
-
+    if args.cpu_moe < 0 or args.cpu_moe_threads < 0 or not 0 <= args.cpu_moe_share <= 100:
+        sys.exit("dsv4_server: --cpu-moe and --cpu-moe-threads must not be negative, --cpu-moe-share is 0..100")
+    if (args.cpu_moe or args.cpu_moe_share) and not args.ram_image:
+        sys.exit("dsv4_server: --cpu-moe needs --ram-image (the host reads its experts from the pinned image)")
+    if args.cpu_moe_decode and not args.cpu_moe:
+        sys.exit("dsv4_server: --cpu-moe-decode needs --cpu-moe N (the cap on the host's experts)")
+    if args.cpu_moe_check and not args.cpu_moe:
+        sys.exit("dsv4_server: --cpu-moe-check needs --cpu-moe N")
+    if args.moe_prefill_check and not args.moe_prefill:
+        sys.exit("dsv4_server: --moe-prefill-check needs --moe-prefill")
+    if args.stage_pipeline and args.cpu_moe and not args.cpu_moe_decode:
+        sys.exit("dsv4_server: --cpu-moe needs --cpu-moe-decode with --stage-pipeline (the pipelined prefill "
+                 "has no host arm, so the host's share would be decode-only)")
+    if args.stage_pipeline and not args.engram_feed:
+        args.engram_feed = True   # the pipeline keeps one engram feed buffer per stage
+    if args.engram_scale_cache and args.no_engram:
+        sys.exit("dsv4_server: --engram-scale-cache needs the engram on")
+    if args.expert_cache_decode_only and not args.expert_cache_mib:
+        sys.exit("dsv4_server: --expert-cache-decode-only needs --expert-cache-mib")
+    if args.expert_cache_decode_only and args.expert_loan:
+        sys.exit("dsv4_server: --expert-cache-decode-only does not combine with --expert-loan yet")
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.api_key:
         sys.exit("dsv4_server: refusing a non-loopback --host without --api-key")
     tok = Tokenizer.from_gguf(args.tokenizer_gguf or first_part(args.model))
     engine = Engine(args)
     srv = Server((args.host, args.port), Handler, args, tok, engine)
+    if args.open:
+        url = "http://%s:%d/" % ("[::1]" if args.host == "::1" else args.host, args.port)
+        threading.Thread(target=lambda: webbrowser.open(url), daemon=True).start()
     sys.stderr.write("[serve] %s on http://%s:%d (model %s, engine %s)\n"
                      % (args.model_id, args.host, args.port, args.model, engine.binary))
     sys.stderr.flush()
