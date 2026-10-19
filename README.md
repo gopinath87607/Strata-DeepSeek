@@ -20,6 +20,7 @@ All measurements below use this exact artifact:
 | item | value |
 | --- | --- |
 | file | `DeepSeek-V4.1-Flash-vq8sh14-q4k-mtpnative.gguf`, 40 parts |
+| source | **[Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF](https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF)** on Hugging Face - the 40 GGUF parts, the two engram shards, `RECIPE.md` and `SHA256SUMS` |
 | size | **113,556,639,424 B = 113.6 GB (105.8 GiB)** |
 | recipe string in the file's metadata | `routed=vq8x8192/4096 sharedcb cbfp8 skeleton=q4_K mtp=vq8x4096 engram=sidecar nocal` |
 | architecture / variant | `deepseek4` / `v41_flash` |
@@ -400,7 +401,8 @@ critical path. The option is kept, and off by default.
 - **Only the CUDA build was tested.** The driver is not part of the HIP or SYCL builds; no AMD card,
   Windows build, or other GPU was tested.
 - **One request at a time.** The engine lock serializes requests.
-- **The artifact is not redistributed here.** You need the 40-part GGUF and the two engram shards;
+- **The artifact is not redistributed here.** Download the 40 GGUF parts and the two engram shards
+  from [Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF](https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF);
   the paths above are the ones this build was measured with.
 
 ## What was not tested

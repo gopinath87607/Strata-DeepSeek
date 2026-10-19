@@ -56,6 +56,10 @@ architecture string; the existing path stays byte-identical.
 
 ## 2. The artifact, measured here
 
+The artifact and its engram shards are published at
+[Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF](https://huggingface.co/Baekpica/DeepSeek-V4.1-Flash-1017-VQ-GGUF):
+the 40 GGUF parts, the two official 1017 engram shards, `RECIPE.md` and `SHA256SUMS`.
+
 Read from the first 64 MiB of part 01 with `/tmp/ds41-tools/gguf_dump.py`; the
 dump is kept in `reference/gguf-header.txt`.
 
