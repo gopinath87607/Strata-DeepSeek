@@ -156,19 +156,14 @@ function confirmDialog(title, html, okLabel, danger = false) {
 // ------------------------------------------------------------------ theme and tabs
 function setTheme(t, save) {
   document.documentElement.dataset.theme = t;
-  if (save) try { localStorage.setItem("maya.ui-theme", t); } catch (e) { /* ignore */ }
+  if (save) try { localStorage.setItem("strata.ui-theme", t); } catch (e) { /* ignore */ }
   $("theme-icon").setAttribute("href", `${SPRITE}#i-${t === "dark" ? "sun" : "moon"}`);
   const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.content = t === "dark" ? "#090a14" : "#f4f4fa";
+  if (meta) meta.content = t === "dark" ? "#16120c" : "#f7f1e6";
 }
 const flipTheme = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
 $("theme-btn").onclick = flipTheme;
-setTheme(document.documentElement.dataset.theme || "dark", false);
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
-  let saved = null;
-  try { saved = localStorage.getItem("maya.ui-theme"); } catch (err) { /* ignore */ }
-  if (!saved) setTheme(e.matches ? "dark" : "light", false);
-});
+setTheme(document.documentElement.dataset.theme || "light", false);   // sandal white unless the user picked otherwise
 
 let tab = "chat";
 function showTab(name) {
@@ -297,7 +292,7 @@ function tierCards(kind) {
   </div></div>`).join("");
   return TIER_SETS[kind];
 }
-function renderTiers(t, eng) {
+function renderTiers(t, eng, m) {
   const card = $("tiers-card");
   if (!t || !t.now) { card.hidden = true; return; }
   card.hidden = false;
@@ -320,10 +315,16 @@ function renderTiers(t, eng) {
   let vu, ru, disk, total;
   const ds4Tier = ds4 && (+eng.ram_experts || 0) > 0;
   if (ds4) {   // DeepSeek: the VRAM slots, the RAM tier's (when on), and the rest read in place from the model's files
-    vu = +eng.expert_slots || 0;
-    ru = ds4Tier ? +eng.ram_experts : +eng.cpu_experts || 0;
-    disk = ds4Tier ? Math.max(0, (+eng.cpu_experts || 0) - ru) : 0;
-    total = Math.max(1, vu + ru + disk);
+    // the cards as the engine reports them now (its LEND lines, a line a card): permanent + the drafter, plus the trunk
+    // slots the arenas lend while the decoder holds them - so the number moves with the engine's phase, never static
+    const gs = (m && m.lend) || [];
+    const phase = m ? phaseOf(m) : 0;
+    const perm = sumBy(gs, (g) => g.perm), lent = sumBy(gs, (g) => g.lend), mtp = sumBy(gs, (g) => g.mtp);
+    const live = gs.length ? perm + (phase === 1 ? lent + mtp : 0) : 0;   // (the drafter's banks are arena bytes too)
+    vu = live || +eng.expert_slots || 0;
+    total = Math.max(1, (+eng.expert_slots || 0) + (+eng.cpu_experts || 0), vu);   // all routed experts
+    ru = ds4Tier ? Math.min(+eng.ram_experts || 0, Math.max(0, total - vu)) : Math.max(0, total - vu);
+    disk = Math.max(0, total - vu - ru);
   } else {
     vu = n.vram_used || 0; ru = n.ram_used || 0;
     total = (eng && eng.experts) || Math.max(1, vu + ru);
@@ -337,8 +338,16 @@ function renderTiers(t, eng) {
   $("tier-vram-text").textContent = ds4 ? `${fmt(vu)} experts` : `${fmt(vu)} experts · ${fmt(n.vram_gb, 1)} GB`;
   $("tier-ram-text").textContent = ds4 ? `${fmt(ru)} experts` : `${fmt(ru)} experts · ${fmt(n.ram_gb, 1)} GB`;
   $("tier-disk-text").textContent = `${fmt(disk)} experts`;
-  $("tiers-sub").textContent = age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer`
-                                                        : `live · ${fmt(total)} routed experts`;
+  const gsL = (m && m.lend) || [];
+  if (ds4 && gsL.length) {   // (the LEND lines are the layout now: they move with the engine's phase, not per answer)
+    const perm = sumBy(gsL, (g) => g.perm), lent = sumBy(gsL, (g) => g.lend), mtp = sumBy(gsL, (g) => g.mtp);
+    $("tiers-sub").textContent = (m && phaseOf(m) === 1)
+      ? `${fmt(perm)} kept + ${fmt(lent)} lent + ${fmt(mtp)} drafter on the cards now`
+      : `${fmt(perm)} on the cards now · ${fmt(lent + mtp)} lent from the arenas while decoding`;
+  } else {
+    $("tiers-sub").textContent = age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer`
+                                                          : `live · ${fmt(total)} routed experts`;
+  }
   // advice from the live numbers (only while they are fresh)
   let tip = "";
   if (ds4) {
@@ -367,6 +376,9 @@ const qmtab = new URLSearchParams(location.search).get("mtab");   // (a link str
 if (qmtab && MTABS.includes(qmtab)) mtab = qmtab;
 const num = (v) => (typeof v === "number" && isFinite(v) ? v : null);
 const sumBy = (xs, f) => xs.reduce((a, x) => a + (num(f(x)) || 0), 0);
+// the Monitor's card rows: the biggest VRAM first, then the smaller ones (a display order only - the engine's split,
+// its layer order and the prefill chain keep the order it placed them in)
+const bigFirst = (gs) => gs.slice().sort((a, b) => (b.total || 0) - (a.total || 0) || (a.dev - b.dev));
 function phaseOf(m) {
   if ((m.live || {}).state === "reading") return 0;         // a prompt holds the arena now
   const st = (m.tiers || {}).now || {};
@@ -445,15 +457,62 @@ function mibBar(parts, total) {
     parts.filter((p) => p.v > 0).map((p) => `<span class="mibbar__seg" data-k="${esc(p.k)}" style="flex-grow:${(p.v / t).toFixed(4)}"></span>`).join("") +
     `</div>`;
 }
+// what each colour of a bar is; every key is drawn from this, so a colour is never left unexplained
+const MIB_PARTS = {
+  weights: {label: "Model weights + caches", sub: "the trunk's dense tensors and the attention caches on this card; fixed, never lent"},
+  pool:    {label: "Permanent experts", sub: "expert banks the card holds through both phases, outside the arena"},
+  lend:    {label: "Lent trunk experts", sub: "trunk experts the decoder borrows into the arena while it answers"},
+  mtp:     {label: "Drafter (DSpark)", sub: "the draft block's expert banks, in the arena while answering"},
+  spare:   {label: "Arena spare", sub: "arena bytes neither the trunk nor the drafter uses right now"},
+  prompt:  {label: "Prompt buffers", sub: "the chunk buffers a prompt is read through; the decoder gets these bytes back after it"},
+  free:    {label: "Free", sub: "VRAM no pool holds: the reserve kept for the driver and the display"},
+};
+// the key above a panel's bars: a swatch, its name (and its MiB over the cards) and a sentence on what it is
+function mibLegend(el, items) {
+  el.innerHTML = items.map(({k, v}) => {
+    const d = MIB_PARTS[k];
+    return `<div class="miblegend__item"><i class="dot${k === "free" ? " dot--free" : ""}" style="--mb-c:var(--mb-${k})"></i>` +
+      `<span class="miblegend__name">${esc(d.label)}${v ? ` <b>${esc(v)}</b>` : ""}</span>` +
+      `<span class="miblegend__sub">${esc(d.sub)}</span></div>`;
+  }).join("");
+  el.hidden = !items.length;
+}
+// the parts both expert panels share, with each part's MiB summed over the cards (the phase's own set)
+function mibPartsFor(gs, phase) {
+  const sum = (f) => gs.reduce((a, g) => a + (f(g) || 0), 0);
+  const arena = sum((g) => g.arena || 0), lend = sum((g) => g.lend_mib || 0), mtp = sum((g) => g.mtp_mib || 0);
+  const items = [{k: "weights", v: `${fmt(sum((g) => (g.weights || 0) + (g.caches || 0)))} MiB`},
+                 {k: "pool", v: `${fmt(sum((g) => g.perm_mib || 0))} MiB`}];
+  if (phase === 1) {
+    items.push({k: "lend", v: `${fmt(lend)} MiB`}, {k: "mtp", v: `${fmt(mtp)} MiB`},
+               {k: "spare", v: `${fmt(Math.max(0, arena - lend - mtp))} MiB`});
+  } else {
+    items.push({k: "prompt", v: `${fmt(arena)} MiB`});
+  }
+  items.push({k: "free", v: `${fmt(sum((g) => g.free || 0))} MiB`});
+  return items;
+}
 function gpuOf(m, g) {   // NVML's reading of the card the engine reported (joined on its bus id; else its order)
   const cards = (m.hardware || {}).gpus || [];
   return (g.pci && cards.find((c) => c.pci === g.pci)) || cards[g.dev] || null;
 }
 function gpuNameCls(g) { return g && g.name ? g.name.replace(/^NVIDIA /, "").replace(/^GeForce /, "").replace(/^AMD /, "").replace(/^Radeon /, "") : ""; }
+// a card's layers from its LEND line.  Its last index can run past the next card's first (the drafter's blocks sit after
+// the trunk on the card that holds them), so the range stops at the next card's first layer: "0–9", not "0–42"
+function layersOf(g, gs) {
+  const L = g.layers;
+  if (!L || L[1] < L[0]) return "";
+  let b = L[1];
+  for (const o of gs) {
+    const M = o.layers;
+    if (o !== g && M && M[0] > L[0] && M[0] <= b) b = Math.min(b, M[0] - 1);
+  }
+  return `layers ${L[0]}–${b}`;
+}
 
 // GPUs: the split as the engine found it - a row a card, its bytes and its experts
 function renderGpuPanel(m) {
-  const card = $("gpus-card"), list = $("gpus-list"), gs = m.lend || [];
+  const card = $("gpus-card"), list = $("gpus-list"), gs = bigFirst(m.lend || []);
   if (!gs.length) { card.hidden = true; return; }
   card.hidden = false;
   const phase = phaseOf(m);
@@ -461,7 +520,7 @@ function renderGpuPanel(m) {
   $("gpus-sub").textContent = `${gs.length} GPU${gs.length > 1 ? "s" : ""} · ${fmt(nExp)} expert slots on the cards` +
     ` · ${phase === 1 ? "the decoder holds the arenas" : "the prompts hold the arenas"}`;
   list.innerHTML = gs.map((g) => {
-    const read = gpuOf(m, g), name = gpuNameCls(read), layers = g.layers;
+    const read = gpuOf(m, g), name = gpuNameCls(read);
     const fixed = (g.weights || 0) + (g.caches || 0), arenaEx = (g.lend_mib || 0) + (g.mtp_mib || 0);
     const segs = [{k: "weights", v: fixed, label: "weights"},
                   {k: "pool", v: g.perm_mib || 0, label: "permanent experts"}];
@@ -475,16 +534,22 @@ function renderGpuPanel(m) {
     segs.push({k: "free", v: g.free || 0, label: "free"});
     const held = (g.perm || 0) + (phase === 1 ? (g.lend || 0) + (g.mtp || 0) : 0);
     return `<div class="gpu-line">
-      <div class="gpu-line__name"><b>GPU ${esc(g.dev)}</b><span>${esc([name, layers && layers[1] >= layers[0] ? `layers ${layers[0]}–${layers[1]}` : ""].filter(Boolean).join(" · "))}</span></div>
+      <div class="gpu-line__name"><b>GPU ${esc(g.dev)}</b><span>${esc([name, layersOf(g, gs)].filter(Boolean).join(" · "))}</span></div>
       ${mibBar(segs, g.total)}
       <div class="gpu-line__nums"><b>${fmt(held)} experts</b><span>${fmt(g.free)} MiB free${g.chunk ? ` · chunk ${fmt(g.chunk)}` : ""}</span></div>
     </div>`;
   }).join("");
+  mibLegend($("gpus-legend"), mibPartsFor(gs, phase));
+  $("gpus-note").textContent = "Each bar is one card's whole VRAM on that card's own scale: a coloured length is MiB of " +
+    "that memory, and the numbers at the right are the expert slots it holds (permanent + borrowed) and its free MiB. " +
+    "The same bytes change colour with the phase — while a prompt is read the arena is the orange chunk buffers; while " +
+    "the model answers it is teal trunk experts and pink drafter slots. Card totals: " +
+    gs.map((g) => `GPU ${g.dev} ${fmt(g.total)} MiB`).join(" · ") + ".";
 }
 
 // Loan: the arena's experts between prompts (the engine's LEND lines and its last refill)
 function renderLendPanel(m) {
-  const card = $("lend-card"), gs = m.lend || [], stat = (m.tiers || {}).now || {};
+  const card = $("lend-card"), gs = bigFirst(m.lend || []), stat = (m.tiers || {}).now || {};
   if (!gs.length) { card.hidden = true; return; }
   card.hidden = false;
   const phase = phaseOf(m), hist = (m.tiers || {}).history || {};
@@ -501,13 +566,14 @@ function renderLendPanel(m) {
                                                     : "the prompt holds the arenas now");
   if (num(stat.lend_n) != null) {
     setCard("lend-refill", fmt(stat.lend_n), " experts",
-            `${fmt(stat.lend_gb, 2)} GB in ${fmt(stat.lend_ms)} ms` + (phase === 1 ? "" : " · before this prompt"));
+            `${fmt(stat.lend_gb, 2)} GB in ${fmt(stat.lend_ms)} ms`);
   } else {
     setCard("lend-refill", null, "", "no refill yet - the first answer fills the arenas");
   }
   const arenaGb = arena / 1024;
-  setCard("lend-arena", fmt(arenaGb, 2), " GB", `${fmt(arenaMib)} MiB of it is expert slots between prompts`);
-  setCard("lend-perm", fmt(perm), " experts", "held on the cards for good (outside the arena)");
+  setCard("lend-arena", fmt(arenaGb, 2), " GB",
+          phase === 1 ? `${fmt(arenaMib)} MiB of expert slots` : `${fmt(arena)} MiB of prompt buffers`);
+  setCard("lend-perm", fmt(perm), " experts", "held through both phases, outside the arena");
   spark("lend-refill-p", (hist.lend_n || []).map((x) => x || 0), Math.max(1, stat.lend_n || 0));
   spark("lend-now-p", (hist.phase || []).map((x) => (x ? 1 : 0)), 1);
   $("lend-sub").textContent = `${gs.length} GPU${gs.length > 1 ? "s" : ""} · ${fmt(lend + mtp)} slots the arenas add while decoding`;
@@ -523,19 +589,27 @@ function renderLendPanel(m) {
                   phase === 1 ? {k: "spare", v: Math.max(0, (g.arena || 0) - ex), label: "arena spare"} : null,
                   {k: "free", v: g.free || 0, label: "free"}].filter(Boolean);
     return `<div class="lend-row">
-      <div class="lend-row__name"><b>GPU ${esc(g.dev)}</b><span>${esc(name || "")}</span></div>
+      <div class="lend-row__name"><b>GPU ${esc(g.dev)}</b><span>${esc([name, layersOf(g, gs)].filter(Boolean).join(" · "))}</span></div>
       ${mibBar(segs, g.total)}
       <div class="lend-row__nums"><b>${fmt(g.perm)} + ${fmt((g.lend || 0) + (g.mtp || 0))}</b>
-        <span>perm + lent · arena ${fmt((g.arena || 0) / 1024, 2)} GB</span></div>
+        <span>perm + ${phase === 1 ? "lent now" : "lent when decoding"} · arena ${fmt((g.arena || 0) / 1024, 2)} GB</span></div>
     </div>`;
   }).join("");
+  mibLegend($("lend-legend"), mibPartsFor(gs, phase));
+  $("lend-note").textContent = "The arena is the same bytes twice: while a prompt is read they are its orange chunk " +
+    "buffers; when the prompt ends the decoder borrows them back as expert slots — teal for the trunk, pink for the " +
+    "drafter — and fills them from the last refill (its experts, the GB of weights copied, the ms it took). GB on this " +
+    "tab is bytes of VRAM summed over the cards; \"perm + lent\" under a bar is that card's experts held in both phases plus " +
+    "the slots its arena adds when the model answers.";
 }
 
 // Prefill: the engine's chunk per card, its path and the rate it read at
 function renderPrefillPanel(m) {
-  const card = $("prefill-card"), gs = m.lend || [], eng = m.engine || {}, stat = (m.tiers || {}).now || {};
+  const card = $("prefill-card"), gs = bigFirst(m.lend || []), eng = m.engine || {}, stat = (m.tiers || {}).now || {};
   const live = m.live || {}, hist = (m.history || {}), last = (m.requests || [])[0];
-  const chunks = gs.filter((g) => (g.chunk || 0) > 0);
+  // the pipeline's own order: layer 0's card first, whatever the cards' sizes (the GPU and Loan tabs keep big card first)
+  const start = (g) => { const L = g.layers || []; return L.length ? L[0] : 1e9; };
+  const chunks = gs.filter((g) => (g.chunk || 0) > 0).slice().sort((a, b) => start(a) - start(b));
   if (!chunks.length && !(num(+eng.prefill_chunk) > 0)) { card.hidden = true; return; }
   card.hidden = false;
   const rate = live.state !== "idle" ? live.prefill_tok_s_mean
@@ -560,14 +634,27 @@ function renderPrefillPanel(m) {
           " tokens", last ? `${fmt(last.reused)} reused from the conversation` : "");
   spark("pf-rate-p", (hist.prefill_tok_s_mean || []).map((x) => x || 0));
   $("prefill-sub").textContent = `${chunks.length || gs.length} GPU${(chunks.length || gs.length) > 1 ? "s" : ""} reading in parallel`;
+  // the pipeline's own order: the layer each card starts at (0-9, 10-19, 20-29, 30-39), whatever the rows' size order
+  const stage = (g) => {
+    const L = g.layers || [], first = L.length ? L[0] : null;
+    if (first == null) return "–";
+    const starts = gs.map((x) => (x.layers || [])[0]).filter((x) => x != null).sort((a, b) => a - b);
+    const i = starts.indexOf(first);
+    return i < 0 ? "–" : i + 1;
+  };
   $("prefill-chunks").innerHTML = chunks.length ? `<table class="st-table">
-      <thead><tr><th>GPU</th><th>Card</th><th>Layers</th><th class="num">Chunk</th></tr></thead><tbody>` +
-    chunks.map((g) => `<tr><td>GPU ${esc(g.dev)}</td><td>${esc(gpuNameCls(gpuOf(m, g)) || "–")}</td>
-      <td>${g.layers && g.layers[1] >= g.layers[0] ? `${g.layers[0]}–${g.layers[1]}` : "–"}</td>
+      <thead><tr><th>GPU</th><th>Stage</th><th>Card</th><th>Layers</th><th class="num">Chunk</th></tr></thead><tbody>` +
+    chunks.map((g) => `<tr><td>GPU ${esc(g.dev)}</td><td>${stage(g)}</td><td>${esc(gpuNameCls(gpuOf(m, g)) || "–")}</td>
+      <td>${layersOf(g, gs) || "–"}</td>
       <td class="num">${fmt(g.chunk)} tokens</td></tr>`).join("") + `</tbody></table>` : "";
+  mibLegend($("prefill-legend"), [{k: "prompt"}, {k: "lend"}, {k: "mtp"}]);
   $("prefill-note").textContent = chunks.length
-    ? "A prompt is read a chunk at a time, each card's buffers sized by --prefill-chunk-max (the engine's steps above). " +
-      "Longer chunks read each expert once a prompt instead of twice, but take VRAM the expert banks would otherwise hold."
+    ? "Rows follow the pipeline: a prompt walks the trunk blocks in layer order — here GPU 0's 0–9 first and GPU 3's " +
+      "30–39 last — and Stage is the card's place in that order (1, 2, 3, 4 here). Chunk is how many prompt tokens that card reads per pass " +
+      "(--prefill-chunk-max): a length of text, not memory. Bigger chunks read each expert once a prompt instead of " +
+      "twice, but take VRAM the expert banks would otherwise hold. The colour key is those same bytes on the GPUs and " +
+      "Loan tabs: orange is these chunk buffers while a prompt is read; teal and pink are what the decoder swaps into " +
+      "the same bytes afterwards."
     : "";
 }
 
@@ -642,7 +729,7 @@ function renderDraftPanel(m) {
     {id: "dr-block", label: "Block", icon: "thinking"},
     {id: "dr-acc", label: "Acceptance", icon: "check"},
     {id: "dr-n", label: "Drafts a token", icon: "activity"},
-    {id: "dr-ms", label: "Time a token", icon: "clock"},
+    {id: "dr-ms", label: "Real speed", icon: "clock"},
   ]);
   setCard("dr-block", eng.dspark_block == null ? null : fmt(eng.dspark_block), " tokens",
           eng.dspark_blocks ? `${fmt(eng.dspark_blocks)} blocks · ${fmt(eng.dspark_targets)} trunk targets` : "");
@@ -650,10 +737,11 @@ function renderDraftPanel(m) {
           num(stat.drafts) == null ? "no answer yet" : "of the drafts the full model kept");
   setCard("dr-n", num(stat.draft_n) == null ? null : fmt(stat.draft_n, 2), " a token",
           num(stat.draft_n) == null ? "" : "offered by the drafter");
-  setCard("dr-ms", num(stat.draft_ms) == null ? null : fmt(stat.draft_ms, 2), " ms/tok",
-          num(stat.verify_ms) == null ? "" : `drafting ${fmt(stat.draft_ms, 2)} · verifying ${fmt(stat.verify_ms, 2)} ms`);
+  // the answer's own speed: the draft is only a part of a token's time (drafting + verifying + the rest of the trunk)
+  setCard("dr-ms", num(stat.tok_s) == null ? null : fmt(stat.tok_s, 1), " tok/s",
+          num(stat.ms_tok) == null ? "" : `${fmt(stat.ms_tok, 1)} ms/tok · drafting ${fmt(stat.draft_ms, 2)} · verifying ${fmt(stat.verify_ms, 2)} ms`);
   spark("dr-acc-p", (hist.drafts || []).map((x) => (x || 0) * 100));
-  spark("dr-ms-p", (hist.draft_ms || []).map((x) => x || 0));
+  spark("dr-ms-p", (hist.tok_s || []).map((x) => x || 0));
   $("draft-sub").textContent = eng.dspark_blocks ? "the drafter proposes, the full model verifies" : "";
   $("draft-note").textContent = "DSpark's block proposes the next tokens in one pass; the full model checks them and keeps " +
     "the run that matches its own choices. Acceptance is how often a draft was kept; the time is the drafter's and the " +
@@ -681,7 +769,7 @@ let gpuOpen = store.get("gpu-open", null);   // the row opened (several GPUs), r
 let gpuShown = {};                           // each row's parts by its GPU, for the tooltip
 
 function gpuSegs(g, eng) {
-  const p = g.parts || {}, draft = eng.dflash ? "DFlash2" : eng.mtp ? "MTP" : "";
+  const p = g.parts || {}, draft = eng.dflash ? "DFlash2" : eng.dspark_blocks ? "DSpark" : eng.mtp ? "MTP" : "";
   return GPU_PARTS.filter((d) => (p[d.key] || 0) > 0 || d.key === "pool" || d.key === "kv")
     .map((d) => ({key: d.key, bytes: p[d.key] || 0, label: d.key === "drafter" && draft ? `Drafter (${draft})` : d.label}))
     .concat([{key: "free", label: "Free", bytes: g.free || 0}]);
@@ -940,7 +1028,7 @@ function render(m) {
     renderMonitorTabs(m);
     const gpuEach = renderGpuMap(m.gpu_map, m);
     renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, gpuEach);
-    renderTiers(m.tiers, eng);
+    renderTiers(m.tiers, eng, m);
     renderHero(live, h, last, eng, m.tiers, m.totals);
   }
   if (tab === "about") renderAbout(eng, hw, st, m.storage);
@@ -1055,9 +1143,14 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, gpuEa
   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
             each ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : multi ? `mean of ${gpus.length} cards` : st.gpu_name || "");
   spark("sp-gpu", h.gpu_util, 100);
+  // the experts the cards hold now: the LEND lines' perm, plus what the arenas lend while the decoder holds them
+  const lm = lastMetrics || {}, lgs = lm.lend || [], lphase = phaseOf(lm);
+  const resident = lgs.length ? sumBy(lgs, (g) => g.perm) +
+                  (lphase === 1 ? sumBy(lgs, (g) => g.lend) + sumBy(lgs, (g) => g.mtp) : 0) : null;
   setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
             each ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
-                 : (multi ? `${gpus.length} cards · ` : "") + (eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : ""));
+                 : (multi ? `${gpus.length} cards · ` : "") + (resident != null ? `${fmt(resident)} experts in VRAM`
+                    : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : ""));
   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
             each ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : multi ? `hottest of ${gpus.length} cards` : "");
@@ -1168,7 +1261,9 @@ function renderAbout(eng, hw, st, storage) {
     ["KV cache", kv],
     ["Experts", eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
                  `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}, the rest read from the SSD` : null],
-    ["Speculation", eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
+    ["Speculation", eng.dspark_blocks ? `DSpark: its ${fmt(eng.dspark_blocks)} draft block${+eng.dspark_blocks === 1 ? "" : "s"} ` +
+                       "propose the next tokens in one pass, the full model verifies them"
+                  : eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
                   : "off (one GPU, or no draft block in this model file)"],
     ["Images", eng.images ? "on" : "off"],
   ]);
@@ -1334,7 +1429,7 @@ $("clear-data").onclick = async () => {
   if (!ok) return;
   try { await db.clear(); } catch (e) { /* nothing stored there */ }
   try {
-    for (const k of Object.keys(localStorage)) if ((k.startsWith("maya.") || k.startsWith("strata.")) && k !== "maya.ui-theme") localStorage.removeItem(k);
+    for (const k of Object.keys(localStorage)) if ((k.startsWith("maya.") || k.startsWith("strata.")) && k !== "strata.ui-theme") localStorage.removeItem(k);
   } catch (e) { /* ignore */ }
   location.reload();
 };
@@ -1548,7 +1643,7 @@ function markdown(text) {
 // only the tail is rendered again each frame (a 14K-token answer stays smooth).
 function streamingMarkdown(m) {
   const t = m.text;
-  if (t.length < 6000) return markdown(t);
+  if (t.length < 2000) return markdown(t);
   const c = m._md || (Object.defineProperty(m, "_md", {value: {upto: 0, html: ""}, enumerable: false, writable: true}), m._md);
   let cut = t.lastIndexOf("\n\n", t.length - 3);
   while (cut > c.upto && ((t.slice(0, cut).match(/(^|\n)```/g) || []).length % 2)) cut = t.lastIndexOf("\n\n", cut - 1);
@@ -1870,10 +1965,13 @@ function updateAssistant(el, m, streaming) {
   if (m.error) {
     bubble.innerHTML = `<div class="msg-error"></div>`;
     bubble.firstChild.textContent = m.error;
+    bubble._html = null;
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
+    bubble._html = null;
   } else {
-    bubble.innerHTML = answerHtml(m, streaming);
+    const html = answerHtml(m, streaming);   // (re-parse only when the text moved: a token a paint would thrash the DOM)
+    if (bubble._html !== html) { bubble.innerHTML = html; bubble._html = html; }
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
@@ -2101,10 +2199,10 @@ async function answer(resumeJob = null) {
     updateAssistant(el, m, true);
     scrollDown();
   };
-  const schedule = () => {                         // a long answer repaints at most ten times a second
+  const schedule = () => {                         // repaint at most twenty times a second, however fast the tokens come
     if (pending) return;
     pending = true;
-    const wait = m.text.length > 20000 ? Math.max(0, 100 - (performance.now() - lastPaint)) : 0;
+    const wait = Math.max(0, 50 - (performance.now() - lastPaint));
     setTimeout(() => requestAnimationFrame(paint), wait);
   };
   const consume = async (r) => {

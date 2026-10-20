@@ -190,6 +190,7 @@ build/strata-ds4 --pack ... --serve
 | `--dspark-conf F` | `0.5` | A draft is verified while its confidence (sigmoid) is at least F |
 | `--vision on\|off` | `on` | Run the model's vision tower (when the pack has one) |
 | `--mmap-experts on\|off\|auto` | `auto` | The CPU lane reads experts in place from the model files (`on`), copies them into RAM (`off`), or reads in place only when RAM cannot hold them (`auto`) |
+| `--ram-resident` | — | The bare form of `--mmap-experts off`: every CPU-lane expert is copied into anonymous RAM up to the copy budget, the coldest staying in the file only when RAM cannot hold them all |
 | `--verbose`, `-v` | off | Per-request and per-load detail, including the LEND lines the Monitor reads |
 | `--serve` | — | The server's stdin/stdout protocol (`GEN`, `GENI`, `STOP`, `QUIT`) |
 | `--ids I,J,...` | — | CLI mode: prompt token ids |

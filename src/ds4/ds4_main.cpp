@@ -70,7 +70,7 @@ void usage() {
                  "           [--no-expert-lend] [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--prefill-chunk-max N0,N1,...]\n"
                  "           [--dspark on|off|none] [--dspark-conf F]\n"
-                 "           [--vision on|off] [--mmap-experts on|off|auto]\n"
+                 "           [--vision on|off] [--mmap-experts on|off|auto] [--ram-resident]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
 }
@@ -462,6 +462,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                           eg_rows > 0 ? (eg_rows - (double) (s.eg_reads - s_dec.eg_reads)) / eg_rows : 1.0,
                           (long long) s.eg_cached);
             out += b;
+            if (s.skipped > s_dec.skipped) {   // (STRATA_DS4_DISK_SKIP_W: experts left out a token)
+                std::snprintf(b, sizeof b, " skipped=%.3f", (double) (s.skipped - s_dec.skipped) / fed);
+                out += b;
+            }
             std::printf("%s\n", out.c_str());
         };
         for (;;) {
@@ -574,7 +578,8 @@ int main(int argc, char** argv) {
         else if (a == "--mmap-experts") {
             const std::string v = val("--mmap-experts");
             o.mmap_experts = v == "on" ? 1 : v == "off" ? 0 : -1;
-        } else if (a == "--images") images = val("--images");
+        } else if (a == "--ram-resident") o.mmap_experts = 0;   // every CPU-lane expert copied into RAM (as --mmap-experts off)
+        else if (a == "--images") images = val("--images");
         else if (a == "--encode-image") enc_rgb = val("--encode-image");
         else if (a == "--dump-image") enc_out = val("--dump-image");
         else if (a == "--size") {
@@ -749,6 +754,10 @@ int main(int argc, char** argv) {
     const long long io1 = io_read_bytes();
     if (io0 >= 0 && io1 >= 0)
         std::fprintf(stderr, "decode reads from the disk: %.1f MB a token\n", (double) (io1 - io0) / 1e6 / nt);
+    if (s.skipped > s0.skipped)   // STRATA_DS4_DISK_SKIP_W
+        std::fprintf(stderr, "decode left out %.1f experts a token not in RAM (%.1f%% of the routed)\n",
+                     (double) (s.skipped - s0.skipped) / nt,
+                     100.0 * (double) (s.skipped - s0.skipped) / std::max<double>(1.0, (double) (s.experts - s0.experts)));
     if (s.ahead_picks > s0.ahead_picks) {   // lookahead
         const double p = (double) (s.ahead_picks - s0.ahead_picks), c = (double) (s.ahead_cold - s0.ahead_cold);
         std::fprintf(stderr, "lookahead: the guesses a layer before held %.1f%% of the picks (their top k %.1f%%, two layers "

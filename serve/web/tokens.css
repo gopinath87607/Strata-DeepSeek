@@ -1,4 +1,4 @@
-/* Strata-DeepSeek UI - tokens.  Dark is the default (<html data-theme="dark">); light via data-theme="light".
+/* Strata-DeepSeek UI - tokens.  Sandal white is the default (light); a warm espresso dark via data-theme="dark".
    The variable names keep the kit's --st-* prefix so every component reads them unchanged. */
 
 /* Outfit (SIL Open Font License 1.1, serve/web/fonts/OFL.txt): one variable font, weights 100-900 */
@@ -27,75 +27,75 @@
   /* layout */
   --maya-side:236px;
 
-  /* color - light */
-  --st-bg:#f2f6fc;
-  --st-bg-glow-1:rgba(77,107,254,.10);
-  --st-bg-glow-2:rgba(6,182,212,.08);
-  --st-surface:#ffffff;
-  --st-surface-2:#eef3fb;
-  --st-surface-3:#e3eaf6;
-  --st-line:#dbe3f1;
-  --st-line-soft:#e8eef7;
-  --st-ink:#0d1530;
-  --st-ink-soft:#2b3a5c;
-  --st-ink-muted:#5c6b8a;
-  --st-icon:#2b3a5c;
+  /* color - sandal white (the default): warm cream paper, sandalwood ink, amber accent */
+  --st-bg:#f7f1e6;
+  --st-bg-glow-1:rgba(180,83,9,.07);
+  --st-bg-glow-2:rgba(146,64,14,.05);
+  --st-surface:#fffbf3;
+  --st-surface-2:#f3ebdc;
+  --st-surface-3:#eae0cd;
+  --st-line:#e3d7c2;
+  --st-line-soft:#efe6d5;
+  --st-ink:#2c2318;
+  --st-ink-soft:#52442f;
+  --st-ink-muted:#8a785f;
+  --st-icon:#52442f;
 
-  --st-accent:#4d6bfe;
-  --st-accent-2:#0891b2;          /* the second stop of the brand gradient */
-  --st-accent-hover:#3b57e8;
-  --st-accent-ink:#ffffff;
-  --st-accent-tint:#e8edff;
-  --st-accent-text:#3448d4;
-  --st-focus:#4d6bfe;
+  --st-accent:#b45309;
+  --st-accent-2:#8a5a2b;          /* the second stop of the brand gradient */
+  --st-accent-hover:#92400e;
+  --st-accent-ink:#fffbf3;
+  --st-accent-tint:#f7e8d3;
+  --st-accent-text:#92400e;
+  --st-focus:#b45309;
 
-  --st-info:#0284c7;     --st-info-tint:#e0f2fe;    --st-info-text:#0369a1;
-  --st-ok:#10b981;       --st-ok-tint:#e7f8f1;      --st-ok-text:#047857;
-  --st-warn:#d97706;     --st-warn-tint:#fef3c7;    --st-warn-text:#92400e;
-  --st-danger:#e11d48;   --st-danger-tint:#ffe4e9;  --st-danger-text:#be123c;
+  --st-info:#0e7490;     --st-info-tint:#e0f2f5;    --st-info-text:#155e75;
+  --st-ok:#15803d;       --st-ok-tint:#e8f5e9;      --st-ok-text:#166534;
+  --st-warn:#b45309;     --st-warn-tint:#fdf0dc;    --st-warn-text:#92400e;
+  --st-danger:#b91c1c;   --st-danger-tint:#fde8e8;  --st-danger-text:#991b1b;
 
-  --st-code-bg:#141629;  --st-code-ink:#e4e6f8;
+  --st-code-bg:#2c2318;  --st-code-ink:#f6ead6;
 
-  --st-sh-card:0 1px 2px rgba(20,21,43,.04),0 6px 18px rgba(20,21,43,.04);
-  --st-sh-bar:0 18px 40px rgba(20,21,43,.08),0 2px 6px rgba(20,21,43,.05);
-  --st-sh-pop:0 18px 48px rgba(20,21,43,.14),0 2px 6px rgba(20,21,43,.06);
-  --st-glow:0 8px 24px rgba(77,107,254,.28);
+  --st-sh-card:0 1px 2px rgba(60,45,25,.05),0 6px 18px rgba(60,45,25,.05);
+  --st-sh-bar:0 18px 40px rgba(60,45,25,.10),0 2px 6px rgba(60,45,25,.06);
+  --st-sh-pop:0 18px 48px rgba(60,45,25,.16),0 2px 6px rgba(60,45,25,.07);
+  --st-glow:0 8px 24px rgba(180,83,9,.24);
   color-scheme:light;
 }
 
-/* color - dark (the default) */
+/* color - dark (a warm espresso, not the old blue night) */
 [data-theme="dark"]{
-  --st-bg:#060a18;
-  --st-bg-glow-1:rgba(77,107,254,.18);
-  --st-bg-glow-2:rgba(34,211,238,.10);
-  --st-surface:#0d1428;
-  --st-surface-2:#121b33;
-  --st-surface-3:#18233f;
-  --st-line:#223052;
-  --st-line-soft:#18233f;
-  --st-ink:#e8eefc;
-  --st-ink-soft:#b9c6e4;
-  --st-ink-muted:#7f8fb4;
-  --st-icon:#b9c6e4;
+  --st-bg:#16120c;
+  --st-bg-glow-1:rgba(217,119,6,.16);
+  --st-bg-glow-2:rgba(202,138,4,.08);
+  --st-surface:#211a12;
+  --st-surface-2:#2a2116;
+  --st-surface-3:#33281b;
+  --st-line:#3d3021;
+  --st-line-soft:#2a2116;
+  --st-ink:#f4e9d6;
+  --st-ink-soft:#d8c7ab;
+  --st-ink-muted:#a08c6d;
+  --st-icon:#d8c7ab;
 
-  --st-accent:#6e8bff;
-  --st-accent-2:#22d3ee;
-  --st-accent-hover:#8aa2ff;
-  --st-accent-ink:#060a18;
-  --st-accent-tint:rgba(110,139,255,.16);
-  --st-accent-text:#a9bbff;
-  --st-focus:#8aa2ff;
+  --st-accent:#e0a458;
+  --st-accent-2:#c98f3d;
+  --st-accent-hover:#eab676;
+  --st-accent-ink:#16120c;
+  --st-accent-tint:rgba(224,164,88,.16);
+  --st-accent-text:#f0c68a;
+  --st-focus:#eab676;
 
-  --st-info:#38bdf8;     --st-info-tint:rgba(56,189,248,.13);  --st-info-text:#7dd3fc;
-  --st-ok:#34d399;       --st-ok-tint:rgba(52,211,153,.13);    --st-ok-text:#6ee7b7;
-  --st-warn:#fbbf24;     --st-warn-tint:rgba(251,191,36,.13);  --st-warn-text:#fcd34d;
-  --st-danger:#fb7185;   --st-danger-tint:rgba(251,113,133,.13);--st-danger-text:#fda4af;
+  --st-info:#67c7db;     --st-info-tint:rgba(103,199,219,.13);  --st-info-text:#a5e3f0;
+  --st-ok:#7bd389;       --st-ok-tint:rgba(123,211,137,.13);    --st-ok-text:#a7e4b1;
+  --st-warn:#eab308;     --st-warn-tint:rgba(234,179,8,.13);    --st-warn-text:#f3d36a;
+  --st-danger:#f28b82;   --st-danger-tint:rgba(242,139,130,.13);--st-danger-text:#f7b0aa;
 
-  --st-code-bg:#07080f;  --st-code-ink:#e4e6f8;
+  --st-code-bg:#0f0b07;  --st-code-ink:#f0e5d2;
 
-  --st-sh-card:0 1px 0 rgba(255,255,255,.03) inset,0 10px 30px rgba(0,0,0,.25);
-  --st-sh-bar:0 18px 48px rgba(0,0,0,.45),0 2px 6px rgba(0,0,0,.35);
-  --st-sh-pop:0 22px 60px rgba(0,0,0,.6),0 2px 6px rgba(0,0,0,.4);
-  --st-glow:0 8px 28px rgba(110,139,255,.35);
+  --st-sh-card:0 1px 0 rgba(255,255,255,.03) inset,0 10px 30px rgba(0,0,0,.3);
+  --st-sh-bar:0 18px 48px rgba(0,0,0,.5),0 2px 6px rgba(0,0,0,.4);
+  --st-sh-pop:0 22px 60px rgba(0,0,0,.65),0 2px 6px rgba(0,0,0,.45);
+  --st-glow:0 8px 28px rgba(224,164,88,.3);
   color-scheme:dark;
 }
