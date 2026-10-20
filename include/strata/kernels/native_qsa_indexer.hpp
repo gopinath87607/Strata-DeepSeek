@@ -1,6 +1,5 @@
 #pragma once
 #include "strata/kernels/qsa.hpp"
-#include "strata/kernels/rope_scaling.hpp"
 
 namespace strata::kernels {
 
@@ -21,9 +20,6 @@ bool native_qsa_indexer_enabled();
 // contiguous, with nonnegative pos_base divisible by four. Clear state before
 // starting a new sequence. Completed block b rotates at pos_base+4*b; the spare
 // always rotates at zero, including nonzero sequence bases, as in the oracle.
-// Under rope scaling (rope_scaling.hpp) the zero angle keeps the spare's
-// rotation an identity; YaRN's mscale rides in through cos(0) on both the pooled
-// keys and the indexer queries, so selection is unchanged.
 //
 // Explicit nonnull stream; no allocation or synchronization. All spans must be
 // aligned and disjoint, remain valid through replay, and contain finite values;
@@ -36,34 +32,11 @@ bool native_qsa_indexer_enabled();
 // Host-side positions (not for a captured graph).
 void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, int32_t pos_base, const float* gamma,
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
-                                     const RopeScaling& scaling, void* stream);
+                                     float freq_base, void* stream);
 
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device,
                                int32_t pos_base, const float* gamma, float epsilon,
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
-                               int64_t max_cells, const RopeScaling& scaling, void* stream);
-
-void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_pos_device,
-                                     int pos_stride, int n_steps, int32_t pos_base,
-                                     const float* gamma, float epsilon,
-                                     const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
-                                     int64_t max_cells, const RopeScaling& scaling, void* stream);
-
-// engine-latency: the commit's append of the same window rows into several QSA layers in one launch.  Layer i reads
-// raw0 + i * raw_stride and its own gamma/buffers; with tail_src[i] set its tail is first restored from there (the
-// commit's snapshot, mapped memory), as copy_from_mapped did before the per-layer append.  Bitwise the per-layer calls.
-struct QsaIndexerLayers {
-    static constexpr int kMax = 16;
-    const float* gamma[kMax] = {};
-    const float* tail_src[kMax] = {};
-    float* tail[kMax] = {};
-    float* dead[kMax] = {};
-    float* pooled[kMax] = {};
-    int32_t* block_pos[kMax] = {};
-};
-void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_stride, const int32_t* relative_pos_device,
-                                            int pos_stride, int n_steps, int32_t pos_base, float epsilon,
-                                            const QsaIndexerLayers& layers, int n_layers, const QsaShapes& shapes,
-                                            int64_t max_cells, const RopeScaling& scaling, void* stream);
+                               int64_t max_cells, float freq_base, void* stream);
 
 } // namespace strata::kernels

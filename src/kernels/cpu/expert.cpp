@@ -21,6 +21,8 @@
 namespace strata::kernels::cpu {
 namespace {
 
+std::atomic<bool> oracle_q8_0{false};
+
 /// fp16 -> fp32, written out rather than using `_cvtsh_ss`, because the F16C intrinsic's behaviour on
 /// subnormals is the one place the two can differ and the scales in this artifact are small.
 inline float h2f(const uint8_t* p) {
@@ -89,9 +91,11 @@ void quantize_oracle_q8_0(const float* x, int n, ActQ& a) {
         max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
         max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
         const float amax = _mm_cvtss_f32(max4);
-        const float d = amax / 127.0f;
+        // the FP16 scale stays finite (Strata #1448: past ~8.3M it overflowed to inf); below that nothing changes
+        const bool big = amax / 127.0f > 65504.0f;
+        const float d = big ? 65504.0f : amax / 127.0f;
         const uint16_t half_d = (uint16_t) _mm_cvtsi128_si32(_mm_cvtps_ph(_mm_set_ss(d), 0));
-        const __m256 inverse = _mm256_set1_ps(amax != 0.0f ? 127.0f / amax : 0.0f);
+        const __m256 inverse = _mm256_set1_ps(amax == 0.0f ? 0.0f : big ? 1.0f / 65504.0f : 127.0f / amax);
         v0 = _mm256_round_ps(_mm256_mul_ps(v0, inverse), _MM_FROUND_TO_NEAREST_INT);
         v1 = _mm256_round_ps(_mm256_mul_ps(v1, inverse), _MM_FROUND_TO_NEAREST_INT);
         v2 = _mm256_round_ps(_mm256_mul_ps(v2, inverse), _MM_FROUND_TO_NEAREST_INT);
@@ -336,10 +340,53 @@ void expert_oracle_q8_0(const uint8_t* blob, const ActQ& a1, float* out, ExpertS
 
 }  // namespace
 
-// CpuFeatures::reason, cpu_features, cpu_require_expert_support and the oracle flag live in expert_layout.cpp: this
-// file is compiled for AVX-512, and the code that finds out whether the CPU has AVX-512 must not be in it (#795).
+const char* CpuFeatures::reason() const {
+    if (usable()) return "ok";
+    // Named individually: "AVX-512 not supported" sends a user looking for a new CPU when the machine may have
+    // AVX-512F and be missing only VNNI, which is a much narrower and more explicable gap.
+    static char buf[160];
+    std::snprintf(buf, sizeof buf, "missing %s%s%s%s%s", avx512f ? "" : "AVX512F ",
+                  avx512bw ? "" : "AVX512BW ", avx512vl ? "" : "AVX512VL ",
+                  avx512_vnni ? "" : "AVX512-VNNI ", avx512_vbmi ? "" : "AVX512-VBMI");
+    return buf;
+}
+
+CpuFeatures cpu_features() {
+    CpuFeatures f;
+    int reg[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+    __cpuid(reg, 0);
+    if (reg[0] < 7) return f;
+    __cpuidex(reg, 7, 0);
+#else
+    unsigned r[4] = {0, 0, 0, 0};
+    __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
+    if (r[0] < 7) return f;
+    __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
+    for (int i = 0; i < 4; ++i) reg[i] = (int) r[i];
+#endif
+    const unsigned ebx = (unsigned) reg[1], ecx = (unsigned) reg[2];
+    f.avx512f = (ebx >> 16) & 1u;
+    f.avx512bw = (ebx >> 30) & 1u;
+    f.avx512vl = (ebx >> 31) & 1u;
+    f.avx512_vnni = (ecx >> 11) & 1u;
+    f.avx512_vbmi = (ecx >> 1) & 1u;
+    return f;
+}
+
+void cpu_require_expert_support() {
+    const CpuFeatures f = cpu_features();
+    if (f.usable()) return;
+    std::fprintf(stderr,
+                 "maya: this CPU cannot run the expert kernel: %s.\n"
+                 "        The engine needs AVX512-VNNI and AVX512-VBMI (Intel Ice Lake / AMD Zen 4 or newer).\n"
+                 "        The scalar fallback exists for tests only and is far too slow to decode with.\n",
+                 f.reason());
+    std::exit(1);
+}
+
 void act_quant_q8_1(const float* x, int n, ActQ& a) {
-    if (expert_oracle_q8_0_enabled()) {
+    if (oracle_q8_0.load(std::memory_order_relaxed)) {
         quantize_oracle_q8_0(x, n, a);
         return;
     }
@@ -405,13 +452,17 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
     }
 }
 
+void expert_set_oracle_q8_0(bool enabled) {
+    oracle_q8_0.store(enabled, std::memory_order_relaxed);
+}
+
 void s2_expert_vnni(const uint8_t* blob, const float* x, float* out, ExpertScratch& ws) {
     act_quant_q8_1(x, H, ws.a1);
     s2_expert_vnni_q(blob, ws.a1, out, ws);
 }
 
 void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScratch& ws) {
-    if (expert_oracle_q8_0_enabled()) {
+    if (oracle_q8_0.load(std::memory_order_relaxed)) {
         expert_oracle_q8_0(blob, a1, out, ws);
         return;
     }
@@ -430,6 +481,7 @@ void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScr
                          blob + O_D_SCALES + (size_t) r * SC_D * 2, ws.a2, SC_D);
 }
 
+bool expert_oracle_q8_0_enabled() { return oracle_q8_0.load(std::memory_order_relaxed); }
 
 void s2_expert_gu_rows(const uint8_t* blob, const ActQ& a1, float* ff, int r0, int r1) {
     for (int r = r0; r < r1; ++r) {
@@ -560,7 +612,7 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
 
 void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* out,
                           ExpertScratchMulti& ws) {
-    if (expert_oracle_q8_0_enabled() || n_tokens < 1 || n_tokens > MAXT) {
+    if (oracle_q8_0.load(std::memory_order_relaxed) || n_tokens < 1 || n_tokens > MAXT) {
         for (int t = 0; t < n_tokens; ++t) s2_expert_vnni_q(blob, *a1[t], out[t], ws.single);
         return;
     }

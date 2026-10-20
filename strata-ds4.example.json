@@ -1,0 +1,17 @@
+{
+ "exe": "/path/to/Strata-DeepSeek/build/strata-ds4",
+ "args": [
+  "--pack", "/path/to/models/DeepSeek-V4.1-Flash/UD-Q8_K_XL/strata-ds4",
+  "--prefill-chunk-max", "8192,8192,16384,16384",
+  "--reserve-pct", "1,1,2,2"
+ ],
+ "cwd": "/path/to/Strata-DeepSeek",
+ "tokenizer": "/path/to/models/DeepSeek-V4.1-Flash/UD-Q8_K_XL/strata-ds4/tokenizer",
+ "model_name": "deepseek-v4.1-flash",
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95
+ },
+ "fit_max_tokens": true,
+ "log": "/path/to/Strata-DeepSeek/strata-ds4.log"
+}

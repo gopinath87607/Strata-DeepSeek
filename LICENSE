@@ -1,5 +1,7 @@
 MIT License
 
+Copyright (c) 2026 Gopi (gopinath87607) and the Strata-DeepSeek contributors
+Copyright (c) 2026 Peasant Smith and the Project Maya contributors
 Copyright (c) 2026 Niko1221 and the Strata contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -19,3 +21,10 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+The ggml CPU kernels under third_party/ggml and the ggml libraries fetched by CMake are MIT-licensed by the
+ggml authors; their license is in third_party/ggml/LICENSE.  This engine's GGUF format, i-quant block
+layouts and CPU dot-product results are matched to llama.cpp/ggml by that license and by their published
+codebooks (third_party/ggml/ggml-common.h).

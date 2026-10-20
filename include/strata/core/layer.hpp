@@ -41,9 +41,6 @@
 #include "strata/kernels/ple.hpp"
 
 #include <cstdio>
-#include <functional>
-
-#include "strata/core/vmm.hpp"
 #include <cstdlib>
 #include <cstdint>
 #include <string>
@@ -171,9 +168,6 @@ bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 /// rung, so a host that sees it knows `h_x_f`/`h_ids`/`h_weights` are in place.
 bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                const float* x, void* stream, std::string& err, const Doorbell* db = nullptr);
-/// The verify window's n tokens routed at once (see layer.cpp); bitwise per token what `moe_route` gives.
-bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
-                      const float* x, float* logits, int32_t* ids, float* weights, int n, void* stream, std::string& err);
 
 /// The finishing half: the shared expert and the combination.
 ///
@@ -223,9 +217,6 @@ struct QsaState {
     /// Uses k_q/k_scale + v_q4. Mode 0 only (no KV streaming, no ring); under this setting the MTP drafter's
     /// ring state stays plain INT8, so the block movers never see the hybrid layout.
     bool kv_hybrid = false;
-    /// K and V go through kv_q4.hpp's Walsh-Hadamard rotation before they are stored, the queries too, the output
-    /// back: always for Q4_0, for INT8 by qsa_set_kv_int8_rotate (spreads outlier channels over the scale groups)
-    bool kv_rot = false;
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
     int64_t n_pages = 0;
     int64_t max_cells = 0;
@@ -236,9 +227,6 @@ struct QsaState {
     /// pages at `block % n_slots`, with the host copy for a resume. The pool pointers above point at the slots.
     int kv_mode = 0;
     int64_t n_slots = 0;
-    /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
-    /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
-    int32_t kv_elastic = -1;
     strata::kernels::KvHostPools host;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
@@ -249,7 +237,6 @@ struct QsaState {
     int32_t* idx_block_pos = nullptr;
 
     float* cos_tab = nullptr;        ///< (max_cells, n_rot/2), built on the HOST in float64
-    bool owns_rope = false;          ///< built the table above (not borrowed with share_rope): it releases it
     float* sin_tab = nullptr;
 
     /// THE PER-TOKEN COUNTS, IN DEVICE MEMORY - the whole reason this layer can be a graph.  `qsa_step_fill`
@@ -282,24 +269,6 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
 /// resident state).
 void qsa_set_kv_resident(int64_t cells);
-/// THE ELASTIC K/V (--kv-grow; vmm.hpp).  A mode-0 state's K/V pools get addresses for every cell of the context but
-/// physical memory only for the first `init_cells`; `qsa_kv_elastic_grow` maps more as the context grows (from
-/// chunks the expert cache gives up) and `qsa_kv_elastic_shrink` hands them back.  The addresses never move, so the
-/// captured graphs stay valid.  Set before sizing and initializing the session and the drafter.
-void qsa_set_kv_elastic(bool enabled, int64_t init_cells);
-bool qsa_kv_elastic();
-/// Cells every elastic state can hold now (INT64_MAX when none is elastic).
-int64_t qsa_kv_elastic_cells();
-/// Chunks still to map for every elastic state to hold `cells` cells.
-int64_t qsa_kv_elastic_need(int64_t cells);
-/// Maps them, each from `take()` (0: a new chunk), the new memory zeroed.  Synchronous; nothing may be running on
-/// the device.  false: out of memory.
-bool qsa_kv_elastic_grow(int64_t cells, const std::function<VmmChunk()>& take);
-/// Unmaps the chunks past `cells` cells, each handed to `give`.  Returns how many.
-int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(VmmChunk)>& give);
-/// Physical bytes the elastic pools hold, and what all of them would at the full context.
-uint64_t qsa_kv_elastic_mapped_bytes();
-uint64_t qsa_kv_elastic_full_bytes();
 int64_t qsa_kv_resident();
 /// The fewest resident cells a streamed layer may have: one verify window's selections (8 queries x 2,051 cells
 /// in whole blocks) must fit at once, with room to spare.
@@ -309,18 +278,21 @@ uint64_t qsa_kv_host_bytes();
 /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);
-/// INT8 K/V through the Hadamard rotation (off by default: STRATA_KV_ROT=1)
-void qsa_set_kv_int8_rotate(bool enabled);
 bool qsa_kv_int8();
 /// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);
 bool qsa_kv_q4();
-/// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell; streams with --kv-resident too.
+/// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell. Not with --kv-resident.
 void qsa_set_kv_hybrid(bool enabled);
 bool qsa_kv_hybrid();
-/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid).
+/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4).
 inline int qsa_kv_format(const QsaState& st) {
-    if (st.kv_hybrid) return strata::kernels::kKvHybrid;   // K8V4: its own three runs (kv_stream.cu)
+    // A hybrid K8V4 state is mode 0 only and never reaches the block movers; refuse rather than let it
+    // fall through to kKvF16 - a wrong layout silently applied is worse than a hard stop (PR review).
+    if (st.kv_hybrid) {
+        std::fprintf(stderr, "maya: qsa_kv_format: a hybrid K8V4 state must never reach the block movers\n");
+        std::exit(1);   // the kernels' own "unsupported geometry" convention (kv_q8.cu, qsa_decode_attn.cu)
+    }
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,

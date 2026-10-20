@@ -1,0 +1,11 @@
+{
+ "name": "Strata-DeepSeek",
+ "short_name": "Strata-DeepSeek",
+ "description": "DeepSeek-V4.1-Flash on your own machine",
+ "start_url": "./",
+ "scope": "./",
+ "display": "standalone",
+ "background_color": "#060a18",
+ "theme_color": "#060a18",
+ "icons": [{"src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}]
+}

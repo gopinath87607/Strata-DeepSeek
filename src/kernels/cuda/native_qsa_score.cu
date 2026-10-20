@@ -19,7 +19,6 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_qsa_score.hpp"
-#include "strata/core/geometry.hpp"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cstddef>
@@ -30,8 +29,6 @@ namespace strata::kernels {
 namespace {
 std::atomic<bool> enabled{false};
 constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
-static_assert(D == strata::core::kCompiledGeometry.idx_key_dim && HEADS == strata::core::kCompiledGeometry.idx_q_heads && R == strata::core::kCompiledGeometry.idx_block,
-              "native_qsa_score is compiled for core/geometry.hpp");
 struct TileA { uint32_t x[4]; };
 struct TileB { uint32_t x[2]; };
 struct TileC { float x[4]={0.0f,0.0f,0.0f,0.0f}; };

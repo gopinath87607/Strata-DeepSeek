@@ -9,14 +9,17 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest quantized activation any native layer uses.  qwen4exp: 2560 values as
+/// Q8_K (10 x 292 = 2604); glm5-next: 4096 values as Q8_K (16 x 260 = 4164).
+inline constexpr size_t kNativeActBytes = 8192;
+/// Bytes of the largest quantized down activation.  qwen4exp: 640 values as Q8_0/Q8_K (1024);
+/// glm5-next: 2048 values as Q8_K (8 x 260 = 2084).
+inline constexpr size_t kNativeHBytes = 4096;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
@@ -27,14 +30,7 @@ struct NativeFmt {
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
-    /// NVFP4 (ggml type 40) only: the blob ends with {s_gate, s_up, s_down, 0} at this offset, the per-expert
-    /// weight_scale_2 the block format has no room for (tools/iq_pack.py). 0 = no tail. Each scale goes on its own
-    /// projection's FP32 output: gate * s_gate, up * s_up, down * s_down. Do not fold s_down into up: the hidden
-    /// drops to ~1e-5 and its q8 block scale becomes an FP16 subnormal (expert error 2-12% instead of 1.1%).
-    size_t tail_off = 0;
 };
-constexpr int kNvfp4Type = 40;
-constexpr size_t kNvfp4Tail = 16;
 
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
@@ -46,12 +42,25 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes).
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 
-/// From how many tokens native_gu_rows gives this gate/up type to a multi-token kernel (#152; ggml-cpu's per-token dot
-/// below that).  1: a token's rows are the same alone and in any group.
-int native_gu_mt_min(int gu_type);
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]) for rows r in [r0, r1), `nt` tokens.
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1);
+/// Split-base variants for files whose gate/up/down tensors are NOT adjacent (the unsloth
+/// GLM-5.3-FF shards interleave other tensors between them).  One token: ggml-cpu's dot per row.
+/// Several tokens (a verify window's tokens sharing an expert, a prompt's CPU rows): the
+/// multi-token kernels (iq_avx512 / iq_avx2: IQ2_*, IQ3_*, IQ4_XS, Q4_K, Q5_K) when they give
+/// ggml's results bit for bit - checked once per type (native_multi_rows_exact) - so a window
+/// computes exactly what its tokens one at a time would; STRATA_GLM_CPU_MT=0 keeps ggml's
+/// dots.  swiglu_limit is GLM's swiglu clamp (gate clamped above, up both sides; +infinity =
+/// qwen4exp's plain path) - the same semantics as the device grouped path, so the two agree.
+void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const uint8_t* up_base,
+                          const void* const* act, int nt, float* const* ff, int r0, int r1,
+                          float swiglu_limit = std::numeric_limits<float>::infinity());
+void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const void* const* hq,
+                            int nt, float* const* out, int r0, int r1);
+/// Whether the split variants take the multi-token kernels for this weight type here (the CPU has
+/// them, they are not switched off, and they matched ggml-cpu's dot bit for bit on synthetic rows).
+bool native_multi_rows_exact(int ggml_type);
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1).
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1);

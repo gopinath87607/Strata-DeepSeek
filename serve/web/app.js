@@ -1,5 +1,5 @@
-// serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
-// The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
+// serve/web/app.js - the Strata-DeepSeek web app: Chat, Monitor, About. No framework, no network beyond this server.
+// The Monitor is built on the server's own /metrics (hardware, requests) and the engine's STAT lines (expert tiers).
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -8,28 +8,70 @@ const icon = (name, cls = "st-icon") => `<svg class="${cls}" aria-hidden="true">
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "–" : Number(n).toLocaleString(undefined, {maximumFractionDigits: d, minimumFractionDigits: d}));
 const kfmt = (n) => (n == null ? "–" : n >= 1000 ? `${fmt(n / 1000, n >= 10000 ? 0 : 1)}k` : fmt(n));
-// a context size: 32768 -> "32K" (powers of two), else like kfmt
-const ctxfmt = (n) => (n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
+// a context size: 32768 -> "32K", 1048576 -> "1M" (powers of two), else like kfmt
+const ctxfmt = (n) => (n && n % 1048576 === 0 ? `${fmt(n / 1048576)}M` : n && n % 1024 === 0 ? `${fmt(n / 1024)}K` : kfmt(n));
 const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memory: binary GB, as Windows shows it
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+// an age in seconds as people say it: "12 s", "4 min", "1 h 25 min"
+function ago(s) {
+  if (s < 90) return `${fmt(s)} s`;
+  if (s < 5400) return `${fmt(Math.round(s / 60))} min`;
+  return `${fmt(Math.floor(s / 3600))} h ${fmt(Math.round((s % 3600) / 60))} min`;
+}
 
 const store = {
-  get(k, d) { try { const v = localStorage.getItem("strata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
+  get(k, d) {
+    try {
+      let v = localStorage.getItem("maya." + k);
+      if (v === null) v = localStorage.getItem("strata." + k);
+      return v === null ? d : JSON.parse(v);
+    } catch (e) { return d; }
+  },
+  set(k, v) { try { localStorage.setItem("maya." + k, JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
 };
+
+// ------------------------------------------------------------------ the chats' store (IndexedDB: no 5 MB cap, pictures and
+// attached files kept, so a reopened chat sends exactly what it sent before)
+const db = (() => {
+  let opening = null;
+  const open = () => opening || (opening = new Promise((ok, bad) => {
+    try {
+      const r = indexedDB.open("maya", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("chats", {keyPath: "id"});
+      r.onsuccess = () => ok(r.result);
+      r.onerror = () => bad(r.error);
+    } catch (e) { bad(e); }
+  }));
+  const run = async (mode, fn) => {
+    const d = await open();
+    return new Promise((ok, bad) => {
+      const t = d.transaction("chats", mode);
+      const req = fn(t.objectStore("chats"));
+      t.oncomplete = () => ok(req ? req.result : undefined);
+      t.onerror = () => bad(t.error);
+      t.onabort = () => bad(t.error);
+    });
+  };
+  return {
+    all: () => run("readonly", (s) => s.getAll()),
+    put: (c) => run("readwrite", (s) => s.put(c)),
+    del: (id) => run("readwrite", (s) => s.delete(id)),
+    clear: () => run("readwrite", (s) => s.clear()),
+  };
+})();
 
 // ------------------------------------------------------------------ toasts
 function toast(kind, title, text = "", ms = 3500, action = null) {
   const names = {info: "info", success: "check", warn: "warning", error: "error"};
   const el = document.createElement("div");
   el.className = `st-toast st-toast--${kind}`;
+  el.setAttribute("role", kind === "error" ? "alert" : "status");
   el.innerHTML = `${icon(names[kind] || "info")}<div><div class="st-toast__title"></div><div class="t-text"></div></div>`;
   el.querySelector(".st-toast__title").textContent = title;
   el.querySelector(".t-text").textContent = text;
   if (action) {
     const b = document.createElement("button");
-    b.className = "st-btn st-btn--secondary";
-    b.style.height = "32px";
-    b.style.marginLeft = "auto";
+    b.className = "st-btn st-btn--secondary st-btn--sm toast-action";
     b.textContent = action.label;
     b.onclick = () => { action.run(); el.remove(); };
     el.appendChild(b);
@@ -38,7 +80,7 @@ function toast(kind, title, text = "", ms = 3500, action = null) {
   setTimeout(() => el.remove(), ms);
 }
 
-async function copyText(text, btn) {
+async function copyText(text, btn, quiet = false) {
   try {
     await navigator.clipboard.writeText(text);
   } catch (e) {                                   // http on another host: no async clipboard
@@ -47,43 +89,100 @@ async function copyText(text, btn) {
   }
   if (btn) {
     const use = btn.querySelector("use");
+    const was = use.getAttribute("href");
     use.setAttribute("href", `${SPRITE}#i-check`);
-    setTimeout(() => use.setAttribute("href", `${SPRITE}#i-copy`), 1500);
+    setTimeout(() => use.setAttribute("href", was), 1500);
   }
-  toast("success", "Copied to clipboard", "", 1800);
+  if (!quiet) toast("success", "Copied to clipboard", "", 1800);
+}
+
+// ------------------------------------------------------------------ focus: a dialog or drawer keeps the keyboard inside it
+function focusables(root) {
+  return [...root.querySelectorAll('button, [href], input, select, textarea, iframe, [tabindex]:not([tabindex="-1"])')]
+    .filter((e) => !e.disabled && !e.hidden && e.offsetParent !== null);
+}
+function trapTab(e, root) {
+  const f = focusables(root);
+  if (!f.length) return;
+  const first = f[0], last = f[f.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+
+// ------------------------------------------------------------------ the dialog (confirmations, the HTML preview)
+let modalReturn = null, modalOnClose = null;
+function openModal({title, body, actions = [], wide = false, onClose = null}) {
+  $("modal-title").textContent = title;
+  const b = $("modal-body");
+  b.innerHTML = "";
+  if (typeof body === "string") b.innerHTML = body; else b.appendChild(body);
+  const a = $("modal-actions");
+  a.innerHTML = "";
+  for (const act of actions) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `st-btn ${act.primary ? "st-btn--primary" : act.danger ? "st-btn--danger" : "st-btn--secondary"}`;
+    btn.textContent = act.label;
+    btn.onclick = () => { closeModal(true); if (act.run) act.run(); };
+    a.appendChild(btn);
+  }
+  a.hidden = !actions.length;
+  $("modal-box").classList.toggle("modal__box--wide", wide);
+  modalReturn = document.activeElement;
+  modalOnClose = onClose;
+  $("modal").hidden = false;
+  (a.querySelector(".st-btn--primary") || $("modal-close")).focus();
+}
+function closeModal(byAction = false) {          // byAction: one of its buttons answered (no "closed" callback)
+  if ($("modal").hidden) return;
+  $("modal").hidden = true;
+  $("modal-body").innerHTML = "";                // an iframe preview stops with it
+  const f = modalOnClose;
+  modalOnClose = null;
+  if (f && !byAction) f();
+  if (modalReturn && modalReturn.focus) modalReturn.focus();
+}
+$("modal-close").onclick = () => closeModal();
+$("modal").addEventListener("click", (e) => { if (e.target === $("modal")) closeModal(); });
+function confirmDialog(title, html, okLabel, danger = false) {
+  return new Promise((ok) => {
+    let answered = false;
+    openModal({title, body: html, onClose: () => { if (!answered) ok(false); },
+               actions: [{label: "Cancel", run: () => { answered = true; ok(false); }},
+                         {label: okLabel, primary: !danger, danger, run: () => { answered = true; ok(true); }}]});
+  });
 }
 
 // ------------------------------------------------------------------ theme and tabs
-// the system's theme until the user picks one (only a click is saved)
 function setTheme(t, save) {
   document.documentElement.dataset.theme = t;
-  if (save) try { localStorage.setItem("strata.theme", t); } catch (e) { /* ignore */ }
+  if (save) try { localStorage.setItem("maya.ui-theme", t); } catch (e) { /* ignore */ }
   $("theme-icon").setAttribute("href", `${SPRITE}#i-${t === "dark" ? "sun" : "moon"}`);
-  $("dark-toggle").setAttribute("aria-checked", String(t === "dark"));
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = t === "dark" ? "#090a14" : "#f4f4fa";
 }
 const flipTheme = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
 $("theme-btn").onclick = flipTheme;
-$("dark-toggle").onclick = flipTheme;
-setTheme(document.documentElement.dataset.theme || "light", false);
+setTheme(document.documentElement.dataset.theme || "dark", false);
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
   let saved = null;
-  try { saved = localStorage.getItem("strata.theme"); } catch (err) { /* ignore */ }
+  try { saved = localStorage.getItem("maya.ui-theme"); } catch (err) { /* ignore */ }
   if (!saved) setTheme(e.matches ? "dark" : "light", false);
 });
 
 let tab = "chat";
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
-  for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
-  if (tab === "images") $("img-prompt").focus();
+  tab = ["chat", "monitor", "about"].includes(name) ? name : "chat";
+  for (const b of document.querySelectorAll(".st-tab[data-tab]")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
+  for (const v of ["chat", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  document.body.dataset.tab = tab;
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
-  if (tab === "about") loadConfig();
+  if (tab === "about") loadUpdate();
   if (lastMetrics) render(lastMetrics);
 }
-for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
+for (const b of document.querySelectorAll(".st-tab[data-tab]")) b.onclick = () => showTab(b.dataset.tab);
 window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
 
 // ------------------------------------------------------------------ server access
@@ -94,59 +193,695 @@ function headers(json = false) {
   if (json) h["Content-Type"] = "application/json";
   return h;
 }
+// the composer's hint line: a passing note (reconnecting, reloading) or the keyboard hint
+let hintNote = "";
+function setHint(t) { hintNote = t || ""; refreshHint(); }
+function refreshHint() {
+  $("composer-hint").textContent = hintNote || (busy && busy.chat !== current ? "An answer is being written in another chat" :
+                                                busy || reloadWatch ? "" : "Shift+Enter: new line");
+}
 $("api-key").value = store.get("apikey", "");
 $("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
 
-let health = {model: "strata", images: false, max_context: 0};
+let health = {model: "strata-deepseek", images: false, max_context: 0, version: null};
 async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
+    // the server's recommended settings for this model (its run config) replace the built-in Chat defaults, and
+    // are what the Chat uses until its user applies settings of their own
+    const d = health.defaults || {};
+    if (THINKING.includes(d.reasoning_effort)) DEFAULTS.thinking = d.reasoning_effort;   // the server sends GLM's names
+    if (d.temperature !== undefined) DEFAULTS.temperature = d.temperature;
+    if (d.top_p !== undefined) DEFAULTS.top_p = d.top_p;
+    if (d.temperature !== undefined || d.top_k !== undefined) DEFAULTS.top_k = d.top_k !== undefined ? d.top_k : 0;
+    // each model keeps its own Chat settings (DeepSeek's are not GLM's), and its own thinking levels' meaning
+    samplingKey = /deepseek/i.test(health.model || "") ? "sampling_deepseek" : "sampling";
+    settings = {...DEFAULTS, ...store.get(samplingKey, {})};
+    if (!THINKING.includes(settings.thinking)) settings.thinking = DEFAULTS.thinking;
+    thinkingTitles();
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
-    $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
-    $("tab-btn-images").hidden = !health.image_generation;
-    if (location.hash === "#images" && health.image_generation) showTab("images");
+    $("chat-empty-sub").textContent = health.mcp_tools ? "Runs on this machine. Nothing leaves it, unless an MCP tool you turned on reaches the web."
+                                                       : "Runs on this machine. Nothing leaves it.";
+    renderModelLine();
+    updateCtxMeter();
+    if (health.status === "reloading") watchReload();
+    if (health.status === "updating" && !updateWatch) loadUpdate().then((u) => u && u.state && watchUpdate(u.state.to));
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
 }
+function renderModelLine() {
+  const ctx = health.max_context ? `${ctxfmt(health.max_context)} context` : "";
+  const ver = health.version ? `v${health.version}` : "";
+  $("side-model").innerHTML = `<b>${esc(health.model)}</b>${esc([ctx, ver].filter(Boolean).join(" · "))}`;
+  $("chat-empty-model").textContent = [health.model, ctx, ver ? `Strata-DeepSeek ${ver}` : ""].filter(Boolean).join(" · ");
+}
 
 // ------------------------------------------------------------------ Monitor
 const METRICS = [
-  {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
-  {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
+  {key: "gpu", label: "GPU active", icon: "gpu", unit: "%", series: "gpu_util", max: 100,
+   tip: "NVIDIA's counter: the share of time any GPU kernel is running. While the engine answers it reads 100% - between "
+        + "bursts of work the GPU waits (inside a kernel) for experts from RAM and the CPU. Power shows how hard it "
+        + "really works."},
   {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
-  {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
   {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
+  {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
   {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
   {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
+  {key: "ram", label: "System RAM", icon: "memory", unit: "GB", series: "ram_used", tone: "info"},
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
 ];
 $("metrics").innerHTML = METRICS.map((m) => `
-  <div class="st-card metric-card"><div class="st-metric">
+  <div class="st-card metric-card"${m.tip ? ` title="${esc(m.tip)}"` : ""}><div class="st-metric">
     <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
-    ${m.key === "speed" ? `<div class="speed-values">
-      <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
-      <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
-    </div>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
-    <span class="st-metric__sub" id="ms-${m.key}"></span>`}
+    <span class="st-metric__value" id="mv-${m.key}">–</span>
+    <span class="st-metric__sub" id="ms-${m.key}"></span>
     <svg class="st-metric__spark" id="sp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
       <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
-      stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
-      ${m.key === "speed" ? `<g id="sp-prefill" class="speed-prefill"><path class="area" fill="currentColor" opacity=".12"/>
-        <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"
-        stroke-linecap="round" vector-effect="non-scaling-stroke"/></g>` : ""}</svg>
+      stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>
   </div></div>`).join("");
 
+// the expert tiers, by engine (the STAT lines): the GLM engine's - where each routed expert came from while the model
+// writes - or DeepSeek's (strata-ds4): the experts the CPU lane computed, what the storage read, the cache's moves and the
+// n-gram memory (Engram) a token.  Speed, time per token and the VRAM hit are the Throughput card's - not repeated here
+const TIER_SETS = {
+  glm: [
+    {key: "ram_fetch", label: "From RAM", icon: "link", unit: "/tok", digits: 2, tone: "info",
+     sub: "experts pulled over PCIe from RAM"},
+    {key: "disk", label: "From SSD", icon: "disk", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
+    {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
+  ],
+  ds4: [
+    {key: "cpu", label: "On the CPU", icon: "cpu", unit: "/tok", digits: 1, tone: "info",
+     sub: "experts the CPU computed from RAM"},
+    {key: "disk_mb", label: "Disk reads", icon: "disk", unit: " MB/tok", digits: 1, tone: "warn",
+     sub: "read from the SSD a token"},
+    {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
+    {key: "engram_ms", label: "N-gram memory", icon: "layers", unit: " ms/tok", digits: 2, sub: "n-gram lookups"},
+  ],
+};
+let tiersShown = null;   // the set the cards are built for
+function tierCards(kind) {
+  if (tiersShown === kind) return TIER_SETS[kind];
+  tiersShown = kind;
+  $("tiers").classList.toggle("metrics--four", TIER_SETS[kind].length === 4);
+  $("tiers").innerHTML = TIER_SETS[kind].map((m) => `
+  <div class="st-card metric-card"><div class="st-metric">
+    <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
+    <span class="st-metric__value" id="tv-${m.key}">–</span>
+    <span class="st-metric__sub" id="ts-${m.key}"></span>
+    <svg class="st-metric__spark" id="tp-${m.key}" viewBox="0 0 100 32" preserveAspectRatio="none"${m.tone ? ` data-tone="${m.tone}"` : ""}>
+      <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
+      stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>
+  </div></div>`).join("");
+  return TIER_SETS[kind];
+}
+function renderTiers(t, eng) {
+  const card = $("tiers-card");
+  if (!t || !t.now) { card.hidden = true; return; }
+  card.hidden = false;
+  const ds4 = !!(eng && eng.engine_kind === "ds4");
+  const n = t.now, h = t.history || {};
+  const age = n.time ? Math.max(0, Date.now() / 1000 - n.time) : null;
+  const stale = age != null && age > 30;               // a reading from the last answer, not live
+  card.classList.toggle("is-stale", stale);
+  for (const m of tierCards(ds4 ? "ds4" : "glm")) {
+    const v = n[m.key];
+    const shown = v == null ? null : fmt(v, m.digits);
+    $(`tv-${m.key}`).innerHTML = shown == null ? "–" : `${esc(shown)}<small>${esc(m.unit)}</small>`;
+    let sub = m.sub;
+    if (m.key === "engram_ms" && eng && eng.engram_lookups) sub = `${fmt(+eng.engram_lookups)} n-gram lookups a token`;
+    if (m.key === "disk_mb" && v == null) sub = "not measured on this system";
+    if (m.key === "cpu" && n.ram != null) sub = `${fmt(n.ram, 1)} of them from RAM, the rest from the SSD`;
+    $(`ts-${m.key}`).textContent = (stale ? "last answer: " : "") + sub;
+    spark(`tp-${m.key}`, (h[m.key] || []).map((x) => (x == null ? 0 : x)), m.max);
+  }
+  let vu, ru, disk, total;
+  const ds4Tier = ds4 && (+eng.ram_experts || 0) > 0;
+  if (ds4) {   // DeepSeek: the VRAM slots, the RAM tier's (when on), and the rest read in place from the model's files
+    vu = +eng.expert_slots || 0;
+    ru = ds4Tier ? +eng.ram_experts : +eng.cpu_experts || 0;
+    disk = ds4Tier ? Math.max(0, (+eng.cpu_experts || 0) - ru) : 0;
+    total = Math.max(1, vu + ru + disk);
+  } else {
+    vu = n.vram_used || 0; ru = n.ram_used || 0;
+    total = (eng && eng.experts) || Math.max(1, vu + ru);
+    disk = Math.max(0, total - vu - ru);
+  }
+  $("tierbar-vram").style.width = `${(100 * vu) / total}%`;
+  $("tierbar-ram").style.width = `${(100 * ru) / total}%`;
+  $("tierbar-disk").style.width = `${(100 * disk) / total}%`;
+  $("tier-ram-label").textContent = ds4 && !ds4Tier ? "RAM cache / SSD (in place)" : "Pinned RAM";
+  $("tier-disk-item").hidden = ds4 && !ds4Tier;
+  $("tier-vram-text").textContent = ds4 ? `${fmt(vu)} experts` : `${fmt(vu)} experts · ${fmt(n.vram_gb, 1)} GB`;
+  $("tier-ram-text").textContent = ds4 ? `${fmt(ru)} experts` : `${fmt(ru)} experts · ${fmt(n.ram_gb, 1)} GB`;
+  $("tier-disk-text").textContent = `${fmt(disk)} experts`;
+  $("tiers-sub").textContent = age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer`
+                                                        : `live · ${fmt(total)} routed experts`;
+  // advice from the live numbers (only while they are fresh)
+  let tip = "";
+  if (ds4) {
+    if (!stale && n.disk_mb != null && n.disk_mb >= 500) {
+      tip = "Much of every token is read from the SSD: more RAM keeps more of the model's experts cached, and answers get faster.";
+    } else if (!stale && n.vram_hit != null && n.vram_hit < 0.5) {
+      tip = "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card.";
+    }
+  } else if (!stale && n.disk != null && n.disk >= 3) {
+    tip = "Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context makes answers faster.";
+  } else if (!stale && n.vram_hit != null && n.vram_hit < 0.85 && (n.ram_fetch || 0) >= 4) {
+    tip = "Most misses come from RAM over PCIe: more VRAM (or a second GPU) keeps more experts on the card.";
+  }
+  $("tier-advice").hidden = !tip;
+  $("tier-advice").textContent = tip;
+}
+
+// ---------------------------------------------------------------- the Monitor's own tabs
+// The engine's own report decides what exists: each tab's data is looked for in /metrics (its INFO facts, its STAT
+// values, its LEND lines - a card a line) and a tab with nothing to show stays hidden.  No GPU count, CPU count or
+// engine is assumed: the rows are the array's, the totals are its sums.
+const MTABS = ["overview", "gpus", "lend", "prefill", "storage", "engram", "draft"];
+let mtab = store.get("mtab", "overview");
+if (!MTABS.includes(mtab)) mtab = "overview";
+const qmtab = new URLSearchParams(location.search).get("mtab");   // (a link straight to a view: #monitor&?mtab=lend)
+if (qmtab && MTABS.includes(qmtab)) mtab = qmtab;
+const num = (v) => (typeof v === "number" && isFinite(v) ? v : null);
+const sumBy = (xs, f) => xs.reduce((a, x) => a + (num(f(x)) || 0), 0);
+function phaseOf(m) {
+  if ((m.live || {}).state === "reading") return 0;         // a prompt holds the arena now
+  const st = (m.tiers || {}).now || {};
+  return num(st.phase) == null ? 0 : +st.phase;              // the engine's last layout
+}
+function mtabAvailable(m) {
+  const eng = m.engine || {}, lend = m.lend || [], stat = (m.tiers || {}).now || {};
+  return {
+    overview: true,
+    gpus: lend.length > 0 || (m.gpu_map || []).length > 0 || ((m.hardware || {}).gpus || []).length > 0,
+    lend: lend.some((g) => (g.lend || 0) > 0 || (g.mtp || 0) > 0 || (g.arena || 0) > 0),
+    prefill: lend.some((g) => (g.chunk || 0) > 0) || (num(+eng.prefill_chunk) || 0) > 0,
+    storage: !!m.storage || num(stat.disk_mb) != null || num((m.hardware || {}).disk_read_mb) != null,
+    engram: eng.engram_layers != null || num(stat.engram_ms) != null,
+    draft: eng.dspark_block != null || num(stat.drafts) != null,
+  };
+}
+function renderMonitorTabs(m) {
+  const avail = mtabAvailable(m);
+  if (!avail[mtab]) mtab = "overview";
+  // the number each view carries in its tab: the same facts its panel sums, live with every poll
+  const gs = m.lend || [], eng = m.engine || {}, stat = (m.tiers || {}).now || {};
+  const badge = (k, v) => { const el = $(`mtab-v-${k}`); if (el) el.textContent = v == null || v === "" ? "" : String(v); };
+  badge("gpus", gs.length || null);
+  badge("lend", gs.length ? fmt(sumBy(gs, (g) => g.lend) + sumBy(gs, (g) => g.mtp)) : null);
+  const chunk = Math.max(0, ...gs.map((g) => +g.chunk || 0), +eng.prefill_chunk || 0);
+  badge("prefill", chunk ? (chunk >= 1024 ? `${fmt(chunk / 1024)}k` : fmt(chunk)) : null);
+  badge("storage", m.storage && m.storage.free ? `${gb(m.storage.free, 0)}G` : null);
+  badge("engram", eng.engram_layers != null ? fmt(eng.engram_layers) : null);
+  badge("draft", num(stat.drafts) != null ? `${fmt(100 * stat.drafts)}%` : null);
+  let shown = 0;
+  for (const b of $("monitor-tabs").querySelectorAll("[data-mtab]")) {
+    b.hidden = !avail[b.dataset.mtab];
+    b.setAttribute("aria-selected", String(b.dataset.mtab === mtab));
+    if (!b.hidden) ++shown;
+  }
+  $("monitor-tabs").hidden = shown <= 1;            // one view only: nothing to switch between
+  for (const k of MTABS) $(`mpanel-${k}`).hidden = k !== mtab;
+  if (mtab === "gpus") renderGpuPanel(m);
+  else if (mtab === "lend") renderLendPanel(m);
+  else if (mtab === "prefill") renderPrefillPanel(m);
+  else if (mtab === "storage") renderStoragePanel(m);
+  else if (mtab === "engram") renderEngramPanel(m);
+  else if (mtab === "draft") renderDraftPanel(m);
+}
+$("monitor-tabs").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-mtab]");
+  if (!b || b.hidden) return;
+  mtab = b.dataset.mtab;
+  store.set("mtab", mtab);
+  if (lastMetrics) renderMonitorTabs(lastMetrics);
+});
+
+// the metric cards the engine's own keys fill (the same markup as the tier cards)
+function cardsInto(el, defs) {
+  el.innerHTML = defs.map((d) => `
+    <div class="st-card metric-card"><div class="st-metric">
+      <span class="st-metric__label">${icon(d.icon || "activity", "st-icon st-icon--sm")}${esc(d.label)}</span>
+      <span class="st-metric__value" id="${d.id}-v">&ndash;</span>
+      <span class="st-metric__sub" id="${d.id}-s"></span>
+      <svg class="st-metric__spark" id="${d.id}-p" viewBox="0 0 100 32" preserveAspectRatio="none"${d.tone ? ` data-tone="${d.tone}"` : ""}>
+        <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
+        stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>
+    </div></div>`).join("");
+}
+function setCard(id, value, unit, sub) {
+  const v = $(`${id}-v`), s = $(`${id}-s`);
+  if (v) v.innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
+  if (s) s.textContent = sub || "";
+}
+// a bar of named parts: the flex widths are the bytes (MiB here); a part with none takes no room
+function mibBar(parts, total) {
+  const t = Math.max(1, total || parts.reduce((a, p) => a + (num(p.v) || 0), 0));
+  const label = parts.filter((p) => p.v > 0).map((p) => `${p.label} ${fmt(p.v)} MiB`).join(", ");
+  return `<div class="mibbar" role="img" aria-label="${esc(label)}">` +
+    parts.filter((p) => p.v > 0).map((p) => `<span class="mibbar__seg" data-k="${esc(p.k)}" style="flex-grow:${(p.v / t).toFixed(4)}"></span>`).join("") +
+    `</div>`;
+}
+function gpuOf(m, g) {   // NVML's reading of the card the engine reported (joined on its bus id; else its order)
+  const cards = (m.hardware || {}).gpus || [];
+  return (g.pci && cards.find((c) => c.pci === g.pci)) || cards[g.dev] || null;
+}
+function gpuNameCls(g) { return g && g.name ? g.name.replace(/^NVIDIA /, "").replace(/^GeForce /, "").replace(/^AMD /, "").replace(/^Radeon /, "") : ""; }
+
+// GPUs: the split as the engine found it - a row a card, its bytes and its experts
+function renderGpuPanel(m) {
+  const card = $("gpus-card"), list = $("gpus-list"), gs = m.lend || [];
+  if (!gs.length) { card.hidden = true; return; }
+  card.hidden = false;
+  const phase = phaseOf(m);
+  const nExp = sumBy(gs, (g) => g.perm) + sumBy(gs, (g) => g.lend) + sumBy(gs, (g) => g.mtp);
+  $("gpus-sub").textContent = `${gs.length} GPU${gs.length > 1 ? "s" : ""} · ${fmt(nExp)} expert slots on the cards` +
+    ` · ${phase === 1 ? "the decoder holds the arenas" : "the prompts hold the arenas"}`;
+  list.innerHTML = gs.map((g) => {
+    const read = gpuOf(m, g), name = gpuNameCls(read), layers = g.layers;
+    const fixed = (g.weights || 0) + (g.caches || 0), arenaEx = (g.lend_mib || 0) + (g.mtp_mib || 0);
+    const segs = [{k: "weights", v: fixed, label: "weights"},
+                  {k: "pool", v: g.perm_mib || 0, label: "permanent experts"}];
+    if (phase === 1) {
+      segs.push({k: "lend", v: g.lend_mib || 0, label: "trunk lent"});
+      segs.push({k: "mtp", v: g.mtp_mib || 0, label: "drafter"});
+      segs.push({k: "spare", v: Math.max(0, (g.arena || 0) - arenaEx), label: "arena spare"});
+    } else {
+      segs.push({k: "prompt", v: g.arena || 0, label: "prompt buffers"});
+    }
+    segs.push({k: "free", v: g.free || 0, label: "free"});
+    const held = (g.perm || 0) + (phase === 1 ? (g.lend || 0) + (g.mtp || 0) : 0);
+    return `<div class="gpu-line">
+      <div class="gpu-line__name"><b>GPU ${esc(g.dev)}</b><span>${esc([name, layers && layers[1] >= layers[0] ? `layers ${layers[0]}–${layers[1]}` : ""].filter(Boolean).join(" · "))}</span></div>
+      ${mibBar(segs, g.total)}
+      <div class="gpu-line__nums"><b>${fmt(held)} experts</b><span>${fmt(g.free)} MiB free${g.chunk ? ` · chunk ${fmt(g.chunk)}` : ""}</span></div>
+    </div>`;
+  }).join("");
+}
+
+// Loan: the arena's experts between prompts (the engine's LEND lines and its last refill)
+function renderLendPanel(m) {
+  const card = $("lend-card"), gs = m.lend || [], stat = (m.tiers || {}).now || {};
+  if (!gs.length) { card.hidden = true; return; }
+  card.hidden = false;
+  const phase = phaseOf(m), hist = (m.tiers || {}).history || {};
+  const perm = sumBy(gs, (g) => g.perm), lend = sumBy(gs, (g) => g.lend), mtp = sumBy(gs, (g) => g.mtp);
+  const arena = sumBy(gs, (g) => g.arena), arenaMib = sumBy(gs, (g) => (g.lend_mib || 0) + (g.mtp_mib || 0));
+  cardsInto($("lend-metrics"), [
+    {id: "lend-now", label: "Experts lent now", icon: "experts"},
+    {id: "lend-refill", label: "Last refill", icon: "refresh"},
+    {id: "lend-arena", label: "Prompt arena", icon: "memory"},
+    {id: "lend-perm", label: "Permanent experts", icon: "gpu"},
+  ]);
+  const lentNow = phase === 1 ? lend + mtp : 0;
+  setCard("lend-now", fmt(lentNow), "", phase === 1 ? `${fmt(lend)} trunk + ${fmt(mtp)} drafter, in the arenas`
+                                                    : "the prompt holds the arenas now");
+  if (num(stat.lend_n) != null) {
+    setCard("lend-refill", fmt(stat.lend_n), " experts",
+            `${fmt(stat.lend_gb, 2)} GB in ${fmt(stat.lend_ms)} ms` + (phase === 1 ? "" : " · before this prompt"));
+  } else {
+    setCard("lend-refill", null, "", "no refill yet - the first answer fills the arenas");
+  }
+  const arenaGb = arena / 1024;
+  setCard("lend-arena", fmt(arenaGb, 2), " GB", `${fmt(arenaMib)} MiB of it is expert slots between prompts`);
+  setCard("lend-perm", fmt(perm), " experts", "held on the cards for good (outside the arena)");
+  spark("lend-refill-p", (hist.lend_n || []).map((x) => x || 0), Math.max(1, stat.lend_n || 0));
+  spark("lend-now-p", (hist.phase || []).map((x) => (x ? 1 : 0)), 1);
+  $("lend-sub").textContent = `${gs.length} GPU${gs.length > 1 ? "s" : ""} · ${fmt(lend + mtp)} slots the arenas add while decoding`;
+  $("lend-rows").innerHTML = gs.map((g) => {
+    const read = gpuOf(m, g), name = gpuNameCls(read);
+    const ex = (g.lend_mib || 0) + (g.mtp_mib || 0);
+    const segs = [{k: "weights", v: (g.weights || 0) + (g.caches || 0), label: "weights"},
+                  {k: "pool", v: g.perm_mib || 0, label: "permanent experts"},
+                  phase === 1
+                    ? {k: "lend", v: g.lend_mib || 0, label: "lent"}
+                    : {k: "prompt", v: g.arena || 0, label: "prompt buffers"},
+                  phase === 1 ? {k: "mtp", v: g.mtp_mib || 0, label: "drafter"} : null,
+                  phase === 1 ? {k: "spare", v: Math.max(0, (g.arena || 0) - ex), label: "arena spare"} : null,
+                  {k: "free", v: g.free || 0, label: "free"}].filter(Boolean);
+    return `<div class="lend-row">
+      <div class="lend-row__name"><b>GPU ${esc(g.dev)}</b><span>${esc(name || "")}</span></div>
+      ${mibBar(segs, g.total)}
+      <div class="lend-row__nums"><b>${fmt(g.perm)} + ${fmt((g.lend || 0) + (g.mtp || 0))}</b>
+        <span>perm + lent · arena ${fmt((g.arena || 0) / 1024, 2)} GB</span></div>
+    </div>`;
+  }).join("");
+}
+
+// Prefill: the engine's chunk per card, its path and the rate it read at
+function renderPrefillPanel(m) {
+  const card = $("prefill-card"), gs = m.lend || [], eng = m.engine || {}, stat = (m.tiers || {}).now || {};
+  const live = m.live || {}, hist = (m.history || {}), last = (m.requests || [])[0];
+  const chunks = gs.filter((g) => (g.chunk || 0) > 0);
+  if (!chunks.length && !(num(+eng.prefill_chunk) > 0)) { card.hidden = true; return; }
+  card.hidden = false;
+  const rate = live.state !== "idle" ? live.prefill_tok_s_mean
+             : last ? (last.prefill_tok_s != null ? last.prefill_tok_s
+                : last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null)
+             : null;
+  const steps = String(eng.prefill_steps || "").split(",").filter((x) => +x > 0).map((x) => fmt(+x));
+  cardsInto($("prefill-metrics"), [
+    {id: "pf-rate", label: "Read rate", icon: "bolt"},
+    {id: "pf-chunk", label: "Chunk", icon: "layers"},
+    {id: "pf-path", label: "Path", icon: "activity"},
+    {id: "pf-prompt", label: "Last prompt", icon: "chat"},
+  ]);
+  setCard("pf-rate", rate == null ? null : fmt(rate), " tok/s",
+          live.state === "reading" ? "reading now" : last ? "last request" : "waiting for a prompt");
+  setCard("pf-chunk", eng.prefill_chunk ? fmt(eng.prefill_chunk) : (chunks[0] ? fmt(chunks[0].chunk) : null), " tokens",
+          steps.length > 1 ? `steps ${steps.join(" → ")}` : "a chunk a pass");
+  const path = typeof stat.path === "string" ? stat.path : null;
+  setCard("pf-path", path || null, "", path === "flow" ? "the flow: each expert read once a layer, at once"
+                                   : path === "windows" ? "windows of 16 tokens" : "the engine picks it a prompt");
+  setCard("pf-prompt", last ? fmt(last.prompt_tokens) : (live.prompt_tokens != null ? fmt(live.prompt_tokens) : null),
+          " tokens", last ? `${fmt(last.reused)} reused from the conversation` : "");
+  spark("pf-rate-p", (hist.prefill_tok_s_mean || []).map((x) => x || 0));
+  $("prefill-sub").textContent = `${chunks.length || gs.length} GPU${(chunks.length || gs.length) > 1 ? "s" : ""} reading in parallel`;
+  $("prefill-chunks").innerHTML = chunks.length ? `<table class="st-table">
+      <thead><tr><th>GPU</th><th>Card</th><th>Layers</th><th class="num">Chunk</th></tr></thead><tbody>` +
+    chunks.map((g) => `<tr><td>GPU ${esc(g.dev)}</td><td>${esc(gpuNameCls(gpuOf(m, g)) || "–")}</td>
+      <td>${g.layers && g.layers[1] >= g.layers[0] ? `${g.layers[0]}–${g.layers[1]}` : "–"}</td>
+      <td class="num">${fmt(g.chunk)} tokens</td></tr>`).join("") + `</tbody></table>` : "";
+  $("prefill-note").textContent = chunks.length
+    ? "A prompt is read a chunk at a time, each card's buffers sized by --prefill-chunk-max (the engine's steps above). " +
+      "Longer chunks read each expert once a prompt instead of twice, but take VRAM the expert banks would otherwise hold."
+    : "";
+}
+
+// Storage: the SSD reads a token costs, the drive the model lives on
+function renderStoragePanel(m) {
+  const card = $("storage-card"), eng = m.engine || {}, st = m.storage || {}, hw = m.hardware || {};
+  const stat = (m.tiers || {}).now || {}, hist = (m.tiers || {}).history || {};
+  if (!m.storage && num(stat.disk_mb) == null && num(hw.disk_read_mb) == null) { card.hidden = true; return; }
+  card.hidden = false;
+  cardsInto($("storage-metrics"), [
+    {id: "st-token", label: "Read from the SSD", icon: "disk"},
+    {id: "st-free", label: "The model's drive", icon: "memory"},
+    {id: "st-io", label: "Disk activity", icon: "activity"},
+    {id: "st-only", label: "Experts off the cards", icon: "experts"},
+  ]);
+  setCard("st-token", num(stat.disk_mb) == null ? null : fmt(stat.disk_mb, 2), " MB/tok",
+          num(stat.disk_mb) == null ? "not measured on this system" : "while the last answer was written");
+  if (st && st.total) {
+    setCard("st-free", gb(st.free), ` / ${gb(st.total, 0)} GB`, st.path || "");
+  } else setCard("st-free", null, "", "");
+  setCard("st-io", num(hw.disk_read_mb) == null ? null : fmt(hw.disk_read_mb, 1), " MB/s",
+          num(hw.disk_write_mb) == null ? "" : `write ${fmt(hw.disk_write_mb, 1)} MB/s`);
+  const cpu = +eng.cpu_experts || 0, ram = +eng.ram_experts || 0;
+  setCard("st-only", cpu ? fmt(Math.max(0, cpu - ram)) : null, " experts",
+          cpu ? `${fmt(ram)} of the CPU lane's ${fmt(cpu)} are cached in RAM` : "");
+  spark("st-token-p", (hist.disk_mb || []).map((x) => x || 0));
+  spark("st-io-p", (hw.disk_read_mb != null ? [hw.disk_read_mb] : []));
+  $("storage-sub").textContent = st && st.path ? st.path : "";
+  $("storage-note").textContent = num(stat.disk_mb) != null
+    ? "The engine reads the experts it does not hold from the model's files: the page cache covers some in RAM, the rest " +
+      "comes from the SSD. That read, not the GPU, is what a slow token waits for."
+    : "";
+}
+
+// Engram: the n-gram memory's layers, lookups and read time
+function renderEngramPanel(m) {
+  const card = $("engram-card"), eng = m.engine || {}, stat = (m.tiers || {}).now || {};
+  const hist = (m.tiers || {}).history || {};
+  if (eng.engram_layers == null && num(stat.engram_ms) == null) { card.hidden = true; return; }
+  card.hidden = false;
+  cardsInto($("engram-metrics"), [
+    {id: "eg-layers", label: "Layers", icon: "layers"},
+    {id: "eg-lookups", label: "Lookups a token", icon: "search"},
+    {id: "eg-ms", label: "Read time", icon: "clock"},
+    {id: "eg-rows", label: "Rows a token", icon: "activity"},
+  ]);
+  setCard("eg-layers", eng.engram_layers == null ? null : fmt(eng.engram_layers), "",
+          eng.engram_ngram ? `${eng.engram_ngram}-grams, ${fmt(eng.engram_heads)} heads a layer` : "");
+  setCard("eg-lookups", eng.engram_lookups == null ? null : fmt(eng.engram_lookups), " a token",
+          eng.engram_cache_rows ? `${fmt(eng.engram_cache_rows)} rows cached` : "");
+  setCard("eg-ms", num(stat.engram_ms) == null ? null : fmt(stat.engram_ms, 2), " ms/tok",
+          num(stat.engram_ms) == null ? "no answer yet" : "the memory's reads a token");
+  if (num(stat.eg_rows) != null) {
+    const hit = num(stat.eg_hit) != null ? ` · ${fmt(100 * stat.eg_hit, 1)}% from its cache` : "";
+    setCard("eg-rows", fmt(stat.eg_rows, 1), " rows/tok",
+            `${stat.eg_cache != null ? `${fmt(stat.eg_cache)} rows held` : ""}${hit}`);
+  } else setCard("eg-rows", null, "", "no answer yet");
+  spark("eg-ms-p", (hist.engram_ms || []).map((x) => x || 0));
+  spark("eg-rows-p", (hist.eg_rows || []).map((x) => x || 0));
+  $("engram-sub").textContent = eng.engram_layers ? "the model's n-gram memory, read on the CPU lane" : "";
+  $("engram-note").textContent = "Engram is the model's n-gram memory: at fixed positions its layers read rows of learned " +
+    "n-grams instead of working the weights. The times above are those reads, spread over the answer's tokens.";
+}
+
+// Draft: DSpark's block, its acceptance and what it costs a token
+function renderDraftPanel(m) {
+  const card = $("draft-card"), eng = m.engine || {}, stat = (m.tiers || {}).now || {};
+  const hist = (m.tiers || {}).history || {};
+  if (eng.dspark_block == null && num(stat.drafts) == null) { card.hidden = true; return; }
+  card.hidden = false;
+  cardsInto($("draft-metrics"), [
+    {id: "dr-block", label: "Block", icon: "thinking"},
+    {id: "dr-acc", label: "Acceptance", icon: "check"},
+    {id: "dr-n", label: "Drafts a token", icon: "activity"},
+    {id: "dr-ms", label: "Time a token", icon: "clock"},
+  ]);
+  setCard("dr-block", eng.dspark_block == null ? null : fmt(eng.dspark_block), " tokens",
+          eng.dspark_blocks ? `${fmt(eng.dspark_blocks)} blocks · ${fmt(eng.dspark_targets)} trunk targets` : "");
+  setCard("dr-acc", num(stat.drafts) == null ? null : fmt(100 * stat.drafts, 1), " %",
+          num(stat.drafts) == null ? "no answer yet" : "of the drafts the full model kept");
+  setCard("dr-n", num(stat.draft_n) == null ? null : fmt(stat.draft_n, 2), " a token",
+          num(stat.draft_n) == null ? "" : "offered by the drafter");
+  setCard("dr-ms", num(stat.draft_ms) == null ? null : fmt(stat.draft_ms, 2), " ms/tok",
+          num(stat.verify_ms) == null ? "" : `drafting ${fmt(stat.draft_ms, 2)} · verifying ${fmt(stat.verify_ms, 2)} ms`);
+  spark("dr-acc-p", (hist.drafts || []).map((x) => (x || 0) * 100));
+  spark("dr-ms-p", (hist.draft_ms || []).map((x) => x || 0));
+  $("draft-sub").textContent = eng.dspark_blocks ? "the drafter proposes, the full model verifies" : "";
+  $("draft-note").textContent = "DSpark's block proposes the next tokens in one pass; the full model checks them and keeps " +
+    "the run that matches its own choices. Acceptance is how often a draft was kept; the time is the drafter's and the " +
+    "verification's share of a token.";
+}
+
+// the GPUs (/metrics gpu_map: the GLM engine's VRAM lines and NVML's processes): a row a GPU, its bar the whole card (its
+// size in GB beside it); with several, the parts' colours once above the rows with their GB over all of them, each row's
+// load, power, temperature and PCIe link under its bar, and a row opened (a click) shows its parts with a sentence each -
+// one GPU: its row, opened (the hardware cards have its readings)
+const GPU_PARTS = [
+  {key: "weights", label: "Model weights"}, {key: "kv", label: "KV cache"}, {key: "act", label: "Activations"},
+  {key: "drafter", label: "Drafter"}, {key: "pool", label: "Expert pool"}, {key: "vision", label: "Vision encoder"},
+  {key: "rest", label: "CUDA and the rest"}, {key: "other", label: "Other programs"},
+];
+const GIB = 1073741824;
+const GPU_PLAIN_FROM = 5;   // an engine without VRAM lines: the rows (NVML's memory and readings) from five GPUs
+const gpuKey = (g) => String(g.index != null ? g.index : `d${g.dev}`);
+const gpuLabel = (g) => `GPU ${g.index ?? g.dev}`;
+const gpuName = (g) => (g.name || "").replace(/^NVIDIA /, "").replace(/^GeForce /, "").replace(/^AMD /, "").replace(/^Radeon /, "");
+const gpuGb = (b) => `${gb(b, b < GIB ? 2 : 1)} GB`;
+const gpuList = (gs) => gs.length === 1 ? gpuLabel(gs[0])
+  : `GPUs ${gs.slice(0, -1).map((g) => g.index ?? g.dev).join(", ")} and ${gs[gs.length - 1].index ?? gs[gs.length - 1].dev}`;
+let gpuOpen = store.get("gpu-open", null);   // the row opened (several GPUs), remembered in this browser
+let gpuShown = {};                           // each row's parts by its GPU, for the tooltip
+
+function gpuSegs(g, eng) {
+  const p = g.parts || {}, draft = eng.dflash ? "DFlash2" : eng.mtp ? "MTP" : "";
+  return GPU_PARTS.filter((d) => (p[d.key] || 0) > 0 || d.key === "pool" || d.key === "kv")
+    .map((d) => ({key: d.key, bytes: p[d.key] || 0, label: d.key === "drafter" && draft ? `Drafter (${draft})` : d.label}))
+    .concat([{key: "free", label: "Free", bytes: g.free || 0}]);
+}
+
+// a GPU's NVML readings under its bar: load, power, temperature (warm from 80 °C, hot from 87) and PCIe link
+function gpuStats(r) {
+  if (!r) return "";
+  const gen = r.pcie_gen_max || r.pcie_gen, mb = r.pcie_rx_mb;
+  const heat = r.temp >= 87 ? " is-hot" : r.temp >= 80 ? " is-warm" : "";
+  const rate = mb == null ? "" : ` · ${mb >= 1000 ? `${fmt(mb / 1024, 1)} GB/s` : `${fmt(mb, mb < 10 ? 1 : 0)} MB/s`}`;
+  return [r.util != null ? `<span><b>${fmt(r.util)}%</b> load</span>` : "",
+          r.power != null ? `<span><b>${fmt(r.power)}</b>${r.power_limit ? ` / ${fmt(r.power_limit)}` : ""} W</span>` : "",
+          r.temp != null ? `<span class="${heat.trim()}"><b>${fmt(r.temp)}</b> °C</span>` : "",
+          gen ? `<span>PCIe <b>Gen${gen}</b>${r.pcie_width ? ` x${r.pcie_width}` : ""}${rate}</span>` : ""].join("");
+}
+
+// an opened row: each part with what it is
+function gpuDetail(g, segs, m) {
+  const eng = m.engine || {}, live = m.live || {}, last = (m.requests || [])[0];
+  const ctx = g.ctx || eng.max_context || 0;
+  const inUse = live.state !== "idle" ? (live.prompt_tokens || 0) + (live.generated || 0)
+              : last ? (last.prompt_tokens || 0) + (last.output_tokens || 0) : 0;
+  const sub = {
+    weights: "attention, shared experts and the other dense tensors",
+    kv: (eng.kv_resident ? `${ctxfmt(eng.kv_resident)} of ${ctxfmt(ctx)} positions here, the rest in RAM`
+                         : `${ctxfmt(ctx)} positions`) + (inUse ? ` · ${kfmt(inUse)} in use` : "") +
+        (g.kv_ram ? ` · ${gb(g.kv_ram)} GB pinned in RAM` : ""),
+    act: "one token's working buffers",
+    drafter: [g.drafter ? `weights ${gb(g.drafter, 2)} GB` : "", g.window ? `verify window ${gb(g.window, 2)} GB` : ""]
+      .filter(Boolean).join(" · "),
+    pool: [g.slots ? `${fmt(g.slots)} expert slots` : "", g.borrow ? `prompts borrow up to ${gb(g.borrow)} GB of it` : ""]
+      .filter(Boolean).join(" · "),
+    vision: g.vision_lent ? "the pool's tail, while it encodes" : "its own process",
+    rest: "the driver's reserve and context, conversation snapshots and small buffers",
+    other: "processes that are not the engine's",
+    free: (g.free || 0) < 1.5 * GIB ? "kept free for the driver and the sampler" : "unused",
+  };
+  return `<div class="gpulegend">` + segs.map((s) =>
+    `<div class="gpulegend__item" data-k="${s.key}"><i class="dot${s.key === "free" ? " dot--free" : ""}" ` +
+    `style="--gm-c:var(--gm-${s.key})"></i><span>${esc(s.label)}</span><b>${esc(gpuGb(s.bytes))}</b>` +
+    `<span class="gpulegend__sub">${esc(sub[s.key] || "")}</span></div>`).join("") + `</div>`;
+}
+
+// pointing at a part (in a bar or the key) picks it out in every bar; a bar's part says its size
+function gpuFocus(k) {
+  const box = $("gpurows");
+  if (k && k !== "free") box.dataset.focus = k;
+  else delete box.dataset.focus;
+}
+$("gpurows").addEventListener("pointermove", (e) => {
+  const seg = e.target.closest(".gpubar__seg"), tip = $("gpubar-tip");
+  const r = seg && gpuShown[seg.closest(".gpurow").dataset.gpu];
+  const s = r && r.segs.find((x) => x.key === seg.dataset.k);
+  gpuFocus(s && s.key);
+  if (!s) { tip.hidden = true; return; }
+  const card = $("gpumap-card").getBoundingClientRect(), bar = seg.parentElement.getBoundingClientRect();
+  tip.innerHTML = (Object.keys(gpuShown).length > 1 ? `${esc(gpuLabel(r.g))} · ` : "") +
+    `<b>${esc(s.label)}</b> · ${esc(gpuGb(s.bytes))} · ${esc(fmt((100 * s.bytes) / (r.g.total || 1), 1))}% of the card`;
+  tip.style.left = `${Math.min(Math.max(e.clientX - card.left, 130), card.width - 130)}px`;
+  tip.style.top = `${bar.top - card.top}px`;
+  tip.hidden = false;
+});
+$("gpurows").addEventListener("pointerleave", () => { gpuFocus(null); $("gpubar-tip").hidden = true; });
+$("gpurows").addEventListener("click", (e) => {
+  const line = e.target.closest("button.gpurow__line");
+  if (!line) return;
+  const k = line.parentElement.dataset.gpu;
+  gpuOpen = gpuOpen === k ? null : k;
+  store.set("gpu-open", gpuOpen);
+  if (lastMetrics) renderGpuMap(lastMetrics.gpu_map, lastMetrics);
+});
+$("gpukey").addEventListener("pointerover", (e) => { const it = e.target.closest(".gpukey__item"); gpuFocus(it && it.dataset.k); });
+$("gpukey").addEventListener("pointerleave", () => gpuFocus(null));
+
+// true when the rows carry each GPU's readings (the hardware cards then keep their totals)
+function renderGpuMap(map, m) {
+  const card = $("gpumap-card"), reads = (m.hardware || {}).gpus || [];
+  const plain = !map || !map.length;   // (no VRAM lines: NVML's memory in use, from five GPUs)
+  if (plain && reads.length >= GPU_PLAIN_FROM) {
+    const names = ((m.hardware_static || {}).gpu_name || "").split(" + ");
+    map = reads.map((r, i) => ({index: r.index, name: names.length === reads.length ? names[i] : "", total: r.mem_total || 0,
+                                free: Math.max(0, (r.mem_total || 0) - (r.mem_used || 0)), parts: {used: r.mem_used || 0}}));
+  }
+  if (!map || !map.length) { card.hidden = true; gpuShown = {}; return false; }
+  card.hidden = false;
+  const eng = m.engine || {}, live = m.live || {}, one = map.length === 1, fold = !one && !plain;   // (fold: rows open)
+  card.classList.toggle("is-one", one);
+  const byIndex = Object.fromEntries(reads.map((r) => [String(r.index), r]));
+  const rows = map.map((g) => ({g, key: gpuKey(g), read: one ? null : byIndex[String(g.index)],
+                                segs: plain ? [{key: "used", label: "In use", bytes: g.parts.used}, {key: "free", label: "Free", bytes: g.free}]
+                                            : gpuSegs(g, eng)}));
+  gpuShown = Object.fromEntries(rows.map((r) => [r.key, r]));
+  const open = plain ? null : one ? rows[0].key : gpuOpen;
+  const sum = (f) => map.reduce((a, g) => a + (f(g) || 0), 0);
+  const total = sum((g) => g.total), used = sum((g) => g.total - (g.free || 0));
+  $("gpumap-title").textContent = plain ? "GPUs" : one ? "What fills the GPU" : "What fills the GPUs";
+  $("gpumap-sub").textContent = [one ? "" : `${map.length} GPUs`, `${gb(used)} of ${gb(total, 0)} GB in use`,
+                                 map.some((g) => g.measured === "start") ? "as measured at the start" : ""].filter(Boolean).join(" · ");
+
+  // the key: each part's GB over all the GPUs (one GPU: its opened row says it; NVML's memory alone: nothing to tell apart)
+  const key = $("gpukey");
+  key.hidden = one || plain;
+  if (!key.hidden) {
+    const tot = {}, label = {};
+    for (const r of rows) for (const s of r.segs) { tot[s.key] = (tot[s.key] || 0) + s.bytes; label[s.key] = s.label; }
+    const html = GPU_PARTS.map((d) => d.key).concat(["free"]).filter((k) => tot[k] > 0).map((k) =>
+      `<span class="gpukey__item" data-k="${k}"><i class="dot${k === "free" ? " dot--free" : ""}" style="--gm-c:var(--gm-${k})">` +
+      `</i>${esc(label[k])} <b>${esc(gpuGb(tot[k]))}</b></span>`).join("");
+    if (key._html !== html) { key.innerHTML = html; key._html = html; }
+  }
+
+  // the rows: built when the GPUs or their parts change, else updated in place (a pointed-at part keeps its focus)
+  const box = $("gpurows");
+  const sig = rows.map((r) => `${r.key}:${r.segs.map((s) => s.key).join("+")}`).join(",") + (one ? "|one" : plain ? "|plain" : "");
+  if (box.dataset.sig !== sig) {
+    box.dataset.sig = sig;
+    box.innerHTML = rows.map((r) => {
+      const tag = fold ? "button" : "div", k = esc(r.key);
+      return `<div class="gpurow" data-gpu="${k}"><${tag} class="gpurow__line"` +
+        (fold ? ` type="button" aria-expanded="false" aria-controls="gpurow-d-${k}"` : "") + `>` +
+        `<span class="gpurow__name"><b></b><span></span></span><span class="gpurow__track"><span class="gpubar" role="img">` +
+        r.segs.map((s) => `<span class="gpubar__seg" data-k="${s.key}" style="--gm-c:var(--gm-${s.key})">` +
+                          (s.key === "pool" ? `<i class="gpubar__lent"></i>` : "") + `</span>`).join("") +
+        `</span>${one ? "" : `<span class="gpustat"></span>`}</span><span class="gpurow__used"><b></b><span></span>` +
+        `${fold ? icon("chevron", "st-icon st-icon--sm st-chev") : ""}</span></${tag}>` +
+        `<div class="gpurow__detail" id="gpurow-d-${k}" hidden></div></div>`;
+    }).join("");
+  }
+  const reading = live.state === "reading";
+  for (const [i, r] of rows.entries()) {
+    const g = r.g, p = g.parts || {}, el = box.children[i], isOpen = r.key === open;
+    el.classList.toggle("is-open", isOpen);
+    if (fold) el.firstElementChild.setAttribute("aria-expanded", String(isOpen));
+    el.querySelector(".gpurow__name b").textContent = gpuLabel(g);
+    el.querySelector(".gpurow__name span").textContent =
+      [gpuName(g), g.layers && g.layers[1] > g.layers[0] ? `layers ${g.layers[0]}–${g.layers[1] - 1}` : ""]
+        .filter(Boolean).join(" · ");
+    el.querySelector(".gpurow__used b").textContent = gb(Math.max(0, g.total - (g.free || 0)));
+    el.querySelector(".gpurow__used span").textContent = `/ ${gb(g.total, 0)} GB`;
+    const bar = el.querySelector(".gpubar");
+    for (const s of r.segs) bar.querySelector(`[data-k="${s.key}"]`).style.flexGrow = String(s.bytes / (g.total || 1));
+    const lent = bar.querySelector(".gpubar__lent");   // (a prompt borrows each pool's tail; the vision encoder's: prompts wait)
+    if (lent) lent.style.width = reading && !g.vision_lent && g.borrow > 0 && p.pool > 0
+      ? `${Math.min(100, (100 * g.borrow) / p.pool)}%` : "0";
+    bar.setAttribute("aria-label", `${gpuLabel(g)}: ` + r.segs.map((s) => `${s.label} ${gpuGb(s.bytes)}`).join(", "));
+    const stat = el.querySelector(".gpustat");
+    if (stat) {
+      const html = gpuStats(r.read);
+      if (stat._html !== html) { stat.innerHTML = html; stat._html = html; }
+    }
+    const d = el.lastElementChild;
+    d.hidden = !isOpen;
+    if (isOpen) {
+      const html = gpuDetail(g, r.segs, m);
+      if (d._html !== html) { d.innerHTML = html; d._html = html; }
+    }
+  }
+
+  // what is happening now: a prompt borrows the pools' tails, the vision encoder GPU 0's
+  const vis = map.find((g) => g.vision_lent);
+  const lentNow = reading ? sum((g) => !g.vision_lent && g.borrow > 0 && (g.parts || {}).pool > 0 ? Math.min(g.borrow, g.parts.pool) : 0) : 0;
+  const now = vis ? `The vision encoder has ${gb(vis.parts.vision || vis.lendable)} GB of ${one ? "the" : `${gpuLabel(vis)}'s`} expert pool while it encodes.`
+            : lentNow ? `Reading a prompt: the expert pool${one ? " lends" : "s lend"} it up to ${gb(lentNow)} GB (hatched).` : "";
+  $("gpumap-now").hidden = !now;
+  $("gpumap-now").textContent = now;
+
+  // advice: memory the expert pool could have at the next start
+  const complete = eng.expert_slots && eng.experts && eng.expert_slots >= eng.experts;   // (every expert in VRAM already)
+  const more = (g, b) => (g.slots && g.parts.pool ? Math.max(0, Math.floor(b / (g.parts.pool / g.slots))) : 0);
+  const where = (gs) => (one ? "this GPU" : gpuList(gs));
+  const pools = (gs) => (one ? "the expert pool" : gs.length > 1 ? "their expert pools" : "its expert pool");
+  const others = complete ? [] : map.filter((g) => (g.parts.other || 0) >= 0.5 * GIB);
+  const frees = complete ? [] : map.filter((g) => !g.vision_lent && (g.free || 0) >= 2 * GIB);
+  let tip = "";
+  if (others.length) {
+    const b = others.reduce((a, g) => a + g.parts.other, 0), n = others.reduce((a, g) => a + more(g, g.parts.other), 0);
+    tip = `Other programs hold ${gb(b)} GB on ${where(others)}: with them closed, a restart gives ${pools(others)} about ` +
+          `${fmt(n)} more experts.`;
+  } else if (frees.length) {
+    const b = frees.reduce((a, g) => a + g.free, 0), n = frees.reduce((a, g) => a + more(g, g.free - GIB), 0);
+    tip = `${gb(b)} GB of ${where(frees)} are free: a restart gives ${pools(frees)} about ${fmt(n)} more experts.`;
+  }
+  $("gpumap-advice").hidden = !tip;
+  $("gpumap-advice").textContent = tip;
+  return rows.some((r) => r.read);
+}
+
+// a sparkline; false when there is nothing to draw (no data, or only zeros: idle)
 function spark(id, values, max) {
   const svg = $(id);
   const v = (values || []).map((x) => (x == null ? 0 : x));
-  if (v.length < 2) { svg.querySelector(".line").setAttribute("d", ""); svg.querySelector(".area").setAttribute("d", ""); return; }
-  const top = Math.max(max || 0, ...v, 1);
+  const line = svg.querySelector(".line"), area = svg.querySelector(".area");
+  if (v.length < 2 || v.every((x) => x === 0)) { line.setAttribute("d", ""); area.setAttribute("d", ""); return false; }
+  const top = Math.max(max || 0, ...v, 1e-9);
   const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 30 - (x / top) * 26]);
-  const line = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
-  svg.querySelector(".line").setAttribute("d", line);
-  svg.querySelector(".area").setAttribute("d", `${line}L100,32L0,32Z`);
+  const d = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(2)},${p[1].toFixed(2)}`).join("");
+  line.setAttribute("d", d);
+  area.setAttribute("d", `${d}L100,32L0,32Z`);
+  return true;
 }
 function setMetric(key, value, unit, sub) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
@@ -164,7 +899,9 @@ async function poll() {
     } else if (r.ok) {
       lastMetrics = await r.json();
       metricsFailures = 0;
-      render(lastMetrics);
+      if (!document.hidden) render(lastMetrics);
+      const rl = lastMetrics.reload;
+      if (rl && (rl.state === "waiting" || rl.state === "running")) watchReload();
     } else {
       throw new Error(`HTTP ${r.status}`);
     }
@@ -172,8 +909,9 @@ async function poll() {
     if (++metricsFailures === 3) setPill("error", "Server not reachable");
   }
   if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
-  setTimeout(poll, 1000);
+  setTimeout(poll, document.hidden ? 5000 : 1000);                // a hidden tab looks five times less often
 }
+document.addEventListener("visibilitychange", () => { if (!document.hidden && lastMetrics) render(lastMetrics); });
 
 function setPill(state, text) {
   $("pill").dataset.state = state === "error" ? "queued" : state;
@@ -184,51 +922,81 @@ function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || [])[0];
   // the header pill
-  if (live.state === "reading") {
+  if (reloadWatch) {
+    setPill("reading", "Reloading");
+  } else if (live.state === "reading") {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
-    setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
+    setPill("reading", pct != null ? `Reading · ${pct}%` : "Reading");
   } else if (live.state === "generating") {
-    setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
+    const many = live.active > 1 ? ` · ${live.active} at once` : "";   // (--parallel: answers written together)
+    setPill("generating", (live.tok_s ? `${fmt(live.tok_s, 1)} tok/s` : "Writing") + many);
   } else {
     setPill("idle", "Idle");
   }
-  if (live.queued > 0) setPill("queued", `${live.queued} queued`);
-  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
-  if (tab === "monitor") renderConvCache(m.conversation_cache);
-  if (tab === "about") renderAbout(eng, hw, st);
+  if (live.queued > 0 && !reloadWatch) setPill("queued", `${live.queued} queued`);
+  liveCtx();                                     // the context meter follows the answer being written
+  if (tab === "monitor") {
+    renderBanners(m);
+    renderMonitorTabs(m);
+    const gpuEach = renderGpuMap(m.gpu_map, m);
+    renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, gpuEach);
+    renderTiers(m.tiers, eng);
+    renderHero(live, h, last, eng, m.tiers, m.totals);
+  }
+  if (tab === "about") renderAbout(eng, hw, st, m.storage);
 }
 
-// #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
-// conversations it parks in RAM when "--conversation-cache-mib N" is in the run config's args (opt-in)
-function since(t) {
-  if (!t) return "";
-  const s = Math.max(0, Date.now() / 1000 - t);
-  return s < 60 ? "just now" : s < 3600 ? `${fmt(s / 60)} min ago` : `${fmt(s / 3600, 1)} h ago`;
-}
-function renderConvCache(c) {
-  $("cc-card").hidden = !c;
-  if (!c) return;                                  // an older server
-  const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
-  $("cc-bars").hidden = !c.enabled;
-  if (c.enabled) {
-    $("cc-slots-text").textContent = `${fmt(c.parked)} / ${fmt(c.slots)}`;
-    $("cc-slots-bar").style.width = pct(c.parked, c.slots);
-    const budget = c.budget_mib * 1048576;
-    $("cc-mem-text").textContent = `${gb(c.bytes)} / ${gb(budget)} GB`;
-    $("cc-mem-bar").style.width = pct(c.bytes, budget);
+// problems worth a line at the top of the Monitor
+function renderBanners(m) {
+  const out = [];
+  const rl = m.reload;
+  if (rl && (rl.state === "waiting" || rl.state === "running")) {
+    out.push(["info", `Reloading the model with a ${ctxfmt(rl.to)} context${rl.state === "waiting" ? ", after the answer being written" : ""}. Requests wait until it is back.`]);
+  } else if (rl && rl.state === "failed" && rl.ended && Date.now() / 1000 - rl.ended < 600) {
+    out.push(["error", `The context change did not work: ${rl.error || "the engine did not start"}. It runs with ${ctxfmt(rl.context)} again.`]);
   }
-  $("cc-sum").textContent = c.requests ? `${fmt(c.requests_reused)} of ${fmt(c.requests)} requests reused part of their prompt` : "";
-  const share = c.prompt_tokens ? ` (${fmt((100 * c.reused_tokens) / c.prompt_tokens)}% of all prompt tokens)` : "";
-  const event = c.last_event ? `${c.last_event === "parked" ? "Parked" : "Restored"} ${fmt(c.last_tokens)} tokens, ${since(c.last_at)}` : null;
-  facts($("cc-facts"), [
-    ["Last request", c.last_prompt != null ? `${fmt(c.last_reused || 0)} of ${fmt(c.last_prompt)} prompt tokens reused` : null],
-    ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
-    ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
-    ["Last switch", c.enabled ? event : null],
-  ]);
-  $("cc-note").textContent = c.enabled
-    ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
-    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+  const eng = m.engine || {};
+  if (eng.gpu_commit_capped_gb > 0) {   // (DeepSeek on a Windows APU: the page file kept experts off the GPU)
+    out.push(["warn", `${fmt(eng.gpu_commit_capped_gb)} GB of experts stay off the GPU: Windows' page file is too small to hold them there. A page file of ${fmt(eng.pagefile_hint_gb)} GB keeps them on the GPU (System > About > Advanced system settings > Performance > Advanced > Virtual memory), then restart Strata-DeepSeek.`]);
+  }
+  const gpus = (m.hardware || {}).gpus || [{index: null, temp: (m.hardware || {}).gpu_temp}];
+  for (const g of gpus) {
+    if (g.temp != null && g.temp >= 87) out.push(["warn", `${g.index == null ? "The GPU" : `GPU ${g.index}`} is at ${fmt(g.temp)} °C: it may slow itself down to cool off.`]);
+  }
+  $("banners").innerHTML = out.map(([k, t]) => `<div class="banner banner--${k}" role="${k === "error" ? "alert" : "status"}">${icon(k === "info" ? "info" : k === "error" ? "error" : "warning", "st-icon st-icon--sm")}<span>${esc(t)}</span></div>`).join("");
+}
+
+// the Monitor's hero: the speed (now, else the last request), its sparkline and four headline numbers
+function renderHero(live, h, last, eng, tiers, totals) {
+  const gen = live.state === "generating";
+  const speed = gen ? live.tok_s : last ? last.decode_tok_s : null;
+  $("hero-speed").textContent = speed == null ? "–" : fmt(speed, 1);
+  $("hero-speed-sub").textContent = "decode · " + (gen ? "writing now" : live.state === "reading" ? "reading the prompt"
+                                    : last ? "last request" : "waiting for a request");
+  // prefill: the engine's rate over the tokens it read (not the reused prefix), live while a request runs
+  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
+                : last ? (last.prefill_tok_s != null ? last.prefill_tok_s
+                          : last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null)
+                : null;
+  $("hero-prefill").textContent = prefill == null ? "–" : fmt(prefill);
+  $("hero-prefill-sub").textContent = "prefill · " + (live.state === "reading" ? "reading now" : gen ? "this request"
+                                      : last ? "last request" : "waiting");
+  const a = spark("hero-spark", h.tok_s);
+  const b = spark("hero-spark-prefill", h.prefill_tok_s_mean);
+  $("hero-spark-wrap").classList.toggle("is-empty", !a && !b);
+  const tn = tiers && tiers.now;
+  const fresh = tn && tn.time && Date.now() / 1000 - tn.time <= 30;
+  const ms = gen && tn && tn.ms_tok ? tn.ms_tok : speed ? 1000 / speed : null;
+  $("hero-ms").innerHTML = ms == null ? "–" : `${fmt(ms, 1)}<small>ms</small>`;
+  $("hero-hit").innerHTML = fresh && tn.vram_hit != null ? `${fmt(100 * tn.vram_hit, 1)}<small>%</small>`
+                          : last && last.hit_rate != null ? `${fmt(100 * last.hit_rate, 1)}<small>%</small>` : "–";
+  const ctx = eng.max_context || 0;
+  let used = 0;
+  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
+  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
+  $("hero-ctx-k").textContent = live.state !== "idle" ? "Context of this request" : "Context of the last request";
+  $("hero-ctx").innerHTML = ctx ? `${kfmt(used)}<small>/ ${ctxfmt(ctx)}</small>` : "–";
+  $("hero-req").textContent = totals && totals.requests != null ? fmt(totals.requests) : "–";
 }
 
 function renderTotals(t) {
@@ -240,64 +1008,73 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+const API_NAMES = {web: "Chat", openai: "OpenAI", anthropic: "Anthropic"};
+function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, gpuEach) {
   // model state
-  const on = live.queued > 0 ? "queued" : live.state;
-  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
-  const prog = $("state-progress");
-  let label = "Waiting for a request", detail = "", pct = 0;
-  if (live.state === "reading") {
-    label = "Reading prompt";
+  const prog = $("state-progress"), badge = $("state-badge");
+  const took = (s) => (s == null ? "" : s < 90 ? ` · ${fmt(s)} s` : ` · ${fmt(Math.floor(s / 60))} min ${fmt(s % 60)} s`);
+  let label = "Idle", state = "idle", detail = "waiting for a request", pct = 0;
+  if (reloadWatch) {
+    label = "Reloading";
+    state = "reading";
+    prog.dataset.tone = "info";
+    detail = `a ${ctxfmt(reloadWatch.to)} context`;
+  } else if (live.state === "reading") {
+    label = "Reading";
+    state = "reading";
     prog.dataset.tone = "info";
     if (live.prompt_total) {
       pct = (100 * live.prompt_read) / live.prompt_total;
-      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
+      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} prompt tokens`;
     } else {
-      detail = `${fmt(live.prompt_tokens)} tokens`;
+      detail = `${fmt(live.prompt_tokens)} prompt tokens`;
     }
   } else if (live.state === "generating") {
-    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
+    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Writing";
+    state = "generating";
     delete prog.dataset.tone;
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+    detail = `${fmt(live.generated)} tokens${took(live.elapsed_s)}`;
   } else if (last) {
     delete prog.dataset.tone;
-    detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
+    detail = `last answer: ${fmt(last.output_tokens)} tokens${took(last.duration_s)}`;
   }
-  $("state-label").textContent = label;
+  if (live.active > 1) label = `${label} · ${live.active} answers at once`;
+  if (live.queued > 0) label = `${label} · ${live.queued} queued`;
+  badge.textContent = label;
+  badge.dataset.s = state;
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
 
-  // the eight cards
-  const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
-  setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-            live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
-  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
-                : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
-  setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
-            live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
-  spark("sp-speed", h.tok_s);
-  spark("sp-prefill", h.prefill_tok_s_mean);
-  // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
-  const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
-  const multi = (hw.gpus || []).length > 1;
+  // the hardware cards: the total (or the mean / the hottest) and its history; with several GPUs the line under it has
+  // every GPU's own value - unless the GPU card's rows have them (gpuEach), each figure shown once
+  const gpus = hw.gpus || [];
+  const multi = gpus.length > 1, each = multi && !gpuEach;
+  const per = (f) => gpus.map((g) => `GPU ${g.index} ${f(g)}`.replace(/ /g, " ")).join(" · ");   // wraps between GPUs only
+  const rate = (mb) => (mb == null ? "–" : mb >= 1000 ? `${fmt(mb / 1024, 1)} GB/s` : `${fmt(mb, mb < 10 ? 1 : 0)} MB/s`);
   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
-            multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || (st.gpu_note ? "not available" : ""));
+            each ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : multi ? `mean of ${gpus.length} cards` : st.gpu_name || "");
   spark("sp-gpu", h.gpu_util, 100);
   setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
-            multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
-                  : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : (st.gpu_note ? "not available on Windows AMD yet" : ""));
+            each ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
+                 : (multi ? `${gpus.length} cards · ` : "") + (eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : ""));
   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
-            multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
+            each ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : multi ? `hottest of ${gpus.length} cards` : "");
   spark("sp-temp", h.gpu_temp, 90);
-  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
+  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W",
+            each ? per((g) => (g.power == null ? "–" : `${fmt(g.power)}${g.power_limit ? `/${fmt(g.power_limit)}` : ""} W`))
+                 : hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit${multi ? ` (all ${gpus.length} cards)` : ""}` : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
+  const link = (g) => `Gen${g.pcie_gen_max || g.pcie_gen || "?"}${g.pcie_width ? ` x${g.pcie_width}` : ""}`;
+  const sameLink = gpus.every((g) => link(g) === link(gpus[0]));
   setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
-            hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
-            (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
+            each ? per((g) => `${sameLink ? "" : `${link(g)} `}${rate(g.pcie_rx_mb)}`)
+                 : hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${rate(hw.gpu_pcie_rx_mb)}` +
+                   (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : ""));
   spark("sp-pcie", h.gpu_pcie_rx_mb);
+  for (const k of ["gpu", "vram", "temp", "power", "pcie"]) $(`ms-${k}`).classList.toggle("is-each", each);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
   if (hw.disk_read_mb == null) {
@@ -308,46 +1085,26 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
               hw.disk_write_mb == null ? "" : `write ${fmt(hw.disk_write_mb, 1)} MB/s`);
   }
   spark("sp-disk", h.disk_read_mb);
-
-  // context fill: the running request, else the last one
-  const ctx = eng.max_context || 0;
-  let used = 0;
-  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-  const frac = ctx ? Math.min(1, used / ctx) : 0;
-  $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
-  $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
-  $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
-  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
-  const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
-  $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
-  $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
-  $("ram-text").textContent = hw.ram_total ? `${gb(hw.ram_used)} / ${gb(hw.ram_total, 0)} GB` : "–";
-  const ramPct = hw.ram_total ? (100 * hw.ram_used) / hw.ram_total : 0;
-  $("ram-bar").style.width = `${ramPct}%`;
-  if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
-  $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
-  $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
+  setMetric("ram", hw.ram_used == null ? null : gb(hw.ram_used), hw.ram_total ? `/ ${gb(hw.ram_total, 0)} GB` : "GB",
+            eng.ram_gb ? `${fmt(+eng.ram_gb, 1)} GB pinned for experts` : "");
+  spark("sp-ram", h.ram_used, hw.ram_total);
 
   // recent requests
   const body = $("req-body");
   if (!requests.length) {
     body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
   } else {
-    const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
-                   disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
+    const badges = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
+                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
     body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
-      const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
+      const [cls, text] = badges[r.finish] || ["", r.finish || "–"];
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
-      const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
-      // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
-      const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
-        (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
-      // Reused tokens are not prefetched again. Match the Monitor's existing Prefill metric.
-      const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
-      const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
-      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
-        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
+      const api = r.api ? ` <span class="chip chip--xs">${esc(API_NAMES[r.api] || r.api)}</span>` : "";
+      const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%`;
+      const pre = r.prefill_tok_s != null ? r.prefill_tok_s
+                : r.prompt_ms > 0 && r.prompt_tokens > (r.reused || 0) ? (r.prompt_tokens - (r.reused || 0)) / (r.prompt_ms / 1000) : null;
+      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${api}</td><td class="num">${fmt(r.prompt_tokens)}</td>
+        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(pre)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
         <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
   }
@@ -358,36 +1115,72 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("req-wrap").classList.toggle("all", reqShowAll);
   $("req-totals").textContent = renderTotals(totals);
 }
+$("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (lastMetrics) render(lastMetrics); });
+
+// the troubleshooting report: what a GitHub issue needs (GET /api/report)
+async function fetchReport() {
+  const r = await fetch("api/report", {headers: headers()});
+  if (!r.ok) throw new Error(r.status === 401 ? "this server needs its API key (About > Settings)" : `HTTP ${r.status}`);
+  return r.text();
+}
+$("report-copy").onclick = async () => {
+  try { await copyText(await fetchReport(), null, true); toast("success", "Report copied", "Paste it into a GitHub issue - read it first."); }
+  catch (e) { toast("error", "No report", e.message, 5000); }
+};
+$("report-show").onclick = async () => {
+  const pre = $("report-pre");
+  if (!pre.hidden) { pre.hidden = true; $("report-show").textContent = "Show engine log"; return; }
+  try { pre.textContent = await fetchReport(); pre.hidden = false; $("report-show").textContent = "Hide"; }
+  catch (e) { toast("error", "No report", e.message, 5000); }
+};
 
 function facts(el, rows) {
   el.innerHTML = rows.filter((r) => r[1] != null && r[1] !== "").map(([k, v, copy]) =>
     `<dt>${esc(k)}</dt><dd>${copy ? `<code>${esc(v)}</code><button class="st-btn st-btn--icon" data-copy="${esc(v)}" aria-label="Copy">${icon("copy")}</button>` : esc(v)}</dd>`).join("");
 }
-// INFO cvec=project:4-44[:singleL] | add:A-B | 0
-function projectionText(c) {
-  if (!c || c === "0" || c === 0) return null;
-  const [mode, range, single] = String(c).split(":");
-  const [a, b] = (range || "").split("-");
-  return `${mode === "project" ? "Projection" : "Additive"} control vector on layers ${a}–${b}` +
-         `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}. Per chat in Sampling. Its package ` +
-         "describes the vector as a refusal-direction projection; measure the speed yourself";
+// "Tesla V100 + Tesla V100" (the server's list) -> "2 × Tesla V100"; mixed cards stay listed
+function gpuNames(name, count) {
+  const parts = String(name).split(" + ");
+  if (parts.length > 1) return parts.every((p) => p === parts[0]) ? `${parts.length} × ${parts[0]}` : parts.join(" + ");
+  return count > 1 ? `${count} × ${name}` : name;
 }
-function renderAbout(eng, hw, st) {
-  const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
+let snippetsKey = "";
+function renderAbout(eng, hw, st, storage) {
+  const ver = eng.maya_version || health.version;
+  const kvPerTok = eng.kv_gb && eng.kv_ctx ? (eng.kv_gb * 1073741824) / eng.kv_ctx : null;
+  let kv;
+  if (eng.engine_kind === "glm-fast") {
+    const k = eng.kv === "int8" ? "8-bit (INT8)" : "16-bit";
+    kv = eng.kv_resident   // KV streaming (--kv-resident): the cache's VRAM is its window, not a cost per token
+      ? `${k} attention cache, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM`
+      : `${k} attention cache, in VRAM${kvPerTok ? ` (about ${fmt(kvPerTok / 1024)} KB a token, ${fmt(eng.kv_gb, 1)} GB at this size)` : ""}`;
+  } else {
+    const k = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit", bf16: "16-bit", f32: "32-bit",
+               fp4: "4-bit FP4 as DeepSeek stores it (the recent-token window FP8)"}[eng.kv] || eng.kv;
+    kv = k ? `${k}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null;
+  }
   facts($("facts-engine"), [
+    ["Version", ver ? `Strata-DeepSeek v${ver}${eng.version ? ` · engine ${eng.version}` : ""}` : null],
     ["Model", eng.model],
-    ["Engine", eng.version ? `v${eng.version}` : "built from source"],
-    ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
-    ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
-    ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
-    ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
+    ["Engine", eng.engine_kind ? ({"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (strata-ds4)"}[eng.engine_kind] || eng.engine_kind) : null],
+    ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens (Settings changes it)` : null],
+    ["Trained for", eng.trained_context ? `up to ${fmt(eng.trained_context)} tokens` : null],
+    ["KV cache", kv],
+    ["Experts", eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
+                 `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}, the rest read from the SSD` : null],
+    ["Speculation", eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
+                  : "off (one GPU, or no draft block in this model file)"],
     ["Images", eng.images ? "on" : "off"],
-    ["Experimental speed projection", projectionText(eng.cvec)],
   ]);
+  const gpus = hw.gpus || [];
+  const pcie = gpus.length > 1 ? gpus.map((g) => `GPU ${g.index}: Gen${g.pcie_gen_max || g.pcie_gen || "?"}${g.pcie_width ? ` x${g.pcie_width}` : ""}`).join(" · ")
+             : (hw.gpu_pcie_gen_max || hw.gpu_pcie_gen) ? `Gen${hw.gpu_pcie_gen_max || hw.gpu_pcie_gen}${hw.gpu_pcie_width ? ` x${hw.gpu_pcie_width}` : ""}` : null;
   facts($("facts-hw"), [
-    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : (st.gpu_note || "not readable (NVML)")],
+    ["GPU", st.gpu_name ? `${gpuNames(st.gpu_name, gpus.length)}${hw.gpu_mem_total ? ` · ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : "not readable (NVML)"],
+    ["PCIe", pcie],
     ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
+    ["Model folder", storage ? `${storage.path} · ${gb(storage.free, 0)} GB free of ${gb(storage.total, 0)} GB` : null],
   ]);
   const base = location.origin;
   facts($("facts-api"), [
@@ -395,12 +1188,156 @@ function renderAbout(eng, hw, st) {
     ["Anthropic base URL", base, true],
     ["Model name", eng.model, true],
   ]);
+  const key = !!health.api_key;
+  const k = `${base}|${eng.model}|${key}`;
+  if (k !== snippetsKey) {                         // rebuilt only when it changes (keeps a selection or a copy click)
+    snippetsKey = k;
+    const auth = key ? "<your API key>" : "strata-deepseek";
+    $("snippets").innerHTML =
+      `<div class="snippet"><div class="snippet__title">Claude Code</div>${codeBlock("bash",
+        `ANTHROPIC_BASE_URL=${base} ANTHROPIC_AUTH_TOKEN=${auth} claude`)}</div>` +
+      `<div class="snippet"><div class="snippet__title">OpenAI-compatible apps and SDKs</div>${codeBlock("bash",
+        `OPENAI_BASE_URL=${base}/v1\nOPENAI_API_KEY=${key ? "<your API key>" : "any-text"}\nmodel: ${eng.model}`)}</div>` +
+      `<div class="snippet"><div class="snippet__title">A first request (curl)</div>${codeBlock("bash",
+        `curl ${base}/v1/chat/completions -H "Content-Type: application/json" ${key ? '-H "Authorization: Bearer <your API key>" ' : ""}\\\n  -d '{"model": "${eng.model}", "messages": [{"role": "user", "content": "Hello!"}]}'`)}</div>`;
+  }
 }
 document.addEventListener("click", (e) => {
   const b = e.target.closest("[data-copy]");
   if (b) copyText(b.dataset.copy, b);
 });
-$("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (lastMetrics) render(lastMetrics); });
+// ------------------------------------------------------------------ About > Updates
+// the server asks GitHub for the latest release (at most every six hours) and says whether this folder can update
+// itself (a git checkout without local changes, started by maya.sh / START-MAYA.bat); else the steps by hand
+let update = null, updateWatch = null;
+async function loadUpdate(force = false) {
+  try {
+    const r = await fetch(force ? "api/update?force=1" : "api/update", {headers: headers()});
+    update = r.ok ? await r.json() : null;
+  } catch (e) { update = null; }
+  renderUpdate();
+  return update;
+}
+function renderUpdate() {
+  const el = $("update-card"), u = update;
+  $("about-dot").hidden = !(u && u.newer) || !!updateWatch;
+  if (!updateWatch && (!u || !u.enabled)) { el.hidden = true; return; }
+  const latest = (u && u.latest) || {};
+  const notes = latest.url ? `<a class="st-btn st-btn--secondary" href="${esc(latest.url)}" target="_blank" rel="noopener">What's new</a>` : "";
+  const again = (label) => `<button class="st-btn st-btn--secondary" type="button" data-update="check">${icon("refresh")}${label}</button>`;
+  const when = u && u.checked ? new Date(u.checked * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}) : "";
+  const state = u && u.state;
+  let tone = "", ic = "info", title, text = "", how = "", acts = "";
+  if (updateWatch || (state && state.state === "updating")) {
+    const to = updateWatch ? updateWatch.to : state.to;
+    tone = "accent"; ic = "download";
+    title = `Updating to v${to}…`;
+    text = updateWatch && updateWatch.down
+      ? "Strata-DeepSeek is starting again: it compiles what changed in the engine and loads the model (a few minutes; the terminal shows the progress). This page reloads when it is back."
+      : "Strata-DeepSeek finishes the answer it is writing, then downloads the update.";
+  } else if (state && state.state === "failed") {
+    tone = "error"; ic = "error";
+    title = "The update did not happen";
+    text = state.error || "";
+    acts = notes + (u.can_update ? `<button class="st-btn st-btn--primary" type="button" data-update="go">Try again</button>` : "");
+  } else if (u.newer) {
+    tone = "accent"; ic = "download";
+    title = `Strata-DeepSeek v${latest.version} is out`;
+    text = latest.summary || "";
+    if (!u.can_update) how = `Update by hand: ${u.by_hand}. This page can't, because ${u.blocker}.`;
+    acts = notes + (u.can_update ? `<button class="st-btn st-btn--primary" type="button" data-update="go">${icon("download")}Update to v${esc(latest.version)}</button>` : "");
+  } else if (u.error) {
+    ic = "warning";
+    title = "Couldn't check for updates";
+    text = `${u.error}. Strata-DeepSeek v${u.current || "?"} is running.`;
+    acts = again("Try again");
+  } else if (u.latest) {
+    tone = "ok"; ic = "check";
+    title = `Up to date: v${u.current} is the latest release`;
+    text = `Checked on GitHub${when ? ` at ${when}` : ""}.`;
+    acts = again("Check again");
+  } else {
+    title = "Checking for updates…";
+  }
+  el.hidden = false;
+  el.dataset.tone = tone;
+  el.innerHTML = `<span class="update-card__icon">${icon(ic)}</span>` +
+    `<div class="update-card__text"><b>${esc(title)}</b>${text ? `<span>${esc(text)}</span>` : ""}` +
+    `${how ? `<span class="update-card__how">${esc(how)}</span>` : ""}</div>` +
+    (acts ? `<div class="update-card__acts">${acts}</div>` : "");
+}
+$("update-card").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-update]");
+  if (!b) return;
+  if (b.dataset.update === "check") { b.disabled = true; loadUpdate(true); }
+  else startUpdate();
+});
+async function startUpdate() {
+  const v = update && update.latest && update.latest.version;
+  if (!v) return;
+  const ok = await confirmDialog(`Update Strata-DeepSeek to v${v}?`,
+    "<p>Only the project's code is updated: <b>the model is not downloaded again</b>, and its files, your settings and the " +
+    "chats in this browser stay.</p><p>Strata-DeepSeek finishes the answer it is writing, downloads the new code (git), compiles " +
+    "only the engine files that changed (usually a few minutes; the terminal shows the progress) and loads the model " +
+    "again. Apps using the API are asked to try again meanwhile.</p>", `Update to v${v}`);
+  if (!ok) return;
+  let r, d = {};
+  try {
+    r = await fetch("api/update", {method: "POST", headers: headers(true), body: "{}"});
+    d = await r.json().catch(() => ({}));
+  } catch (e) {
+    toast("error", "The update did not start", "The server did not answer.", 9000);
+    return;
+  }
+  if (!r.ok) {
+    toast("error", "The update did not start", (d.error && d.error.message) || `HTTP ${r.status}`, 9000);
+    loadUpdate();
+    return;
+  }
+  watchUpdate(v);
+}
+// until the server answers with the new version (then the page reloads for its new files), or says it failed
+async function watchUpdate(to) {
+  if (updateWatch) return;
+  updateWatch = {to, down: false};
+  renderUpdate();
+  for (;;) {
+    await new Promise((ok) => setTimeout(ok, 3000));
+    let h = null;
+    try {
+      const r = await fetch("health", {cache: "no-store"});
+      h = r.ok ? await r.json() : null;
+    } catch (e) { h = null; }
+    if (!h) {                                      // stopped: compiling, or loading the model
+      if (!updateWatch.down) { updateWatch.down = true; renderUpdate(); }
+      continue;
+    }
+    if (h.version === to) {
+      toast("success", `Updated to v${to}`, "Reloading the page…", 4000);
+      setTimeout(() => location.reload(), 1200);
+      return;
+    }
+    if (h.status === "updating") continue;
+    const restarted = updateWatch.down;
+    updateWatch = null;
+    await loadUpdate();
+    if (!restarted) toast("error", "The update did not happen", (update && update.state && update.state.error) || "", 9000);
+    else toast("warn", "Strata-DeepSeek started again on the same version", "The update's files did not arrive; the terminal shows why.", 9000);
+    return;
+  }
+}
+
+$("clear-data").onclick = async () => {
+  const ok = await confirmDialog("Clear this browser's chats and settings?",
+    "<p>Every chat, the Chat settings, the instructions and the API key kept in this browser are removed. The model, " +
+    "its files and the server's own settings are not touched.</p>", "Clear everything", true);
+  if (!ok) return;
+  try { await db.clear(); } catch (e) { /* nothing stored there */ }
+  try {
+    for (const k of Object.keys(localStorage)) if ((k.startsWith("maya.") || k.startsWith("strata.")) && k !== "maya.ui-theme") localStorage.removeItem(k);
+  } catch (e) { /* ignore */ }
+  location.reload();
+};
 
 // ------------------------------------------------------------------ MCP servers (GET /mcp)
 // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,
@@ -437,61 +1374,71 @@ function renderMcp() {
   }).join("");
 }
 
-// ------------------------------------------------------------------ Model settings (GET / POST /config, #564)
-// A few documented keys of the run config (strata-<model>.json), for every client, from the next start on.  The
-// server lists them, checks every value and keeps every other key of the file as it is.
-let cfgKeys = [];
-async function loadConfig() {
-  let r;
-  try { r = await fetch("config", {headers: headers()}); } catch (e) { return; }
-  if (!r.ok) { $("cfg-card").hidden = true; return; }       // no run config, an older server, or no key yet
-  const c = await r.json();
-  cfgKeys = c.keys || [];
-  $("cfg-file").textContent = c.file || "";
-  $("cfg-form").innerHTML = cfgKeys.map((k, i) => {
-    const id = `cfg-${i}`, v = k.value;
-    let input;
-    if (k.kind === "bool" || k.kind === "enum") {
-      const opts = k.kind === "bool" ? [["true", "on"], ["false", "off"]] : k.choices.map((x) => [x, x]);
-      const cur = v == null ? "" : String(v);
-      input = `<select class="st-input" id="${id}"><option value=""${cur === "" ? " selected" : ""}>default</option>` +
-        opts.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(text)}</option>`).join("") + `</select>`;
-    } else {
-      const text = v == null ? "" : Array.isArray(v) ? v.join(", ") : String(v);
-      input = `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
-        `value="${esc(text)}" placeholder="default" autocomplete="off">`;
+// ------------------------------------------------------------------ syntax highlighting (small, local, no library)
+const KW = (s) => new Set(s.split(/\s+/));
+const HL_FAMILY = {};
+for (const [fam, names] of Object.entries({
+  c: "js javascript jsx mjs cjs ts typescript tsx java c h cpp cc cxx hpp c++ cu cuh cuda cs csharp go golang rust rs kotlin kt swift php dart scala glsl hlsl wgsl zig",
+  py: "py python python3", sh: "sh bash shell zsh console ps1 powershell bat cmd", json: "json jsonc json5",
+  html: "html htm xhtml xml svg vue", css: "css scss less", sql: "sql", yaml: "yaml yml toml ini cfg conf env dockerfile",
+})) for (const n of names.split(" ")) HL_FAMILY[n] = fam;
+const STR = /"(?:\\[\s\S]|[^"\\\n])*"?|'(?:\\[\s\S]|[^'\\\n])*'?/y;
+const NUM = /\b(?:0x[\da-fA-F_]+|0b[01_]+|\d[\d_]*\.?\d*(?:[eE][+-]?\d+)?)[a-zA-Z]*\b/y;
+const WORD = /[A-Za-z_$][\w$]*/y;
+const HL = {
+  c: {rules: [[/\/\/[^\n]*|\/\*[\s\S]*?(?:\*\/|$)/y, "c"], [/`(?:\\[\s\S]|[^`\\])*`?/y, "s"], [STR, "s"],
+              [/#[ \t]*[a-z]+/y, "k"], [NUM, "n"], [WORD, "w"]],
+      kw: KW(`abstract as async await break case catch class const constexpr continue debugger default defer delete do else enum
+        export extends extern false final finally fn for from func function get go goto if impl implements import in inline
+        instanceof interface let loop match mod module move mut namespace new nil null nullptr of operator override package
+        private protected pub public readonly ref register return self Self sizeof static struct super switch template this
+        throw throws trait true try type typedef typename typeof union unsafe use using var virtual void volatile where while
+        with yield auto bool char double float int long short signed unsigned void string number boolean any never unknown
+        __global__ __device__ __host__ __shared__ __restrict__ i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 usize isize`)},
+  py: {rules: [[/#[^\n]*/y, "c"], [/[rbfuRBFU]{0,2}(?:"""[\s\S]*?(?:"""|$)|'''[\s\S]*?(?:'''|$))/y, "s"],
+               [/[rbfuRBFU]{0,2}(?:"(?:\\[\s\S]|[^"\\\n])*"?|'(?:\\[\s\S]|[^'\\\n])*'?)/y, "s"], [/@[\w.]+/y, "f"], [NUM, "n"], [WORD, "w"]],
+       kw: KW(`and as assert async await break case class continue def del elif else except False finally for from global if
+         import in is lambda match None nonlocal not or pass raise return True try while with yield self cls print len range`)},
+  sh: {rules: [[/(?:^|(?<=\s))#[^\n]*/y, "c"], [STR, "s"], [/\$\{[^}\n]*\}?|\$[\w@#?*!$-]+/y, "v"], [NUM, "n"], [/[A-Za-z_][\w.-]*/y, "w"]],
+       kw: KW(`if then else elif fi for while until do done case esac in function return export local set unset echo printf cd
+         sudo source alias exit read shift trap eval exec`)},
+  json: {rules: [[/"(?:\\[\s\S]|[^"\\\n])*"(?=\s*:)/y, "a"], [STR, "s"], [/-?\d+\.?\d*(?:[eE][+-]?\d+)?/y, "n"], [/[a-z]+/y, "w"]],
+         kw: KW("true false null")},
+  html: {rules: [[/<!--[\s\S]*?(?:-->|$)/y, "c"], [/<\/?[A-Za-z][\w:-]*/y, "k"], [/[A-Za-z_:][\w:.-]*(?==)/y, "a"], [STR, "s"],
+                 [/&#?\w+;/y, "n"]], kw: KW("")},
+  css: {rules: [[/\/\*[\s\S]*?(?:\*\/|$)/y, "c"], [STR, "s"], [/#[\da-fA-F]{3,8}\b/y, "n"], [/@[\w-]+/y, "k"],
+                [/-?\d+\.?\d*(?:px|em|rem|%|vh|vw|s|ms|deg|fr)?/y, "n"], [/[\w-]+(?=\s*:[^:{;]*[;}])/y, "a"]], kw: KW("")},
+  sql: {rules: [[/--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)/y, "c"], [STR, "s"], [NUM, "n"], [WORD, "w"]],
+        kw: KW(`select from where and or not insert into values update set delete create table index view drop alter add join
+          left right inner outer on group by order having limit offset as distinct union all null is in like between case
+          when then else end primary key foreign references default exists with returning asc desc count sum avg min max`),
+        ci: true},
+  yaml: {rules: [[/#[^\n]*/y, "c"], [/[\w.-]+(?=[ \t]*[:=])/y, "a"], [STR, "s"], [NUM, "n"], [/[a-z]+/y, "w"]],
+         kw: KW("true false null yes no on off")},
+};
+function highlight(code, lang) {
+  const fam = HL_FAMILY[(lang || "").toLowerCase()];
+  if (!fam || code.length > 200000) return esc(code);
+  const R = HL[fam];
+  let out = "", plain = "", i = 0;
+  while (i < code.length) {
+    let tok = null, cls = null;
+    for (const [re, c] of R.rules) {
+      re.lastIndex = i;
+      const m = re.exec(code);
+      if (m && m[0].length) { tok = m[0]; cls = c; break; }
     }
-    return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code></label>${input}`;
-  }).join("");
-  $("cfg-card").hidden = false;
-}
-function configValue(k, el) {
-  const s = el.value.trim();
-  if (s === "") return null;
-  if (k.kind === "bool") return s === "true";
-  if (k.kind === "number") return Number(s);
-  return s;                                         // enum, or names (the server splits them at commas)
-}
-$("cfg-save").addEventListener("click", async () => {
-  const set = {};
-  cfgKeys.forEach((k, i) => {
-    const v = configValue(k, $(`cfg-${i}`));
-    const old = Array.isArray(k.value) ? k.value.join(", ") : k.value;
-    if (JSON.stringify(v) !== JSON.stringify(old ?? null)) set[k.key] = v;
-  });
-  if (!Object.keys(set).length) { $("cfg-msg").textContent = "Nothing changed."; return; }
-  try {
-    const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set})});
-    const b = await r.json();
-    if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
-    $("cfg-msg").textContent = b.changed.length
-      ? `Saved (${b.changed.join(", ")}); the earlier file is ${b.file}.bak. Start the model again to use it.` : "Nothing changed.";
-    loadConfig();
-  } catch (e) {
-    $("cfg-msg").textContent = "";
-    toast("error", "Not saved", String(e.message || e), 6000);
+    if (tok === null) { plain += code[i++]; continue; }
+    if (cls === "w") {
+      const w = R.ci ? tok.toLowerCase() : tok;
+      cls = R.kw.has(w) ? "k" : code[i + tok.length] === "(" ? "f" : null;
+    }
+    if (plain) { out += esc(plain); plain = ""; }
+    out += cls ? `<span class="tk-${cls}">${esc(tok)}</span>` : esc(tok);
+    i += tok.length;
   }
-});
+  return out + esc(plain);
+}
 
 // ------------------------------------------------------------------ Markdown (escaped first, then formatted)
 function inline(s) {
@@ -500,48 +1447,87 @@ function inline(s) {
   s = esc(s)
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*\w])\*([^*\n]+)\*(?![*\w])/g, "$1<em>$2</em>")
+    .replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
     .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
   return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code class="inline">${esc(codes[+i])}</code>`);
 }
-function codeBlock(lang, code) {
-  return `<div class="st-code"><div class="st-code__head"><span>${esc(lang || "code")}</span>` +
-    `<button class="st-btn st-btn--icon" data-code-copy aria-label="Copy code">${icon("copy")}</button></div>` +
-    `<pre><code>${esc(code)}</code></pre></div>`;
+const CODE_EXT = {python: "py", py: "py", javascript: "js", js: "js", jsx: "jsx", typescript: "ts", ts: "ts", tsx: "tsx",
+  html: "html", htm: "html", css: "css", scss: "scss", json: "json", bash: "sh", sh: "sh", shell: "sh", zsh: "sh",
+  c: "c", h: "h", cpp: "cpp", "c++": "cpp", hpp: "hpp", cuda: "cu", cu: "cu", rust: "rs", rs: "rs", go: "go", java: "java",
+  kotlin: "kt", swift: "swift", sql: "sql", yaml: "yaml", yml: "yml", toml: "toml", xml: "xml", svg: "svg", markdown: "md",
+  md: "md", ps1: "ps1", powershell: "ps1", php: "php", ruby: "rb", rb: "rb", lua: "lua", dockerfile: "Dockerfile"};
+const isHtmlCode = (lang, code) => ["html", "htm", "xhtml"].includes((lang || "").toLowerCase()) ||
+                                   (!lang && /^\s*(<!doctype html|<html[\s>])/i.test(code));
+function codeBlock(lang, code, complete = true) {
+  const l = (lang || "").trim().split(/\s+/)[0] || "";
+  const btn = (attr, name, title) => `<button class="st-btn st-btn--icon" ${attr} aria-label="${title}" title="${title}">${icon(name)}</button>`;
+  const actions = (complete && isHtmlCode(l, code) ? btn("data-code-preview", "eye", "Preview this page") : "") +
+    btn("data-code-wrap", "wrap", "Wrap long lines") + btn("data-code-download", "download", "Download as a file") +
+    btn("data-code-copy", "copy", "Copy");
+  return `<div class="st-code" data-lang="${esc(l)}"><div class="st-code__head"><span>${esc(l || "code")}</span>` +
+    `<span class="st-code__actions">${actions}</span></div><pre><code>${highlight(code, l)}</code></pre></div>`;
 }
+// a list, nested by indentation: [{indent, ordered, start, text}]
+function renderList(items) {
+  let pos = 0;
+  const build = (indent) => {
+    const first = items[pos];
+    const tag = first.ordered ? "ol" : "ul";
+    let html = `<${tag}${first.ordered && first.start && first.start !== 1 ? ` start="${first.start}"` : ""}>`;
+    while (pos < items.length && items[pos].indent >= indent) {
+      const it = items[pos];
+      if (it.indent > indent) {                     // a deeper level: inside the item before it
+        const sub = build(it.indent);
+        html = html.endsWith("</li>") ? `${html.slice(0, -5)}${sub}</li>` : `${html}<li>${sub}</li>`;
+        continue;
+      }
+      html += `<li>${inline(it.text)}</li>`;
+      pos++;
+    }
+    return `${html}</${tag}>`;
+  };
+  let out = "";
+  while (pos < items.length) out += build(items[pos].indent);
+  return out;
+}
+const LIST_RE = /^(\s*)(?:([-*+])|(\d+)[.)])\s+(.*)$/;
 function blocks(text) {
   const out = [], lines = text.split("\n");
-  let para = [], list = null;
+  let para = [];
   const flushPara = () => { if (para.length) out.push(`<p>${para.map(inline).join("<br>")}</p>`); para = []; };
-  const flushList = () => { if (list) out.push(`<${list.tag}>${list.items.map((i) => `<li>${inline(i)}</li>`).join("")}</${list.tag}>`); list = null; };
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
     let m;
-    if (!l.trim()) { flushPara(); flushList(); continue; }
-    if ((m = l.match(/^(#{1,6})\s+(.*)$/))) { flushPara(); flushList(); out.push(`<${m[1].length <= 2 ? "h3" : "h4"}>${inline(m[2])}</${m[1].length <= 2 ? "h3" : "h4"}>`); continue; }
-    if (/^\s*([-*_])\s*\1\s*\1[\s\1]*$/.test(l)) { flushPara(); flushList(); out.push("<hr>"); continue; }
-    if ((m = l.match(/^>\s?(.*)$/))) { flushPara(); flushList(); out.push(`<blockquote>${inline(m[1])}</blockquote>`); continue; }
+    if (!l.trim()) { flushPara(); continue; }
+    if ((m = l.match(/^(#{1,6})\s+(.*)$/))) { flushPara(); out.push(`<${m[1].length <= 2 ? "h3" : "h4"}>${inline(m[2])}</${m[1].length <= 2 ? "h3" : "h4"}>`); continue; }
+    if (/^\s*([-*_])\s*\1\s*\1[\s\1]*$/.test(l)) { flushPara(); out.push("<hr>"); continue; }
+    if ((m = l.match(/^>\s?(.*)$/))) { flushPara(); out.push(`<blockquote>${inline(m[1])}</blockquote>`); continue; }
     if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(lines[i + 1])) {
-      flushPara(); flushList();
+      flushPara();
       const cells = (row) => row.trim().replace(/^\||\|$/g, "").split("|").map((c) => inline(c.trim()));
-      let html = `<table><thead><tr>${cells(l).map((c) => `<th>${c}</th>`).join("")}</tr></thead><tbody>`;
+      let html = `<div class="table-scroll"><table><thead><tr>${cells(l).map((c) => `<th>${c}</th>`).join("")}</tr></thead><tbody>`;
       i += 2;
       while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) html += `<tr>${cells(lines[i++]).map((c) => `<td>${c}</td>`).join("")}</tr>`;
       i--;
-      out.push(html + "</tbody></table>");
+      out.push(html + "</tbody></table></div>");
       continue;
     }
-    if ((m = l.match(/^\s*(?:[-*+]|(\d+)[.)])\s+(.*)$/))) {
+    if (LIST_RE.test(l)) {
       flushPara();
-      const tag = m[1] ? "ol" : "ul";
-      if (!list || list.tag !== tag) { flushList(); list = {tag, items: []}; }
-      list.items.push(m[2]);
+      const items = [];
+      while (i < lines.length) {
+        const L = lines[i], mm = L.match(LIST_RE);
+        if (mm) { items.push({indent: mm[1].replace(/\t/g, "    ").length, ordered: !mm[2], start: mm[3] ? +mm[3] : null, text: mm[4]}); i++; continue; }
+        if (L.trim() && /^\s{2,}\S/.test(L) && items.length) { items[items.length - 1].text += " " + L.trim(); i++; continue; }
+        break;
+      }
+      i--;
+      out.push(renderList(items));
       continue;
     }
-    if (list && /^\s{2,}\S/.test(l)) { list.items[list.items.length - 1] += " " + l.trim(); continue; }
-    flushList();
     para.push(l);
   }
-  flushPara(); flushList();
+  flushPara();
   return out.join("");
 }
 function markdown(text) {
@@ -552,34 +1538,224 @@ function markdown(text) {
     html += blocks(rest.slice(0, m.index));
     rest = rest.slice(m.index + m[0].length);
     const end = rest.match(/(^|\n)```[ \t]*(\n|$)/);
-    if (!end) { html += codeBlock(m[2].trim(), rest); break; }         // still streaming
+    if (!end) { html += codeBlock(m[2].trim(), rest, false); break; }         // still streaming
     html += codeBlock(m[2].trim(), rest.slice(0, end.index));
     rest = rest.slice(end.index + end[0].length);
   }
   return html;
 }
+// While a long answer streams, the part before its last blank line (outside a code block) is rendered once and kept;
+// only the tail is rendered again each frame (a 14K-token answer stays smooth).
+function streamingMarkdown(m) {
+  const t = m.text;
+  if (t.length < 6000) return markdown(t);
+  const c = m._md || (Object.defineProperty(m, "_md", {value: {upto: 0, html: ""}, enumerable: false, writable: true}), m._md);
+  let cut = t.lastIndexOf("\n\n", t.length - 3);
+  while (cut > c.upto && ((t.slice(0, cut).match(/(^|\n)```/g) || []).length % 2)) cut = t.lastIndexOf("\n\n", cut - 1);
+  if (cut > c.upto) { c.html += markdown(t.slice(c.upto, cut)); c.upto = cut; }
+  return c.html + markdown(t.slice(c.upto));
+}
+
+// the code blocks' buttons (chat answers and About's snippets)
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-code-copy], [data-code-wrap], [data-code-download], [data-code-preview]");
+  if (!b) return;
+  const block = b.closest(".st-code"), code = block.querySelector("pre").textContent, lang = block.dataset.lang || "";
+  if (b.hasAttribute("data-code-copy")) copyText(code, b);
+  else if (b.hasAttribute("data-code-wrap")) block.classList.toggle("is-wrapped");
+  else if (b.hasAttribute("data-code-download")) {
+    const ext = CODE_EXT[lang.toLowerCase()] || (isHtmlCode(lang, code) ? "html" : "txt");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([code], {type: "text/plain"}));
+    a.download = ext === "Dockerfile" ? ext : `strata-code.${ext}`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  } else if (b.hasAttribute("data-code-preview")) previewHtml(code);
+});
+// an HTML answer in a sandboxed frame: scripts run, but cut off from this page (no same-origin, no storage)
+function previewHtml(code) {
+  const wrap = document.createElement("div");
+  wrap.className = "preview";
+  wrap.innerHTML = `<p class="muted small">Runs in a sandbox, cut off from this page. Scripts it loads from the web (a
+    three.js CDN, say) come from the internet.</p>`;
+  const f = document.createElement("iframe");
+  f.className = "preview__frame";
+  f.setAttribute("sandbox", "allow-scripts allow-pointer-lock allow-modals");
+  f.setAttribute("title", "Preview");
+  f.srcdoc = code;
+  wrap.appendChild(f);
+  openModal({title: "Preview", body: wrap, wide: true});
+}
+
+// ------------------------------------------------------------------ Chats (many, kept in this browser)
+// thinking: GLM's own levels - none (Off), low, high, max.  The page before v1.0.18 saved Qwen-era names, where its
+// "Medium" was GLM's High and its "High" GLM's Max: they are translated once (thinking_v 2)
+const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0, max: "", seed: "", show: true,
+                  mcp: true, system: "", sys_default: false, thinking_v: 2};
+const THINKING = ["none", "low", "high", "max"];
+const glmLevel = (v, v2) => (v2 ? v : {medium: "high", high: "max", xhigh: "max"}[v] || v);
+let samplingKey = "sampling";        // the running model's saved settings (loadHealth: DeepSeek's own key)
+let settings = {...DEFAULTS, ...store.get(samplingKey, {})};
+// the thinking buttons say what each level is for the running model
+const THINK_TITLES = {
+  glm: {none: "No thinking: it answers right away", low: "GLM's Low: a short think", high: "GLM's High: thinks it through",
+        max: "GLM's Max: the most thorough, and the longest"},
+  deepseek: {none: "No thinking: it answers right away", low: "DeepSeek's Low: reasoning effort 50",
+             high: "DeepSeek's High: reasoning effort 75", max: "DeepSeek's Max: reasoning effort 100, the most thorough"},
+};
+function thinkingTitles() {
+  const t = THINK_TITLES[samplingKey === "sampling_deepseek" ? "deepseek" : "glm"];
+  for (const b of $("s-thinking").children) if (t[b.dataset.v]) b.title = t[b.dataset.v];
+}
+if (settings.thinking_v !== 2) { settings.thinking = glmLevel(settings.thinking, false); settings.thinking_v = 2; }
+if (!THINKING.includes(settings.thinking)) settings.thinking = "high";
+let chats = [];                       // {id, title, created, updated, messages, system}, newest first
+let current = null;                   // the open chat
+let messages = [];                    // current.messages
+let attachments = [];                 // {kind: "image" | "file", name, url | text}
+let busy = null;                      // {controller, msg, chat}
+let editIndex = null;                 // the user message being edited (its answers are replaced on send)
+let dbBroken = false;                 // IndexedDB unavailable (some private windows): localStorage, without pictures
+
+const titleOf = (msgs) => {
+  const u = msgs.find((m) => m.role === "user" && (m.text || (m.files || []).length));
+  const t = u ? (u.text || (u.files || []).map((f) => f.name).join(", ")) : "";
+  return t.replace(/\s+/g, " ").trim().slice(0, 60) || "New chat";
+};
+function newChatObj() {
+  return {id: uid(), title: "", created: Date.now(), updated: Date.now(), messages: [],
+          system: settings.sys_default ? settings.system || "" : ""};
+}
+const slim = (c) => ({...c, messages: c.messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name}))}))});
+async function persist(c = current) {
+  if (!c || !c.messages.length) return;
+  if (!chats.includes(c)) chats.unshift(c);
+  const plain = JSON.parse(JSON.stringify(c));    // no transient fields (the streaming cache is not enumerable)
+  try {
+    if (dbBroken) throw new Error("no IndexedDB");
+    await db.put(plain);
+  } catch (e) {
+    dbBroken = true;
+    try { localStorage.setItem("maya.chats-fallback", JSON.stringify(chats.slice(0, 30).map(slim))); }
+    catch (e2) { /* full: the newest chats only next time */ }
+  }
+}
+function saveChat(c = current) {
+  if (!c) return;
+  c.updated = Date.now();
+  if (!c.title || c.title === "New chat") c.title = titleOf(c.messages);
+  chats.sort((a, b) => b.updated - a.updated);
+  persist(c);
+  renderChatList();
+}
+async function loadChats() {
+  try { chats = await db.all(); }
+  catch (e) { dbBroken = true; chats = store.get("chats-fallback", []); }
+  if (!chats.length) {                            // the single chat of earlier versions becomes the first one
+    const old = store.get("chat", []);
+    if (old.length) {
+      const c = newChatObj();
+      c.messages = old;
+      c.title = titleOf(old);
+      chats.push(c);
+      await persist(c);
+    }
+  }
+  try { localStorage.removeItem("maya.chat"); localStorage.removeItem("strata.chat"); } catch (e) { /* ignore */ }
+  chats.sort((a, b) => b.updated - a.updated);
+  const want = store.get("current-chat", null);
+  current = chats.find((c) => c.id === want) || chats[0] || newChatObj();
+  messages = current.messages;
+}
+// an answer being written goes on in its own chat while another one is open (and shows again when its chat is)
+function openChat(c) {
+  current = c;
+  messages = c.messages;
+  store.set("current-chat", c.id);
+  cancelEdit();
+  renderChat();
+  renderChatList();
+  refreshHint();
+  showChats(false);
+  if (tab !== "chat") showTab("chat");
+  resumePending();
+}
+function newChat() {
+  if (!messages.length && current.system === (settings.sys_default ? settings.system || "" : "")) {
+    showChats(false); showTab("chat"); $("input").focus(); return;
+  }
+  openChat(newChatObj());
+  $("input").focus();
+}
+async function deleteChat(c) {
+  if (busy && busy.chat === c) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  chats = chats.filter((x) => x !== c);
+  try { if (!dbBroken) await db.del(c.id); } catch (e) { /* ignore */ }
+  if (dbBroken) persist(chats[0]);
+  if (current === c) { current = chats[0] || newChatObj(); messages = current.messages; renderChat(); }
+  renderChatList();
+  toast("info", "Chat deleted", c.title || "", 6000, {label: "Undo", run: () => { chats.push(c); saveChat(c); }});
+}
+function relTime(t) {
+  const d = new Date(t), now = new Date();
+  if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (d.toDateString() === y.toDateString()) return "Yesterday";
+  return d.toLocaleDateString([], {month: "short", day: "numeric"});
+}
+function renderChatList() {
+  const q = $("chats-search").value.trim().toLowerCase();
+  const list = $("chats-list");
+  let items = chats;
+  if (!chats.includes(current)) items = [current, ...chats];            // the new, still empty chat
+  if (q) items = items.filter((c) => (c.title || "").toLowerCase().includes(q) ||
+                                     c.messages.some((m) => (m.text || "").toLowerCase().includes(q)));
+  list.innerHTML = items.length ? "" : `<p class="muted small chats__empty">${q ? "No chat matches." : "No chats yet."}</p>`;
+  for (const c of items) {
+    const row = document.createElement("div");
+    row.className = "chat-item" + (c === current ? " is-active" : "");
+    row.setAttribute("role", "listitem");
+    row.innerHTML = `<button type="button" class="chat-item__open"><span class="chat-item__title"></span>` +
+      `<span class="chat-item__time muted"></span></button>` +
+      `<span class="chat-item__actions"><button type="button" class="st-btn st-btn--icon" data-act="rename" aria-label="Rename" title="Rename">${icon("edit")}</button>` +
+      `<button type="button" class="st-btn st-btn--icon" data-act="delete" aria-label="Delete" title="Delete">${icon("trash")}</button></span>`;
+    row.querySelector(".chat-item__title").textContent = c.title || (c.messages.length ? titleOf(c.messages) : "New chat");
+    row.querySelector(".chat-item__time").textContent = c.messages.length ? relTime(c.updated) : "";
+    row.querySelector(".chat-item__open").onclick = () => { if (c !== current) openChat(c); else showChats(false); };
+    row.querySelector('[data-act="delete"]').onclick = () => deleteChat(c);
+    row.querySelector('[data-act="rename"]').onclick = () => renameChat(row, c);
+    if (!c.messages.length) row.querySelector(".chat-item__actions").hidden = true;
+    list.appendChild(row);
+  }
+}
+function renameChat(row, c) {
+  const t = row.querySelector(".chat-item__title");
+  const input = document.createElement("input");
+  input.className = "st-input chat-item__rename";
+  input.value = c.title || titleOf(c.messages);
+  t.replaceWith(input);
+  input.focus();
+  input.select();
+  const done = (save) => {
+    if (save && input.value.trim()) { c.title = input.value.trim().slice(0, 80); persist(c); }
+    renderChatList();
+  };
+  input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); done(true); } if (e.key === "Escape") { e.stopPropagation(); done(false); } };
+  input.onblur = () => done(true);
+  input.onclick = (e) => e.stopPropagation();
+}
+$("chats-search").addEventListener("input", renderChatList);
+$("chats-new").onclick = newChat;
+// narrow screens: the chats slide in from the left
+function showChats(open) {
+  document.body.classList.toggle("chats-open", open);
+  $("chats-scrim").hidden = !open;
+  $("chats-toggle").setAttribute("aria-expanded", String(open));
+}
+$("chats-toggle").onclick = () => showChats(!document.body.classList.contains("chats-open"));
+$("chats-scrim").onclick = () => showChats(false);
 
 // ------------------------------------------------------------------ Chat
-// The sampling shown until the user changes it is the model card's thinking set. Untouched, the page sends NO sampling
-// fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
-// 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
-// values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
-const OLD_DEFAULT_TEMPERATURE = 0.6;
-function samplingUntouched(s) {
-  const t = +s.temperature;
-  return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
-}
-let settings = {...DEFAULTS, ...store.get("sampling", {})};
-if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
-let messages = store.get("chat", []);
-let attachments = [];                 // {name, url}
-let busy = null;                      // {controller, msg}
-
-function saveChat() {
-  store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
-                                           files: (m.files || []).map((f) => ({name: f.name}))})));
-}
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
 function msgEl(m, i) {
@@ -614,14 +1790,17 @@ function msgEl(m, i) {
     el.appendChild(b);
     const meta = document.createElement("div");
     meta.className = "st-msg__meta";
-    meta.textContent = `You · ${timeStr(m.time)}`;
+    meta.innerHTML = `<span></span><button class="st-btn st-btn--icon" data-msg-edit aria-label="Edit and send again" title="Edit">${icon("edit")}</button>` +
+      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy" title="Copy">${icon("copy")}</button>`;
+    meta.firstChild.textContent = `You · ${timeStr(m.time)}`;
     el.appendChild(meta);
   } else {
     el.innerHTML = `<details class="st-collapse think" hidden><summary>${icon("thinking", "st-icon st-icon--sm")}<span class="think-title"></span>` +
       `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body thinking"></div></details>` +
       `<div class="st-bubble"></div><div class="st-msg__meta"><span class="meta-text"></span>` +
-      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button></div>`;
-    updateAssistant(el, m, false);
+      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button>` +
+      `<button class="st-btn st-btn--icon" data-msg-regen aria-label="Write this answer again" title="Regenerate">${icon("refresh")}</button></div>`;
+    updateAssistant(el, m, !!busy && busy.msg === m);
   }
   return el;
 }
@@ -649,8 +1828,8 @@ function toolHtml(t, k) {
     `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>`;
 }
 // the answer's text with the tool blocks where the model called them
-function answerHtml(m) {
-  if (!m.tools || !m.tools.length) return markdown(m.text || "");
+function answerHtml(m, streaming) {
+  if (!m.tools || !m.tools.length) return streaming ? streamingMarkdown(m) : markdown(m.text || "");
   let html = "", pos = 0;
   m.tools.forEach((t, k) => {
     const at = Math.min(Math.max(t.at || 0, pos), m.text.length);
@@ -694,11 +1873,13 @@ function updateAssistant(el, m, streaming) {
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
-    bubble.innerHTML = answerHtml(m);
+    bubble.innerHTML = answerHtml(m, streaming);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
+  // regenerate: the last answer only, when nothing is running
+  el.querySelector("[data-msg-regen]").hidden = streaming || !!busy || +el.dataset.i !== messages.length - 1;
 }
 function renderChat() {
   const chat = $("chat");
@@ -706,15 +1887,23 @@ function renderChat() {
   $("chat-empty").hidden = messages.length > 0;
   messages.forEach((m, i) => chat.appendChild(msgEl(m, i)));
   scrollDown(true);
+  updateCtxMeter();
 }
 function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
-function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
+function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; updateJump(); }
+function updateJump() { $("jump-latest").hidden = nearBottom() || !messages.length; }
+$("chat-scroll").addEventListener("scroll", updateJump, {passive: true});
+$("jump-latest").onclick = () => scrollDown(true);
 
 $("chat").addEventListener("click", (e) => {
-  const cc = e.target.closest("[data-code-copy]");
-  if (cc) { copyText(cc.closest(".st-code").querySelector("pre").textContent, cc); return; }
   const mc = e.target.closest("[data-msg-copy]");
   if (mc) { const i = +mc.closest(".st-msg").dataset.i; copyText(messages[i].text, mc); return; }
+  const me = e.target.closest("[data-msg-edit]");
+  if (me) { editMessage(+me.closest(".st-msg").dataset.i); return; }
+  const mr = e.target.closest("[data-msg-regen]");
+  if (mr) { regenerate(); return; }
+  const sg = e.target.closest(".suggestion");
+  if (sg) { $("input").value = sg.dataset.q; autosize(); updateCtxMeter(); $("input").focus(); return; }
   // a tool block: its open state lives in the message (the answer is rebuilt while it streams), so the click sets it
   const sum = e.target.closest(".tool-call > summary");
   if (sum) {
@@ -734,15 +1923,17 @@ $("chat").addEventListener("toggle", (e) => {
   if (d.open && body.dataset.pending) { body.textContent = messages[+d.closest(".st-msg").dataset.i].reasoning; delete body.dataset.pending; }
 }, true);
 
-function apiMessages() {
+// the chat as the API sends it; `light`: pictures as placeholders (the context meter's count needs only where they are)
+function apiMessages(msgs = messages, light = false) {
   const out = [];
-  for (const m of messages) {
+  if (current.system && current.system.trim()) out.push({role: "system", content: current.system.trim()});
+  for (const m of msgs) {
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url);
       const text = userText(m);
       out.push({role: "user", content: imgs.length ? [{type: "text", text},
-        ...imgs.map((i) => ({type: "image_url", image_url: {url: i.url}}))] : text});
-    } else if (!(busy && busy.msg === m)) {            // the answer being asked for now is not history yet
+        ...imgs.map((i) => ({type: "image_url", image_url: {url: light ? "data:," : i.url}}))] : text});
+    } else if (!m.error) {
       out.push(...assistantMessages(m));
     }
   }
@@ -752,14 +1943,7 @@ function apiMessages() {
 // their results (as the model read them), then the rest - so the next question can build on what the tools found.
 function assistantMessages(m) {
   const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped");
-  // #1392: a turn with no answer text (only reasoning, a stop before the first content token, or an error) still goes
-  // back as an assistant turn, so the history keeps alternating and a reasoning model sees that it already answered.
-  // The server leaves such a turn out of the prompt itself (serve/frontend.py, #843); reasoning_content rides along.
-  if (!ran.length) {
-    const msg = {role: "assistant", content: m.text || ""};
-    if (!m.text && m.reasoning) msg.reasoning_content = m.reasoning;
-    return [msg];
-  }
+  if (!ran.length) return m.text ? [{role: "assistant", content: m.text}] : [];
   const out = [];
   let pos = 0;
   for (const r of [...new Set(ran.map((t) => t.round))]) {
@@ -777,50 +1961,153 @@ function assistantMessages(m) {
 
 function setBusy(on) {
   $("stop-btn").hidden = !on;
-  $("send-btn").disabled = on;
-  $("composer-hint").textContent = on ? "" : "Shift+Enter: new line";
+  $("send-btn").disabled = on || !!reloadWatch;
+  refreshHint();
 }
 
-async function send() {
+// the context meter: how much of the model's context this chat takes - while an answer is written, the request's own
+// prompt tokens plus the tokens written so far (the server's live count); otherwise the chat with what is being typed,
+// counted by the server with the model's own template and tokenizer (POST /api/tokens).  "≈" only when a count can't be
+// exact (pictures, or an older server: then a length estimate).
+const tokfmt = (n) => (n == null ? "–" : n < 1000 ? fmt(n) : `${fmt(n / 1024, n < 10240 ? 1 : 0)}K`);   // as 128K = 131,072
+let ctxShown = {key: null, tokens: null, approx: false};
+let ctxTimer = null, ctxSeq = 0;
+function draftChat() {
+  const base = editIndex != null ? messages.slice(0, editIndex) : messages;
   const text = $("input").value.trim();
-  if ((!text && !attachments.length) || busy) return;
-  messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
-                 files: attachments.filter((a) => a.kind === "file"), time: Date.now()});
-  attachments = [];
-  renderAttachments();
-  $("input").value = "";
-  autosize();
-  const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
-  messages.push(m);
+  if (!text && !attachments.length) return base;
+  return [...base, {role: "user", text, images: attachments.filter((a) => a.kind === "image"),
+                    files: attachments.filter((a) => a.kind === "file")}];
+}
+function estimateTokens(msgs) {              // an older server without /api/tokens: about 3.5 characters a token
+  let chars = (current.system || "").length;
+  for (const m of msgs) chars += m.role === "user" ? userText(m).length : (m.text || "").length;
+  return Math.round(chars / 3.5) + 8 * msgs.length;
+}
+function showCtx(tokens, approx, why) {
+  const max = health.max_context, meter = $("ctx-meter");
+  if (!max || tokens == null) { meter.hidden = true; return; }
+  const pct = Math.min(100, (100 * tokens) / max);
+  meter.hidden = false;
+  $("ctx-ring").setAttribute("stroke-dasharray", `${Math.max(pct, 1.5).toFixed(1)} 100`);
+  meter.dataset.level = pct >= 95 ? "danger" : pct >= 80 ? "warn" : "";
+  $("ctx-text").textContent = `${approx ? "≈" : ""}${tokfmt(tokens)} / ${ctxfmt(max)}`;
+  meter.title = `${why}: ${fmt(tokens)} of the ${fmt(max)}-token context (${fmt(pct, pct < 10 ? 1 : 0)}%)` +
+    (approx ? " - approximate (pictures count once they are read)" : "") +
+    (pct >= 95 ? ". Nearly full: start a new chat, or raise the context size in Settings." : "");
+}
+// while an answer is written in the open chat: the server's live count (every poll)
+function liveCtx() {
+  const live = lastMetrics && lastMetrics.live;
+  if (!busy || busy.chat !== current || !live || live.state === "idle" || live.prompt_tokens == null) return false;
+  showCtx(live.prompt_tokens + (live.generated || 0), false, "This request");
+  return true;
+}
+function updateCtxMeter() {
+  clearTimeout(ctxTimer);
+  if (liveCtx()) return;
+  const msgs = draftChat();
+  if (!msgs.length) { ctxShown = {key: null, tokens: null, approx: false}; $("ctx-meter").hidden = true; return; }
+  if (ctxShown.tokens != null) showCtx(ctxShown.tokens, ctxShown.approx, "This chat");   // the last count meanwhile
+  ctxTimer = setTimeout(async () => {
+    const body = {messages: apiMessages(msgs, true), reasoning_effort: settings.thinking};
+    if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;
+    const key = JSON.stringify(body);
+    if (key === ctxShown.key && ctxShown.tokens != null) return;
+    const seq = ++ctxSeq;
+    let tokens = null, approx = false;
+    try {
+      const r = await fetch("api/tokens", {method: "POST", headers: headers(true), body: key});
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const j = await r.json();
+      tokens = j.tokens;
+      approx = !!j.approximate;
+    } catch (e) {
+      tokens = estimateTokens(msgs);
+      approx = true;
+    }
+    if (seq !== ctxSeq || liveCtx()) return;      // typed on, or an answer started meanwhile
+    ctxShown = {key, tokens, approx};
+    showCtx(tokens, approx, "This chat");
+  }, 400);
+}
+
+function answerMeta(m, n, secs) {
+  const parts = [];
+  if (n) {
+    const t = m.timings || {};
+    const rate = t.predicted_per_second || (secs > 0.25 ? n / secs : null);
+    parts.push(`${fmt(n)} tokens${rate ? ` · ${fmt(rate, 1)} tok/s` : ""}`);
+    if (t.prompt_n != null && t.prompt_ms) {
+      parts.push(`read ${fmt(t.prompt_n)} new prompt tokens in ${fmt(t.prompt_ms / 1000, 1)} s` +
+                 (t.cache_n ? ` (${fmt(t.cache_n)} reused)` : ""));
+    }
+  }
+  if (m.stopped) parts.push("stopped");
+  const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
+  if (ran) parts.push(`${ran} tool call${ran > 1 ? "s" : ""}`);
+  if (m.limit) parts.push(`stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`);
+  return parts.join(" · ") || (m.stopped ? "Stopped" : "");
+}
+
+const sleepOrVisible = (ms) => new Promise((ok) => {
+  const go = () => { document.removeEventListener("visibilitychange", go); clearTimeout(tm); ok(); };
+  const tm = setTimeout(go, ms);
+  document.addEventListener("visibilitychange", go);
+});
+
+// One answer, streamed: a new one (POST), or - after a page reload - the one still running on the server (resumeJob)
+async function answer(resumeJob = null) {
+  let m;
+  if (resumeJob) {
+    m = messages[messages.length - 1];
+    Object.assign(m, {text: "", reasoning: "", tools: [], error: undefined, meta: undefined, stopped: undefined});
+  } else {
+    m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
+    messages.push(m);
+  }
+  const chat = current;
   renderChat();
-  const el = $("chat").lastElementChild;
+  // the answer on the screen: none while another chat is open (renderChat draws it anew when its chat is opened again)
+  const view = () => (chat === current ? $("chat").querySelector(`.st-msg[data-i="${chat.messages.indexOf(m)}"]`) : null);
   const controller = new AbortController();
-  busy = {controller, msg: m};
+  busy = {controller, msg: m, chat};
   setBusy(true);
 
-  const body = {model: health.model, messages: apiMessages(), stream: true,
-                reasoning_effort: settings.thinking};
-  if (!(settings.temperature > 0)) {
-    body.temperature = 0;
-  } else if (!samplingUntouched(settings)) {
-    Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
-  }
-  if (settings.seed) body.seed = +settings.seed;
-  if (settings.max) body.max_tokens = +settings.max;
-  if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
-  if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
-
-  let firstAt = null, thinkStart = null, usage = null, frame = 0;
-  const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
-  try {
-    const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
-                                                   signal: controller.signal});
-    if (!r.ok) {
-      let msg = `HTTP ${r.status}`;
-      try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-      if (r.status === 401) msg = "This server needs an API key: add it under About > Settings.";
-      throw new Error(msg);
+  let body = null;
+  if (!resumeJob) {
+    body = {model: health.model, messages: apiMessages(), stream: true, reasoning_effort: settings.thinking};
+    if (settings.temperature > 0) {
+      Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p});
+      if (+settings.top_k > 0) body.top_k = +settings.top_k;   // 0: no top-k cut
+      if (+settings.min_p > 0) body.min_p = +settings.min_p;
+    } else {
+      body.temperature = 0;
     }
+    if (settings.seed) body.seed = +settings.seed;
+    if (settings.max) body.max_tokens = +settings.max;
+    if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+    // the server keeps the answer running if this connection drops (a phone's screen sleeping mid-answer, or a reload):
+    // the page reconnects to it by id and carries on from the last chunk it read (strata_resume)
+    body.strata_resume = true;
+  }
+  let firstAt = null, thinkStart = null, usage = null, pending = false, lastPaint = 0, jobId = resumeJob, nRecv = 0, finished = false;
+  let ended = false;                               // a repaint queued while streaming must not land after the end
+  const paint = () => {
+    pending = false;
+    const el = ended ? null : view();
+    if (!el) return;
+    lastPaint = performance.now();
+    updateAssistant(el, m, true);
+    scrollDown();
+  };
+  const schedule = () => {                         // a long answer repaints at most ten times a second
+    if (pending) return;
+    pending = true;
+    const wait = m.text.length > 20000 ? Math.max(0, 100 - (performance.now() - lastPaint)) : 0;
+    setTimeout(() => requestAnimationFrame(paint), wait);
+  };
+  const consume = async (r) => {
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = "";
     for (;;) {
@@ -833,11 +2120,20 @@ async function send() {
         buf = buf.slice(nl + 1);
         if (!line.startsWith("data:")) continue;              // ": keep-alive" comments while a long prompt is read
         const data = line.slice(5).trim();
-        if (data === "[DONE]") continue;
+        if (data === "[DONE]") { finished = true; continue; }
         let j;
         try { j = JSON.parse(data); } catch (e) { continue; }
-        if (j.error) throw new Error(j.error.message || "the engine reported an error");
+        nRecv++;
+        if (j.id && !jobId) {
+          jobId = j.id;
+          busy.job = jobId;
+          m.job = jobId;
+          m.pending = true;
+          saveChat(chat);                                     // a reload can take this answer back up
+        }
+        if (j.error) { finished = true; throw new Error(j.error.message || "the engine reported an error"); }
         if (j.usage) usage = j.usage;
+        if (j.timings) m.timings = j.timings;
         if (j.strata_mcp) onTool(m, j.strata_mcp);
         const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
         const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
@@ -853,57 +2149,154 @@ async function send() {
           if (lastTool && m.text && lastTool.at === m.text.length) m.text += "\n\n";
           m.text += d.content;
         }
-        if (!frame) frame = requestAnimationFrame(paint);
+        schedule();
+      }
+    }
+  };
+  // reconnect to the running answer by id (every 2 s for up to 10 minutes, at once when the page is shown again)
+  const follow = async (gone) => {
+    const t0 = Date.now();
+    setHint(resumeJob ? "Taking the answer back up…" : "Connection lost - reconnecting to the answer…");
+    for (;;) {
+      if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");
+      if (Date.now() - t0 > 600000) throw gone;
+      try {
+        const r2 = await fetch(`v1/strata/stream?id=${encodeURIComponent(jobId)}&from=${nRecv}`,
+                               {headers: headers(false), signal: controller.signal});
+        if (r2.status === 404) throw gone;
+        if (r2.ok) {
+          setHint("");
+          await consume(r2);
+          if (finished) return;
+        }
+      } catch (e2) {
+        if (e2.name === "AbortError" || e2 === gone) throw e2;
+        /* still offline: try again */
+      }
+      await sleepOrVisible(2000);
+    }
+  };
+  const failed = async (r) => {
+    let msg = `HTTP ${r.status}`;
+    try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
+    if (r.status === 401) msg = "This server needs an API key: add it under About > Settings.";
+    return new Error(msg);
+  };
+  try {
+    if (resumeJob) {
+      await follow(new Error("This answer was cut off when the page was reloaded, and the server no longer has it."));
+    } else {
+      const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
+                                                     signal: controller.signal});
+      if (!r.ok) throw await failed(r);
+      try {
+        await consume(r);
+        if (!finished) throw new Error("the connection closed early");
+      } catch (e) {
+        if (e.name === "AbortError" || finished || !jobId) throw e;
+        await follow(e);
       }
     }
   } catch (e) {
     if (e.name === "AbortError") m.stopped = true;
     else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
   }
+  setHint("");
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   const n = usage ? usage.completion_tokens : null;
-  if (n && firstAt) {
-    const secs = (performance.now() - firstAt) / 1000;
-    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
-             (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
-  } else if (m.stopped) {
-    m.meta = "Stopped";
-  }
+  if (usage) m.usage = {prompt: usage.prompt_tokens, completion: usage.completion_tokens,
+                        cached: (usage.prompt_tokens_details || {}).cached_tokens || 0};
   for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") { t.state = "skipped"; t.ms = null; }
-  const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
-  if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${ran} tool call${ran > 1 ? "s" : ""}`;
-  if (m.limit) m.meta = `${m.meta || ""} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`;
+  m.meta = answerMeta(m, n, firstAt ? (performance.now() - firstAt) / 1000 : 0);
+  delete m.pending;
+  delete m.job;
+  if (m._md) m._md = null;
+  ended = true;
   busy = null;
   setBusy(false);
-  if (frame) cancelAnimationFrame(frame);
-  updateAssistant(el, m, false);
-  saveChat();
-  scrollDown();
+  if (chat === current) {
+    const el = view();
+    if (el) updateAssistant(el, m, false);
+    scrollDown();
+    updateCtxMeter();
+  } else {                                         // another chat is open: its last answer can be written again now
+    const last = $("chat").lastElementChild;
+    if (last && last.classList.contains("st-msg--assistant")) updateAssistant(last, messages[+last.dataset.i], false);
+  }
+  saveChat(chat);
+  resumePending();                                 // the open chat's answer cut off by a reload, now that none runs
+}
+// after a reload: an answer the page was streaming when it went away is taken back up from the server
+function resumePending() {
+  const m = messages[messages.length - 1];
+  if (!busy && m && m.role === "assistant" && m.pending && m.job) answer(m.job);
 }
 
+async function send() {
+  const text = $("input").value.trim();
+  if (reloadWatch) { toast("info", "The model is reloading", "Send it once the new context size is loaded."); return; }
+  if ((!text && !attachments.length) || busy) return;
+  if (editIndex != null) messages.splice(editIndex);       // the edited message and every answer after it
+  messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
+                 files: attachments.filter((a) => a.kind === "file"), time: Date.now()});
+  cancelEdit(false);
+  attachments = [];
+  renderAttachments();
+  $("input").value = "";
+  autosize();
+  saveChat();
+  await answer();
+}
+function regenerate() {
+  if (busy || reloadWatch) return;
+  while (messages.length && messages[messages.length - 1].role === "assistant") messages.pop();
+  if (!messages.length) return;
+  answer();
+}
+function editMessage(i) {
+  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  const m = messages[i];
+  editIndex = i;
+  $("input").value = m.text || "";
+  attachments = [...(m.images || []).filter((a) => a.url).map((a) => ({...a, kind: "image"})),
+                 ...(m.files || []).filter((f) => f.text != null).map((f) => ({...f, kind: "file"}))];
+  renderAttachments();
+  $("edit-banner").hidden = false;
+  autosize();
+  $("input").focus();
+  updateCtxMeter();
+}
+function cancelEdit(clear = true) {
+  if (editIndex == null) return;
+  editIndex = null;
+  $("edit-banner").hidden = true;
+  if (clear) { $("input").value = ""; attachments = []; renderAttachments(); autosize(); }
+}
+$("edit-cancel").onclick = () => cancelEdit();
+
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
-$("stop-btn").onclick = () => { if (busy) busy.controller.abort(); };
+function stopAnswer() {
+  if (!busy) return;
+  // the server runs a dropped answer on, so Stop says so explicitly (then the stream ends with it)
+  if (busy.job) fetch("v1/strata/cancel", {method: "POST", headers: headers(true), body: JSON.stringify({id: busy.job})})
+    .catch(() => {});
+  busy.controller.abort();
+}
+$("stop-btn").onclick = stopAnswer;
 $("input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && !matchMedia("(pointer: coarse)").matches) { e.preventDefault(); send(); }
 });
 function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, innerHeight * 0.4)}px`; }
-$("input").addEventListener("input", autosize);
+$("input").addEventListener("input", () => { autosize(); updateCtxMeter(); });
 
-$("new-btn").onclick = () => {
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
-  if (!messages.length) return;
-  const backup = messages;
-  messages = [];
-  saveChat();
-  renderChat();
-  toast("info", "New chat", "The last one was cleared.", 6000, {label: "Undo", run: () => { messages = backup; saveChat(); renderChat(); }});
-};
+$("new-btn").onclick = newChat;
 $("export-btn").onclick = () => {
   if (!messages.length) { toast("info", "Nothing to save yet"); return; }
   const tools = (m) => (m.tools || []).filter((t) => t.result != null).map((t) =>
     `<details><summary>Tool ${t.server ? `${t.server} / ` : ""}${t.tool || t.name}${t.ok ? "" : " (error)"}</summary>\n\n` +
     `\`\`\`json\n${JSON.stringify(t.arguments || {}, null, 2)}\n\`\`\`\n\n\`\`\`\n${t.result}\n\`\`\`\n\n</details>\n\n`).join("");
-  const md = messages.map((m) => m.role === "user" ? `## You\n\n${m.text}\n` :
+  const head = `# ${current.title || titleOf(messages)}\n\n` + (current.system ? `> Instructions: ${current.system.replace(/\n/g, " ")}\n\n` : "");
+  const md = head + messages.map((m) => m.role === "user" ? `## You\n\n${m.text}\n` :
     `## ${health.model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([md], {type: "text/markdown"}));
@@ -963,10 +2356,11 @@ function renderAttachments() {
     const x = document.createElement("button");
     x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", "Remove");
     x.innerHTML = icon("trash");
-    x.onclick = () => { attachments.splice(i, 1); renderAttachments(); };
+    x.onclick = () => { attachments.splice(i, 1); renderAttachments(); updateCtxMeter(); };
     c.appendChild(x);
     box.appendChild(c);
   });
+  updateCtxMeter();
 }
 $("attach-btn").onclick = () => $("file").click();
 // drop files on the chat or the message box
@@ -993,40 +2387,190 @@ $("input").addEventListener("paste", (e) => {
   if (files.length) { e.preventDefault(); addFiles(files); }
 });
 
-// ------------------------------------------------------------------ the sampling drawer
-function openDrawer(open) {
-  $("drawer").dataset.open = String(open);
-  $("drawer").setAttribute("aria-hidden", String(!open));
-  $("scrim").hidden = !open;
-  if (open) { loadDrawer(); loadShared(); loadMcp(); }
+// ------------------------------------------------------------------ the context size (a reload of the model)
+const CTX_STOPS = [4096, 8192, 16384, 32768, 49152, 65536, 98304, 131072, 196608, 262144, 393216, 524288, 786432, 1048576];
+let ctxInfo = null;                   // GET /api/context: the range, the current size, its measured cost, a reload's state
+let ctxStops = [];
+let reloadWatch = null;               // {to}: a reload in progress (the page waits for it)
+async function loadCtxInfo() {
+  try {
+    const r = await fetch("api/context", {headers: headers()});
+    ctxInfo = r.ok ? await r.json() : null;
+  } catch (e) { ctxInfo = null; }
+  if (ctxInfo) {
+    ctxStops = CTX_STOPS.filter((v) => v >= ctxInfo.min && v <= ctxInfo.max);
+    if (!ctxStops.includes(ctxInfo.context)) ctxStops = [...ctxStops, ctxInfo.context].sort((a, b) => a - b);
+  }
+  return ctxInfo;
+}
+// what a context size costs here: the engine's own measurement of the current size, scaled
+function ctxEstimate(n) {
+  // (a streamed cache - KV streaming - keeps a fixed window in VRAM: scaling it by the context would mislead)
+  if (!ctxInfo || !ctxInfo.kv_gb || !ctxInfo.kv_ctx || ctxInfo.kv_resident) return null;
+  const perTok = ctxInfo.kv_gb / ctxInfo.kv_ctx;
+  const est = perTok * n, now = perTok * ctxInfo.context;
+  const expertGb = ctxInfo.vram_gb && ctxInfo.vram_slots ? +ctxInfo.vram_gb / ctxInfo.vram_slots : null;
+  return {gb: est, delta: est - now, experts: expertGb ? Math.round((est - now) / expertGb) : null, vram: +ctxInfo.vram_gb || null};
+}
+function renderCtxField(n) {
+  const field = $("ctx-field");
+  field.hidden = !ctxInfo;
+  if (!ctxInfo) return;
+  const v = n || ctxInfo.context;
+  $("s-ctx").max = String(ctxStops.length - 1);
+  $("s-ctx").value = String(Math.max(0, ctxStops.indexOf(v)));
+  $("s-ctx").disabled = !!reloadWatch;
+  outputsCtx();
+}
+function ctxValue() { return ctxStops[+$("s-ctx").value] || (ctxInfo && ctxInfo.context); }
+function outputsCtx() {
+  if (!ctxInfo) return;
+  const v = ctxValue(), now = ctxInfo.context;
+  $("o-ctx").textContent = `${ctxfmt(v)} tokens${v === now ? " · now" : ""}`;
+  const e = ctxEstimate(v);
+  let text = "How much text the model holds at once: the chat, files, tool output.";
+  if (reloadWatch) text = `Reloading with a ${ctxfmt(reloadWatch.to)} context…`;
+  else if (e) {
+    text = `≈ ${fmt(e.gb, 1)} GB of GPU memory for the context` + (v === now ? "." :
+      e.experts ? ` · about ${fmt(Math.abs(e.experts))} ${e.experts > 0 ? "fewer" : "more"} experts held in VRAM than now` +
+                  `${e.experts > 0 ? " (answers a little slower)" : ""}.` : ".");
+  }
+  $("ctx-est").textContent = text;
+  const warns = [];
+  if (v > 262144) warns.push("Beyond 256K is untested on this engine.");
+  if (e && e.vram && e.gb > e.vram * 0.6) warns.push("That leaves little GPU memory for experts: answers get much slower, and it may not start (the current size then comes back).");
+  if (v !== now) warns.push("Saving reloads the model (1-3 minutes).");
+  $("ctx-warn").hidden = !warns.length;
+  $("ctx-warn").textContent = warns.join(" ");
+}
+$("s-ctx").oninput = outputsCtx;
+async function confirmContext(n) {
+  const e = ctxEstimate(n);
+  const tokens = ctxShown.tokens != null ? ctxShown.tokens : estimateTokens(messages);
+  const parts = [`<p>The engine restarts with a <b>${esc(ctxfmt(n))}</b>-token context (now ${esc(ctxfmt(ctxInfo.context))}). ` +
+                 "That takes about 1-3 minutes.</p>",
+                 "<ul><li>Your chat stays here; the next answer reads it again.</li>" +
+                 "<li>Requests from other apps get a “try again” until the model is back.</li>" +
+                 "<li>If the new size does not fit, the current one comes back by itself.</li>" +
+                 (busy ? "<li>The answer being written finishes first.</li>" : "") + "</ul>"];
+  if (e) parts.push(`<p class="muted">Its cost here: about ${esc(fmt(e.gb, 1))} GB of GPU memory` +
+                    (e.experts ? `, ${esc(fmt(Math.abs(e.experts)))} ${e.experts > 0 ? "fewer" : "more"} experts in VRAM than now.` : ".") + "</p>");
+  if (tokens > n) parts.push(`<p class="ctx-warn">This chat holds about ${esc(fmt(tokens))} tokens: more than the new size, so it will not fit. Start a new chat after the reload, or keep a larger context.</p>`);
+  const ok = await confirmDialog(`Reload the model with a ${ctxfmt(n)} context?`, parts.join(""), `Reload with ${ctxfmt(n)}`);
+  if (!ok) return false;
+  try {
+    const r = await fetch("api/context", {method: "POST", headers: headers(true), body: JSON.stringify({max_context: n})});
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { msg = (await r.json()).error.message || msg; } catch (err) { /* not json */ }
+      throw new Error(msg);
+    }
+  } catch (err) {
+    toast("error", "The context did not change", err.message, 6000);
+    return false;
+  }
+  watchReload(n);
+  return true;
+}
+// a reload in progress: the composer waits, the pill says so, and the page follows it to the end
+async function watchReload(to) {
+  if (reloadWatch) return;
+  reloadWatch = {to: to || (ctxInfo && ctxInfo.reload && ctxInfo.reload.to) || null};
+  setBusy(!!busy);
+  setHint(`Reloading the model${reloadWatch.to ? ` with a ${ctxfmt(reloadWatch.to)} context` : ""}…`);
+  if (lastMetrics) render(lastMetrics);
+  for (;;) {
+    await new Promise((ok) => setTimeout(ok, 2000));
+    const info = await loadCtxInfo();
+    const rl = info && info.reload;
+    if (!info) continue;                           // the server is busy restarting: ask again
+    if (!reloadWatch.to && rl) reloadWatch.to = rl.to;
+    if (rl && (rl.state === "waiting" || rl.state === "running")) { if (lastMetrics) render(lastMetrics); continue; }
+    reloadWatch = null;
+    setHint("");
+    setBusy(!!busy);
+    await loadHealth();
+    if (rl && rl.state === "failed") toast("error", "The context did not change", rl.error || "the engine did not start with it", 9000);
+    else toast("success", "Model reloaded", `It runs with a ${ctxfmt(info.context)} context now.`, 5000);
+    if ($("drawer").dataset.open === "true") renderCtxField();
+    if (lastMetrics) render(lastMetrics);
+    return;
+  }
+}
+
+// ------------------------------------------------------------------ the settings drawer
+let drawerReturn = null, drawerSnapshot = null;
+function formState() {
+  const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
+  return {thinking: sel ? sel.dataset.v : DEFAULTS.thinking, temperature: +$("s-temp").value, top_p: +$("s-topp").value,
+          top_k: +$("s-topk").value, min_p: +$("s-minp").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
+          show: $("s-show").getAttribute("aria-checked") === "true", mcp: $("s-mcp").getAttribute("aria-checked") === "true",
+          share: $("s-share").getAttribute("aria-checked") === "true", system: $("s-system").value,
+          sys_default: $("s-sys-default").getAttribute("aria-checked") === "true", ctx: ctxInfo ? ctxValue() : null};
+}
+async function openDrawer() {
+  drawerReturn = document.activeElement;
+  $("drawer").dataset.open = "true";
+  $("drawer").setAttribute("aria-hidden", "false");
+  $("scrim").hidden = false;
+  $("dirty-bar").hidden = true;
+  loadDrawer();
+  await Promise.all([loadShared(), loadMcp(), loadCtxInfo()]);
+  renderCtxField();
+  loadDrawer();
+  drawerSnapshot = JSON.stringify(formState());
+  $("drawer-close").focus();
+}
+function closeDrawer(force = false) {
+  if ($("drawer").dataset.open !== "true") return;
+  if (!force && drawerSnapshot && JSON.stringify(formState()) !== drawerSnapshot) {
+    $("dirty-bar").hidden = false;                 // changes not saved: ask first
+    $("dirty-save").focus();
+    return;
+  }
+  $("drawer").dataset.open = "false";
+  $("drawer").setAttribute("aria-hidden", "true");
+  $("scrim").hidden = true;
+  $("dirty-bar").hidden = true;
+  if (drawerReturn && drawerReturn.focus) drawerReturn.focus();
 }
 function loadDrawer(s = settings) {
-  for (const b of $("s-thinking").children) b.setAttribute("aria-checked", String(b.dataset.v === s.thinking));
-  $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k;
+  for (const b of $("s-thinking").children) {
+    b.setAttribute("aria-checked", String(b.dataset.v === s.thinking));
+    b.tabIndex = b.dataset.v === s.thinking ? 0 : -1;
+  }
+  $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k; $("s-minp").value = s.min_p || 0;
   $("s-max").value = s.max; $("s-seed").value = s.seed;
   $("s-show").setAttribute("aria-checked", String(!!s.show));
-  $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
-  $("esp-row").hidden = !projectionLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
   $("s-share").setAttribute("aria-checked", String(sharedOn));
+  $("s-system").value = current.system || "";
+  $("s-sys-default").setAttribute("aria-checked", String(!!settings.sys_default));
   outputs();
 }
 // "Use for other apps too": the server keeps these settings as every client's defaults (GET/POST /settings)
-let sharedOn = false;
+let sharedOn = false, sharedNow = null;
 async function loadShared() {
   try {
     const r = await fetch("settings", {headers: headers()});
-    if (r.ok) sharedOn = !!(await r.json()).shared;
+    if (r.ok) { const j = await r.json(); sharedOn = !!j.shared; sharedNow = j.defaults || null; }
   } catch (e) { /* an older server: the switch just stays off */ }
   $("s-share").setAttribute("aria-checked", String(sharedOn));
+  renderShareSub();
+}
+function renderShareSub() {
+  const d = sharedOn && sharedNow ? sharedNow : null;
+  if (!d || !Object.keys(d).length) { $("share-sub").textContent = "API clients get these settings for anything they don't set themselves"; return; }
+  const names = {reasoning_effort: "thinking", temperature: "temperature", top_p: "top-p", top_k: "top-k", min_p: "min-p", seed: "seed", max_tokens: "max tokens"};
+  $("share-sub").textContent = "API clients get now: " + Object.entries(d).map(([k, v]) => `${names[k] || k} ${v}`).join(", ");
 }
 function sharedDefaults(s) {
-  const d = {reasoning_effort: s.thinking};
-  if (!(+s.temperature > 0)) d.temperature = 0;
-  else if (!samplingUntouched(s)) Object.assign(d, {temperature: +s.temperature, top_p: +s.top_p, top_k: +s.top_k});
+  const d = {reasoning_effort: s.thinking, temperature: +s.temperature};
+  if (+s.temperature > 0) Object.assign(d, {top_p: +s.top_p});
+  if (+s.temperature > 0 && +s.top_k > 0) d.top_k = +s.top_k;
+  if (+s.temperature > 0 && +s.min_p > 0) d.min_p = +s.min_p;
   if (s.seed) d.seed = +s.seed;
   if (s.max) d.max_tokens = +s.max;
-  if (projectionLoaded()) d.experimental_speed_projection = s.esp !== false;
   return d;
 }
 async function saveShared(on, s) {
@@ -1037,94 +2581,116 @@ async function saveShared(on, s) {
     try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
     throw new Error(msg);
   }
-  sharedOn = !!(await r.json()).shared;
+  const j = await r.json();
+  sharedOn = !!j.shared;
+  sharedNow = j.defaults || null;
 }
-// the engine was started with the experimental-speed-projection control vector (INFO cvec=...)
-function projectionLoaded() {
-  const c = lastMetrics && lastMetrics.engine ? lastMetrics.engine.cvec : 0;
-  return !!c && c !== "0";
-}
+const PRESETS = {precise: {temperature: 0}, balanced: {temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0},
+                 creative: {temperature: 1.0, top_p: 0.95, top_k: 0, min_p: 0.05}};
 function outputs() {
   const t = +$("s-temp").value;
   $("o-temp").textContent = t === 0 ? "0 · greedy" : t.toFixed(2);
   $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
-  $("o-topk").textContent = $("s-topk").value;
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  $("o-thinking").textContent = sel ? {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v] : "";
-  for (const id of ["s-topp", "s-topk"]) $(id).disabled = t === 0;
+  $("o-thinking").textContent = sel ? {none: "answers right away", low: "a short think", high: "thinks it through",
+                                       max: "the most thorough, the longest"}[sel.dataset.v] +
+    (sel.dataset.v === DEFAULTS.thinking ? " (default)" : "") : "";
+  $("o-topk").textContent = +$("s-topk").value > 0 ? $("s-topk").value : "off";
+  $("o-minp").textContent = +$("s-minp").value > 0 ? (+$("s-minp").value).toFixed(2) : "off";
+  for (const id of ["s-topp", "s-topk", "s-minp"]) $(id).disabled = t === 0;
+  // the preset these values match, if any
+  const f = {temperature: t, top_p: +$("s-topp").value, top_k: +$("s-topk").value, min_p: +$("s-minp").value};
+  for (const b of $("s-preset").children) {
+    const p = PRESETS[b.dataset.p];
+    b.setAttribute("aria-pressed", String(Object.entries(p).every(([k, v]) => (k === "temperature" || t > 0) && Math.abs(f[k] - v) < 1e-9)));
+  }
 }
-for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
-for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
-$("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
-$("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
-$("s-mcp").onclick = () => $("s-mcp").setAttribute("aria-checked", String($("s-mcp").getAttribute("aria-checked") !== "true"));
-$("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($("s-share").getAttribute("aria-checked") !== "true"));
-$("s-reset").onclick = () => loadDrawer(DEFAULTS);
-$("s-apply").onclick = async () => {
-  const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  settings = {thinking: sel ? sel.dataset.v : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
-              top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
-              show: $("s-show").getAttribute("aria-checked") === "true",
-              esp: $("s-esp").getAttribute("aria-checked") === "true",
-              mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
-  store.set("sampling", settings);
-  const share = $("s-share").getAttribute("aria-checked") === "true";
-  openDrawer(false);
-  if (share || sharedOn) {
+for (const b of $("s-preset").children) b.onclick = () => {
+  const p = PRESETS[b.dataset.p];
+  if (p.temperature !== undefined) $("s-temp").value = p.temperature;
+  if (p.top_p !== undefined) $("s-topp").value = p.top_p;
+  if (p.top_k !== undefined) $("s-topk").value = p.top_k;
+  if (p.min_p !== undefined) $("s-minp").value = p.min_p;
+  outputs();
+};
+function selectThinking(b) {
+  for (const x of $("s-thinking").children) { x.setAttribute("aria-checked", String(x === b)); x.tabIndex = x === b ? 0 : -1; }
+  outputs();
+}
+for (const b of $("s-thinking").children) b.onclick = () => selectThinking(b);
+// a radio group: the arrow keys move the choice
+$("s-thinking").addEventListener("keydown", (e) => {
+  if (!["ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+  e.preventDefault();
+  const items = [...$("s-thinking").children];
+  const i = items.findIndex((x) => x.getAttribute("aria-checked") === "true");
+  const next = items[(i + (e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length];
+  selectThinking(next);
+  next.focus();
+});
+for (const id of ["s-temp", "s-topp", "s-topk", "s-minp"]) $(id).oninput = outputs;
+for (const id of ["s-show", "s-mcp", "s-share", "s-sys-default"]) {
+  $(id).onclick = () => $(id).setAttribute("aria-checked", String($(id).getAttribute("aria-checked") !== "true"));
+}
+$("s-reset").onclick = () => { loadDrawer({...DEFAULTS, system: current.system}); renderCtxField(); };
+async function applySettings() {
+  const f = formState();
+  settings = {thinking: f.thinking, temperature: f.temperature, top_p: f.top_p, top_k: f.top_k, min_p: f.min_p, max: f.max,
+              seed: f.seed, show: f.show, mcp: f.mcp, sys_default: f.sys_default,
+              system: f.sys_default ? f.system : settings.system || ""};
+  store.set(samplingKey, settings);
+  current.system = f.system;
+  if (messages.length) saveChat();
+  closeDrawer(true);
+  let note = settings.temperature === 0 ? "Greedy: the same question gives the same answer." : "";
+  if (f.share || sharedOn) {
     try {
-      await saveShared(share, settings);
-      toast("success", "Sampling saved", share ? "Other apps (omp, API clients) use these settings from their next request."
-                                               : "Other apps use their own settings again.");
+      await saveShared(f.share, settings);
+      note = f.share ? "Other apps (API clients) use these settings from their next request." : "Other apps use their own settings again.";
     } catch (e) {
       toast("error", "Saved here, but not for other apps", e.message, 6000);
+      note = null;
     }
+  }
+  if (note !== null) toast("success", "Settings saved", note);
+  if (ctxInfo && f.ctx && f.ctx !== ctxInfo.context) await confirmContext(f.ctx);
+}
+$("s-apply").onclick = applySettings;
+$("dirty-save").onclick = applySettings;
+$("dirty-discard").onclick = () => closeDrawer(true);
+$("sampling-btn").onclick = openDrawer;
+$("drawer-close").onclick = () => closeDrawer();
+$("scrim").onclick = () => closeDrawer();
+
+// ------------------------------------------------------------------ the keyboard
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Tab") {
+    if (!$("modal").hidden) trapTab(e, $("modal-box"));
+    else if ($("drawer").dataset.open === "true") trapTab(e, $("drawer"));
     return;
   }
-  toast("success", "Sampling saved", settings.temperature === 0 ? "Greedy: the same question gives the same answer." : "");
-};
-$("sampling-btn").onclick = () => openDrawer(true);
-$("drawer-close").onclick = () => openDrawer(false);
-$("scrim").onclick = () => openDrawer(false);
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
+  if (e.key === "Escape") {
+    if (!$("modal").hidden) { closeModal(); return; }
+    if ($("drawer").dataset.open === "true") { closeDrawer(); return; }
+    if (document.body.classList.contains("chats-open")) { showChats(false); return; }
+    if (editIndex != null) { cancelEdit(); return; }
+    if (busy && busy.chat === current) { stopAnswer(); return; }
+  }
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "O" || e.key === "o")) { e.preventDefault(); newChat(); }
+});
 
 // ------------------------------------------------------------------ start
 setBusy(false);
-renderChat();
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
+loadChats().then(() => {
+  renderChat();
+  renderChatList();
+  return loadHealth();
+}).then(loadMcp).then(() => {
+  loadUpdate();                                    // (the About tab's dot when a new version is out)
+  resumePending();
+  if (startQuestion) { if (messages.length) openChat(newChatObj()); $("input").value = startQuestion; send(); }
+});
 poll();
-
-// ------------------------------------------------------------------ images (POST /v1/images/generations)
-$("img-form").onsubmit = async (ev) => {
-  ev.preventDefault();
-  const prompt = $("img-prompt").value.trim();
-  if (!prompt) return;
-  const body = {prompt, size: $("img-size").value, response_format: "b64_json"};
-  if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
-  $("img-go").disabled = true;
-  const t0 = performance.now();
-  $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
-  try {
-    const r = await fetch("v1/images/generations", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
-    const j = await r.json();
-    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
-    for (const d of j.data) {
-      const fig = document.createElement("figure");
-      const img = document.createElement("img");
-      img.src = "data:image/png;base64," + d.b64_json;
-      img.alt = prompt;
-      const cap = document.createElement("figcaption");
-      cap.textContent = `${j.size}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
-      fig.append(img, cap);
-      $("img-results").prepend(fig);
-    }
-    $("img-hint").textContent = "Done. Right-click an image to save it.";
-  } catch (e) {
-    $("img-hint").textContent = "";
-    toast("error", "No image", String(e.message || e), 8000);
-  } finally {
-    $("img-go").disabled = false;
-  }
-};

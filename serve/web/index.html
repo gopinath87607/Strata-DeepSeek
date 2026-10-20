@@ -1,41 +1,72 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Strata</title>
-<link rel="icon" href="web/favicon.svg" type="image/svg+xml">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#090a14">
+<title>Strata-DeepSeek</title>
+<link rel="manifest" href="web/manifest.webmanifest">
+<link rel="icon" href="web/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="web/tokens.css">
 <link rel="stylesheet" href="web/components.css">
 <link rel="stylesheet" href="web/app.css">
 <script>
-  // the theme before the first paint: the saved choice, else the system's
+  // the theme before the first paint: the saved choice, else dark (the default).  "maya.ui-theme": a choice
+  // saved under the paper skin ("maya.theme") does not carry over
   try {
-    const t = localStorage.getItem("strata.theme") ||
-      (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    const t = localStorage.getItem("maya.ui-theme") || "dark";
     document.documentElement.dataset.theme = t;
   } catch (e) {}
 </script>
 </head>
 <body>
-<header class="st-header">
-  <span class="st-header__brand">Strata</span>
+<!-- the gradient the context ring is drawn with -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs><linearGradient id="maya-grad" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="var(--st-accent)"/><stop offset="1" stop-color="var(--st-accent-2)"/></linearGradient></defs>
+</svg>
+
+<div class="shell">
+<!-- ============================ Sidebar ============================ -->
+<aside class="side">
+  <div class="brand">
+    <span class="maya-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M9 4.5h6v3H9z" fill="currentColor" opacity=".95"/>
+        <path d="M6.5 9h11v3.5h-11z" fill="currentColor" opacity=".8"/><path d="M4 14h16v4.5H4z" fill="currentColor" opacity=".65"/></svg>
+    </span>
+    <span class="brand__text"><span class="brand__name">Strata-DeepSeek</span><span class="brand__sub">DeepSeek V4.1</span></span>
+  </div>
+  <button class="st-btn st-btn--icon chats-toggle" id="chats-toggle" title="Chats" aria-label="Chats" aria-controls="chats" aria-expanded="false">
+    <svg class="st-icon"><use href="web/sprite.svg#i-menu"/></svg></button>
   <nav class="st-tabs" role="tablist" aria-label="Views">
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
-    <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" hidden>
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg>Images</button>
+      <svg class="st-icon"><use href="web/sprite.svg#i-chat"/></svg><span>Chat</span></button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
+      <svg class="st-icon"><use href="web/sprite.svg#i-activity"/></svg><span>Monitor</span></button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
+      <svg class="st-icon"><use href="web/sprite.svg#i-info"/></svg><span>About</span>
+      <i class="tab-dot" id="about-dot" hidden title="A new version is available"></i></button>
   </nav>
-  <span class="st-header__spacer"></span>
-  <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
-    <span class="st-pill__dot"></span><span id="pill-text">Connecting&hellip;</span></span>
-  <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark">
-    <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
-</header>
+  <!-- the chats: in the sidebar on wide screens, a panel from the left on narrow ones -->
+  <section class="chats" id="chats" aria-label="Chats">
+    <div class="chats__head">
+      <span class="chats__title">Chats</span>
+      <button class="st-btn st-btn--icon" id="chats-new" title="New chat (Ctrl+Shift+O)" aria-label="New chat">
+        <svg class="st-icon"><use href="web/sprite.svg#i-plus"/></svg></button>
+    </div>
+    <label class="chats__search"><svg class="st-icon st-icon--sm" aria-hidden="true"><use href="web/sprite.svg#i-search"/></svg>
+      <input id="chats-search" type="search" placeholder="Search chats" aria-label="Search chats" autocomplete="off"></label>
+    <div class="chats__list" id="chats-list" role="list"></div>
+  </section>
+  <div class="side__model" id="side-model"></div>
+  <div class="side__foot">
+    <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
+      <span class="st-pill__dot"></span><span id="pill-text">Connecting&hellip;</span></span>
+    <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark">
+      <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-sun"/></svg></button>
+  </div>
+</aside>
+<div class="scrim scrim--chats" id="chats-scrim" hidden></div>
 
 <main>
   <!-- ============================ Chat ============================ -->
@@ -43,28 +74,50 @@
     <div class="chat-scroll" id="chat-scroll">
       <div class="chat" id="chat">
         <div class="chat-empty" id="chat-empty">
-          <div class="chat-empty__title">Ask anything</div>
-          <div class="chat-empty__sub" id="chat-empty-sub">The model runs on this PC. Nothing leaves it.</div>
+          <span class="maya-mark maya-mark--xl" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M9 4.5h6v3H9z" fill="currentColor" opacity=".95"/>
+              <path d="M6.5 9h11v3.5h-11z" fill="currentColor" opacity=".8"/><path d="M4 14h16v4.5H4z" fill="currentColor" opacity=".65"/></svg>
+          </span>
+          <div class="chat-empty__title">What are we building today?</div>
+          <div class="chat-empty__sub" id="chat-empty-sub">Runs on this machine. Nothing leaves it.</div>
+          <div class="chat-empty__model muted small" id="chat-empty-model"></div>
+          <div class="suggestions" id="suggestions">
+            <button type="button" class="suggestion" data-q="Write a single-file HTML page with a three.js scene: a slowly rotating, softly lit crystal on a dark background, with orbit controls.">A three.js scene in one HTML file</button>
+            <button type="button" class="suggestion" data-q="Explain step by step what this code does, then suggest two improvements:&#10;&#10;```&#10;&#10;```">Explain and improve some code</button>
+            <button type="button" class="suggestion" data-q="Plan a small Python command-line tool that renames photos by the date they were taken. List the steps, then write it.">Plan and write a small tool</button>
+            <button type="button" class="suggestion" data-q="Summarize the key ideas of mixture-of-experts language models for a curious engineer, in five short paragraphs.">Explain a topic clearly</button>
+          </div>
         </div>
       </div>
     </div>
+    <button type="button" class="st-btn st-btn--secondary jump-latest" id="jump-latest" hidden>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-arrow-down"/></svg>Latest</button>
     <div class="composer-wrap">
       <form class="st-composer" id="composer">
+        <div class="edit-banner" id="edit-banner" hidden>
+          <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-edit"/></svg>
+          <span>Editing a message: sending it replaces the answers after it.</span>
+          <button type="button" class="st-btn st-btn--secondary st-btn--sm" id="edit-cancel">Cancel</button>
+        </div>
         <div class="attachments" id="attachments" hidden></div>
-        <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message"></textarea>
+        <textarea id="input" rows="2" placeholder="Message DeepSeek&hellip;" aria-label="Message"></textarea>
         <div class="st-composer__bar">
           <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file">
             <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
           <input type="file" id="file" multiple hidden>
-          <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat" aria-label="New chat">
+          <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat (Ctrl+Shift+O)" aria-label="New chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
-          <button type="button" class="st-btn st-btn--icon" id="sampling-btn" title="Sampling and thinking" aria-label="Sampling and thinking">
+          <button type="button" class="st-btn st-btn--icon" id="sampling-btn" title="Settings: context, instructions, sampling" aria-label="Settings">
             <svg class="st-icon"><use href="web/sprite.svg#i-settings"/></svg></button>
           <span class="spacer"></span>
+          <span class="ctx-meter" id="ctx-meter" hidden>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><circle class="ctx-meter__track" cx="10" cy="10" r="8"/>
+              <circle class="ctx-meter__fill" id="ctx-ring" cx="10" cy="10" r="8" pathLength="100" stroke-dasharray="0 100"/></svg>
+            <span id="ctx-text"></span></span>
           <span class="composer-hint" id="composer-hint"></span>
-          <button type="button" class="st-btn st-btn--secondary" id="stop-btn" hidden>
+          <button type="button" class="st-btn st-btn--secondary" id="stop-btn" hidden title="Stop (Esc)">
             <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-stop"/></svg>Stop</button>
           <button type="submit" class="st-btn st-btn--primary st-btn--send" id="send-btn" aria-label="Send">
             <svg class="st-icon"><use href="web/sprite.svg#i-send"/></svg></button>
@@ -73,99 +126,224 @@
     </div>
   </section>
 
-  <!-- ============================ Images ============================ -->
-  <section class="view view--images" id="view-images" role="tabpanel" aria-labelledby="tab-btn-images" hidden>
-    <div class="about">
-      <form class="st-card img-form" id="img-form">
-        <span class="card-title" id="img-title">Make an image</span>
-        <textarea class="st-input img-prompt" id="img-prompt" rows="3" placeholder="Describe the image&hellip;" aria-label="Prompt"></textarea>
-        <div class="img-row">
-          <label class="st-field">Size
-            <select class="st-input" id="img-size">
-              <option>1024x1024</option><option>1536x1024</option><option>1024x1536</option>
-              <option>768x768</option><option>512x512</option></select></label>
-          <label class="st-field">Seed
-            <input class="st-input" id="img-seed" type="number" min="0" placeholder="random"></label>
-          <button type="submit" class="st-btn st-btn--primary" id="img-go">Generate</button>
-        </div>
-        <span class="composer-hint" id="img-hint">One image at a time; a chat request waits for it (and the other way round).</span>
-      </form>
-      <div class="img-results" id="img-results"></div>
-    </div>
-  </section>
-
   <!-- ============================ Monitor ============================ -->
   <section class="view view--monitor" id="view-monitor" role="tabpanel" aria-labelledby="tab-btn-monitor" hidden>
     <div class="monitor">
-      <div class="st-card state-card">
-        <div class="state-card__head">
-          <span class="card-title">Model state</span>
-          <span class="badges" id="state-badges">
-            <span class="st-badge" data-s="idle">Idle</span>
-            <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
-            <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
-            <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
-            <span class="st-badge st-badge--error" data-s="error">Error</span>
-          </span>
-        </div>
-        <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
-        <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+      <div class="page-head">
+        <div><h1 class="page-title">Monitor</h1><p class="muted page-sub" id="mon-sub">Live view of the model, its experts and the hardware</p></div>
+      </div>
+      <div class="banners" id="banners"></div>
+
+      <!-- the Monitor's own tabs: each appears only when the engine reports what it shows (app.js renderMonitorTabs) -
+           two GPUs or ten, a drafter or none, a page of tabs the engine's own facts fill, never empty ones -->
+      <div class="st-tabs mtabbar" id="monitor-tabs" role="tablist" aria-label="Monitor views">
+        <button class="st-tab" role="tab" data-mtab="overview" aria-selected="true">
+          <svg class="st-icon"><use href="web/sprite.svg#i-activity"/></svg><span>Overview</span></button>
+        <button class="st-tab" role="tab" data-mtab="gpus" aria-selected="false" hidden>
+          <svg class="st-icon"><use href="web/sprite.svg#i-gpu"/></svg><span>GPUs</span><span class="mtab__v" id="mtab-v-gpus"></span></button>
+        <button class="st-tab" role="tab" data-mtab="lend" aria-selected="false" hidden>
+          <svg class="st-icon"><use href="web/sprite.svg#i-experts"/></svg><span>Loan</span><span class="mtab__v" id="mtab-v-lend"></span></button>
+        <button class="st-tab" role="tab" data-mtab="prefill" aria-selected="false" hidden>
+          <svg class="st-icon"><use href="web/sprite.svg#i-bolt"/></svg><span>Prefill</span><span class="mtab__v" id="mtab-v-prefill"></span></button>
+        <button class="st-tab" role="tab" data-mtab="storage" aria-selected="false" hidden>
+          <svg class="st-icon"><use href="web/sprite.svg#i-disk"/></svg><span>Storage</span><span class="mtab__v" id="mtab-v-storage"></span></button>
+        <button class="st-tab" role="tab" data-mtab="engram" aria-selected="false" hidden>
+          <svg class="st-icon"><use href="web/sprite.svg#i-layers"/></svg><span>Engram</span><span class="mtab__v" id="mtab-v-engram"></span></button>
+        <button class="st-tab" role="tab" data-mtab="draft" aria-selected="false" hidden>
+          <svg class="st-icon"><use href="web/sprite.svg#i-thinking"/></svg><span>Draft</span><span class="mtab__v" id="mtab-v-draft"></span></button>
       </div>
 
-      <div class="metrics" id="metrics">
-        <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
-      </div>
-
-      <div class="monitor-row">
-        <div class="st-card ctx-card">
-          <span class="card-title">Context fill</span>
-          <div class="ctx-gauge">
-            <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
-              <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"
-                      stroke-dasharray="235.6 314.2" transform="rotate(135 60 60)"/>
-              <circle class="st-gauge__fill" id="ctx-fill" cx="60" cy="60" r="50" fill="none" stroke-width="10"
-                      stroke-linecap="round" stroke-dasharray="0 314.2" transform="rotate(135 60 60)"/>
-            </svg>
-            <div class="ctx-gauge__label"><span class="ctx-gauge__pct" id="ctx-pct">0%</span><span class="muted" id="ctx-sub">&ndash;</span></div>
+      <div class="mpanel" id="mpanel-overview" role="tabpanel" aria-label="Overview">
+      <!-- hero: what the model is doing right now -->
+      <div class="st-card hero">
+        <div class="hero__top">
+          <div class="hero__speed">
+            <span class="hero__label">Throughput</span>
+            <div class="hero__speeds">
+              <div class="hero__rate">
+                <span class="hero__value"><span id="hero-speed">&ndash;</span><small>tok/s</small></span>
+                <span class="muted hero__speed-sub" id="hero-speed-sub">decode &middot; waiting for a request</span>
+              </div>
+              <div class="hero__rate hero__rate--prefill" title="Prompt tokens read per second (the prefill), counting only the tokens read - not the ones reused from the conversation cache">
+                <span class="hero__value"><span id="hero-prefill">&ndash;</span><small>tok/s</small></span>
+                <span class="muted hero__speed-sub" id="hero-prefill-sub">prefill</span>
+              </div>
+            </div>
           </div>
-          <div class="bar-row"><span>Experts in VRAM</span><span class="muted" id="slots-text">&ndash;</span></div>
-          <div class="st-progress"><div class="st-progress__bar" id="slots-bar" style="width:0%"></div></div>
-          <div class="bar-row"><span>System RAM</span><span class="muted" id="ram-text">&ndash;</span></div>
-          <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div>
-          <div class="bar-row"><span>GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
-          <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="temp-bar" style="width:0%"></div></div>
+          <div class="hero__state">
+            <div class="state-card__row"><span class="st-badge state-badge" id="state-badge" data-s="idle">Idle</span>
+              <span class="muted" id="state-detail">waiting for a request</span></div>
+            <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+          </div>
         </div>
-        <div class="st-card req-card">
-          <div class="req-head"><span class="card-title">Recent requests</span>
-            <button class="st-btn st-btn--secondary" id="req-all" hidden>Show all</button></div>
+        <div class="spark-wrap" id="hero-spark-wrap">
+          <svg class="hero__spark" id="hero-spark" viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true">
+            <defs><linearGradient id="hero-fill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="var(--st-accent)" stop-opacity=".35"/><stop offset="1" stop-color="var(--st-accent)" stop-opacity="0"/></linearGradient></defs>
+            <path class="area" fill="url(#hero-fill)"/><path class="line" fill="none" stroke="var(--st-accent)" stroke-width="1.8"
+              stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+            <g id="hero-spark-prefill" class="hero__spark-prefill"><path class="area" fill="currentColor" opacity=".10"/>
+              <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 2" stroke-linejoin="round"
+              stroke-linecap="round" vector-effect="non-scaling-stroke"/></g></svg>
+          <span class="spark-empty muted small">No activity in the last minute</span>
+        </div>
+        <div class="hero__stats">
+          <div class="kv"><span class="kv__k">Time per token</span><span class="kv__v" id="hero-ms">&ndash;</span></div>
+          <div class="kv"><span class="kv__k">VRAM hit</span><span class="kv__v" id="hero-hit">&ndash;</span></div>
+          <div class="kv" title="Prompt and answer tokens of the request running now, else of the last one - against the model's context size"><span class="kv__k" id="hero-ctx-k">Context of the last request</span><span class="kv__v" id="hero-ctx">&ndash;</span></div>
+          <div class="kv"><span class="kv__k">Requests served</span><span class="kv__v" id="hero-req">&ndash;</span></div>
+        </div>
+      </div>
+
+      <!-- the expert tiers (the engine's STAT lines): shown only when the engine reports them -->
+      <div class="st-card tiers-card" id="tiers-card" hidden>
+        <div class="card-head">
+          <span class="card-title">Where the experts live</span>
+          <span class="muted small" id="tiers-sub"></span>
+        </div>
+        <div class="tierbar" id="tierbar" aria-label="Experts by tier">
+          <span class="tierbar__seg tierbar__seg--vram" id="tierbar-vram" style="width:0%"></span>
+          <span class="tierbar__seg tierbar__seg--ram" id="tierbar-ram" style="width:0%"></span>
+          <span class="tierbar__seg tierbar__seg--disk" id="tierbar-disk" style="width:0%"></span>
+        </div>
+        <div class="tierlegend">
+          <div class="tierlegend__item"><i class="dot dot--vram"></i><span>VRAM</span><b id="tier-vram-text">&ndash;</b></div>
+          <div class="tierlegend__item"><i class="dot dot--ram"></i><span id="tier-ram-label">Pinned RAM</span><b id="tier-ram-text">&ndash;</b></div>
+          <div class="tierlegend__item" id="tier-disk-item"><i class="dot dot--disk"></i><span>SSD only</span><b id="tier-disk-text">&ndash;</b></div>
+        </div>
+        <div class="metrics metrics--tiers" id="tiers"></div>
+        <p class="tier-advice muted small" id="tier-advice" hidden></p>
+      </div>
+
+      <div class="section-title">Hardware</div>
+      <div class="metrics" id="metrics">
+        <!-- filled by app.js: the GPU row (active, VRAM, power, temperature), the host row (PCIe, CPU, RAM, disk) -->
+      </div>
+
+      <div class="st-card req-card">
+          <div class="card-head"><span class="card-title">Recent requests</span>
+            <button class="st-btn st-btn--secondary st-btn--sm" id="req-all" hidden>Show all</button></div>
           <div class="table-wrap" id="req-wrap">
             <table class="st-table">
-              <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Output</th>
-                <th class="num" title="New prompt tokens per second, excluding reused cache tokens (engine prompt time)">Prefill t/s</th><th class="num">Decode t/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th><th class="num">Duration</th></tr></thead>
+              <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num" title="Prompt tokens the conversation cache already held">Reused</th>
+                <th class="num" title="Prompt tokens read per second (the reused ones not counted)">Prefill</th><th class="num">Output</th>
+                <th class="num" title="Answer tokens written per second">Decode</th><th class="num" title="While writing the answer: the share of the routed experts that were already in VRAM">VRAM hit</th><th class="num">Duration</th></tr></thead>
               <tbody id="req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
             </table>
           </div>
           <p class="muted req-totals" id="req-totals"></p>
-        </div>
       </div>
 
-      <div class="st-card cc-card" id="cc-card">
-        <div class="req-head"><span class="card-title">Conversation cache</span><span class="muted small" id="cc-sum"></span></div>
-        <div class="cc-bars" id="cc-bars" hidden>
-          <div><div class="bar-row"><span>Parked conversations</span><span class="muted" id="cc-slots-text">&ndash;</span></div>
-            <div class="st-progress"><div class="st-progress__bar" id="cc-slots-bar" style="width:0%"></div></div></div>
-          <div><div class="bar-row"><span>Their memory (RAM)</span><span class="muted" id="cc-mem-text">&ndash;</span></div>
-            <div class="st-progress"><div class="st-progress__bar" id="cc-mem-bar" style="width:0%"></div></div></div>
-        </div>
-        <dl class="facts" id="cc-facts"></dl>
-        <p class="muted small cc-note" id="cc-note"></p>
+      <div class="st-card trouble-card">
+        <div class="card-head"><span class="card-title">Troubleshooting</span>
+          <span class="trouble-actions">
+            <button class="st-btn st-btn--secondary st-btn--sm" id="report-show" type="button">Show engine log</button>
+            <button class="st-btn st-btn--primary st-btn--sm" id="report-copy" type="button">
+              <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-report"/></svg>Copy report</button></span></div>
+        <p class="muted small trouble-note">A report for a GitHub issue: the versions, this PC, the engine's settings and the
+          telling lines of its log (no API key). Read it before you share it.</p>
+        <pre class="report-pre" id="report-pre" hidden></pre>
       </div>
 
       <div class="st-card mcp-card" id="mcp-card" hidden>
-        <div class="req-head"><span class="card-title">MCP servers</span><span class="muted small" id="mcp-sum"></span></div>
+        <div class="card-head"><span class="card-title">MCP servers</span><span class="muted small" id="mcp-sum"></span></div>
         <div class="mcp-list" id="mcp-list"></div>
-        <p class="muted small mcp-note">Their tools run on this PC with your rights, when the model decides to call them
-          (in this page's chat only; switch it off in Sampling).</p>
+        <p class="muted small mcp-note">Their tools run on this machine with your rights, when the model decides to call them
+          (in this page's chat only; switch it off in Settings).</p>
+      </div>
+      </div>
+
+      <!-- the split, card by card: the engine's own LEND lines (app.js renderGpuPanel) -->
+      <div class="mpanel" id="mpanel-gpus" role="tabpanel" aria-label="GPUs" hidden>
+        <div class="st-card gpus-card" id="gpus-card" hidden>
+          <div class="card-head">
+            <span class="card-title">The split, card by card</span>
+            <span class="muted small" id="gpus-sub"></span>
+          </div>
+          <div class="gpus-list" id="gpus-list"></div>
+          <p class="muted small gpus-note">Each card as the engine reports it: the layers on it, the experts it holds for
+            good, the drafter's and the trunk's slots its prompt arena lends between prompts, and the chunk its prompt
+            path takes. The page sums whatever the engine reports.</p>
+        </div>
+
+        <!-- the GPUs: what fills each (the GLM engine's VRAM lines and NVML's processes) and, with several, each one's load,
+             power, temperature and PCIe link.  A row a GPU, the parts' colours once above them, a row's own parts when
+             opened; an engine without VRAM lines: NVML's memory only, from five GPUs (app.js renderGpuMap) -->
+        <div class="st-card gpumap-card" id="gpumap-card" hidden>
+          <div class="card-head">
+            <span class="card-title" id="gpumap-title">What fills the GPU</span>
+            <span class="muted small" id="gpumap-sub"></span>
+          </div>
+          <div class="gpukey" id="gpukey" hidden></div>
+          <div class="gpurows" id="gpurows"></div>
+          <p class="gpumap-now muted small" id="gpumap-now" hidden></p>
+          <p class="tier-advice muted small" id="gpumap-advice" hidden></p>
+          <div class="gpubar-tip" id="gpubar-tip" role="tooltip" hidden></div>
+        </div>
+      </div>
+
+      <!-- lending and borrowing: the arena's experts between prompts, the prompt's buffers during one (renderLendPanel) -->
+      <div class="mpanel" id="mpanel-lend" role="tabpanel" aria-label="Loan" hidden>
+        <div class="st-card lend-card" id="lend-card" hidden>
+          <div class="card-head">
+            <span class="card-title">Lending and borrowing</span>
+            <span class="muted small" id="lend-sub"></span>
+          </div>
+          <div class="metrics metrics--tiers metrics--four" id="lend-metrics"></div>
+          <div class="lend-rows" id="lend-rows"></div>
+          <p class="muted small lend-note">While the model reads a prompt its expert banks are lent back to the prompt:
+            the same bytes are the chunk buffers, then experts again. The engine's own report, summed over whatever
+            cards it found.</p>
+        </div>
+      </div>
+
+      <!-- reading a prompt: the engine's chunk per card, its path and the rate (renderPrefillPanel) -->
+      <div class="mpanel" id="mpanel-prefill" role="tabpanel" aria-label="Prefill" hidden>
+        <div class="st-card prefill-card" id="prefill-card" hidden>
+          <div class="card-head">
+            <span class="card-title">Reading a prompt</span>
+            <span class="muted small" id="prefill-sub"></span>
+          </div>
+          <div class="metrics metrics--tiers metrics--four" id="prefill-metrics"></div>
+          <div class="table-wrap" id="prefill-chunks"></div>
+          <p class="muted small prefill-note" id="prefill-note"></p>
+        </div>
+      </div>
+
+      <!-- the model on the disk: its folder, the free space, the SSD reads a token costs (renderStoragePanel) -->
+      <div class="mpanel" id="mpanel-storage" role="tabpanel" aria-label="Storage" hidden>
+        <div class="st-card storage-card" id="storage-card" hidden>
+          <div class="card-head">
+            <span class="card-title">The model on the disk</span>
+            <span class="muted small" id="storage-sub"></span>
+          </div>
+          <div class="metrics metrics--tiers metrics--four" id="storage-metrics"></div>
+          <p class="muted small storage-note" id="storage-note"></p>
+        </div>
+      </div>
+
+      <!-- the n-gram memory (Engram): its layers, lookups and read time (renderEngramPanel) -->
+      <div class="mpanel" id="mpanel-engram" role="tabpanel" aria-label="Engram" hidden>
+        <div class="st-card engram-card" id="engram-card" hidden>
+          <div class="card-head">
+            <span class="card-title">The n-gram memory (Engram)</span>
+            <span class="muted small" id="engram-sub"></span>
+          </div>
+          <div class="metrics metrics--tiers metrics--four" id="engram-metrics"></div>
+          <p class="muted small engram-note" id="engram-note"></p>
+        </div>
+      </div>
+
+      <!-- speculative decoding (DSpark): its block, acceptance and time a token (renderDraftPanel) -->
+      <div class="mpanel" id="mpanel-draft" role="tabpanel" aria-label="Draft" hidden>
+        <div class="st-card draft-card" id="draft-card" hidden>
+          <div class="card-head">
+            <span class="card-title">Speculative decoding (DSpark)</span>
+            <span class="muted small" id="draft-sub"></span>
+          </div>
+          <div class="metrics metrics--tiers metrics--four" id="draft-metrics"></div>
+          <p class="muted small draft-note" id="draft-note"></p>
+        </div>
       </div>
     </div>
   </section>
@@ -173,53 +351,80 @@
   <!-- ============================ About ============================ -->
   <section class="view view--about" id="view-about" role="tabpanel" aria-labelledby="tab-btn-about" hidden>
     <div class="about">
-      <div class="st-card">
-        <span class="card-title">Model and engine</span>
-        <dl class="facts" id="facts-engine"></dl>
+      <div class="page-head">
+        <div><h1 class="page-title">About</h1><p class="muted page-sub">The model, this machine, and how to connect your tools</p></div>
       </div>
-      <div class="st-card">
-        <span class="card-title">This PC</span>
-        <dl class="facts" id="facts-hw"></dl>
-      </div>
-      <div class="st-card">
-        <span class="card-title">Connect your tools</span>
-        <p class="muted">Any OpenAI- or Anthropic-compatible client works with these addresses.</p>
-        <dl class="facts" id="facts-api"></dl>
-      </div>
-      <div class="st-card">
-        <span class="card-title">Settings</span>
-        <div class="st-field">
-          <label class="st-label" for="api-key">API key <output>only if the server was started with one</output></label>
-          <input class="st-input" id="api-key" type="password" autocomplete="off" placeholder="Not needed">
+      <div class="update-card" id="update-card" hidden aria-live="polite"></div>
+      <div class="about-grid">
+        <div class="st-card about-engine">
+          <span class="card-title">Model and engine</span>
+          <dl class="facts" id="facts-engine"></dl>
         </div>
-        <div class="toggle-row"><span>Dark theme</span>
-          <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme"></button></div>
-        <p class="muted small">Chats, settings and the key are kept in this browser only.
-          <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata on GitHub</a></p>
-      </div>
-      <div class="st-card cfg-card" id="cfg-card" hidden>
-        <div class="req-head"><span class="card-title">Model settings</span><span class="muted small" id="cfg-file"></span></div>
-        <p class="muted small">Kept in the model's run config for every client. An empty field is the default. They
-          take effect the next time the model starts (close Strata's window and start it again).</p>
-        <form class="cfg-form" id="cfg-form"></form>
-        <div class="cfg-actions"><button class="st-btn st-btn--primary" id="cfg-save" type="button">Save</button>
-          <span class="muted small" id="cfg-msg" role="status"></span></div>
+        <div class="st-card about-machine">
+          <span class="card-title">This machine</span>
+          <dl class="facts" id="facts-hw"></dl>
+        </div>
+        <div class="st-card about-connect">
+          <span class="card-title">Connect your tools</span>
+          <p class="muted">Any OpenAI- or Anthropic-compatible client works with these addresses.</p>
+          <dl class="facts" id="facts-api"></dl>
+          <div class="snippets" id="snippets"></div>
+        </div>
+        <div class="st-card about-settings">
+          <span class="card-title">Settings</span>
+          <div class="st-field">
+            <label class="st-label" for="api-key">API key <output>only if the server was started with one</output></label>
+            <input class="st-input" id="api-key" type="password" autocomplete="off" placeholder="Not needed">
+          </div>
+          <p class="muted small">Chats, settings and the key are kept in this browser only. The light or dark look is
+            the button beside the status in the sidebar.</p>
+          <button class="st-btn st-btn--danger" id="clear-data" type="button">
+            <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-trash"/></svg>Clear chats and settings in this browser</button>
+        </div>
       </div>
     </div>
   </section>
 </main>
+</div>
 
-<!-- ============================ Sampling drawer ============================ -->
-<aside class="st-drawer" id="drawer" data-open="false" aria-label="Sampling and thinking" aria-hidden="true">
-  <div class="st-drawer__head"><span class="card-title">Sampling</span>
+<!-- ============================ Settings drawer ============================ -->
+<aside class="st-drawer" id="drawer" data-open="false" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true">
+  <div class="st-drawer__head"><span class="card-title" id="drawer-title">Settings</span>
     <button class="st-btn st-btn--icon" id="drawer-close" aria-label="Close">
-      <svg class="st-icon"><use href="web/sprite.svg#i-chevron"/></svg></button></div>
+      <svg class="st-icon"><use href="web/sprite.svg#i-close"/></svg></button></div>
   <div class="st-drawer__body">
+    <div class="drawer-section">Model</div>
+    <div class="st-field" id="ctx-field">
+      <label class="st-label" for="s-ctx">Context size <output id="o-ctx"></output></label>
+      <input class="st-slider" type="range" id="s-ctx" min="0" max="10" step="1">
+      <span class="muted small" id="ctx-est">How much text the model holds at once: the chat, files, tool output.</span>
+      <span class="ctx-warn small" id="ctx-warn" hidden></span>
+    </div>
+
+    <div class="drawer-section">This chat</div>
     <div class="st-field">
-      <label class="st-label" for="s-thinking">Thinking <output id="o-thinking"></output></label>
-      <div class="seg" id="s-thinking" role="radiogroup" aria-label="Thinking">
-        <button type="button" role="radio" data-v="none">Off</button><button type="button" role="radio" data-v="low">Low</button>
-        <button type="button" role="radio" data-v="medium">Medium</button><button type="button" role="radio" data-v="high">High</button>
+      <label class="st-label" for="s-system">Instructions <output>the model reads them first</output></label>
+      <textarea class="st-input st-textarea" id="s-system" rows="3" placeholder="e.g. Answer briefly. Write code in TypeScript."></textarea>
+    </div>
+    <div class="toggle-row"><span>Use them for new chats too<br><span class="muted small">new chats start with these instructions</span></span>
+      <button class="st-toggle" id="s-sys-default" role="switch" aria-checked="false" aria-label="Use the instructions for new chats"></button></div>
+
+    <div class="drawer-section">Sampling</div>
+    <div class="st-field">
+      <span class="st-label">Presets</span>
+      <div class="seg seg--3" id="s-preset" role="group" aria-label="Presets">
+        <button type="button" data-p="precise" title="Temperature 0: the same question gives the same answer">Precise</button>
+        <button type="button" data-p="balanced" title="Temperature 0.6, top-p 0.95, top-k 20">Balanced</button>
+        <button type="button" data-p="creative" title="Temperature 1.0, top-p 0.95, min-p 0.05">Creative</button>
+      </div>
+    </div>
+    <div class="st-field">
+      <label class="st-label" id="l-thinking">Thinking <output id="o-thinking"></output></label>
+      <div class="seg" id="s-thinking" role="radiogroup" aria-labelledby="l-thinking">
+        <button type="button" role="radio" data-v="none" title="No thinking: it answers right away">Off</button>
+        <button type="button" role="radio" data-v="low" title="GLM's Low: a short think">Low</button>
+        <button type="button" role="radio" data-v="high" title="GLM's High: thinks it through">High</button>
+        <button type="button" role="radio" data-v="max" title="GLM's Max: the most thorough, and the longest">Max</button>
       </div>
     </div>
     <div class="st-field">
@@ -233,7 +438,12 @@
     </div>
     <div class="st-field">
       <label class="st-label" for="s-topk">Top-k <output id="o-topk"></output></label>
-      <input class="st-slider" type="range" id="s-topk" min="1" max="64" step="1">
+      <input class="st-slider" type="range" id="s-topk" min="0" max="64" step="1">
+    </div>
+    <div class="st-field">
+      <label class="st-label" for="s-minp">Min-p <output id="o-minp"></output></label>
+      <input class="st-slider" type="range" id="s-minp" min="0" max="0.5" step="0.01">
+      <span class="muted small">drops words far less likely than the best one</span>
     </div>
     <div class="st-field">
       <label class="st-label" for="s-max">Max tokens <output>empty = until done</output></label>
@@ -248,19 +458,31 @@
     <div class="toggle-row" id="mcp-row" hidden><span>Use tools from MCP servers<br><span class="muted small"
       id="mcp-row-sub">the model may call them while it answers</span></span>
       <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers"></button></div>
-    <div class="toggle-row" id="esp-row" hidden><span>Experimental speed projection<br><span class="muted small">the
-      engine's control vector; off = the stock model. Switching reads the chat again once</span></span>
-      <button class="st-toggle" id="s-esp" role="switch" aria-checked="true" aria-label="Experimental speed projection"></button></div>
-    <div class="toggle-row"><span>Use for other apps too<br><span class="muted small">omp and other API clients get
-      these settings for anything they don't set themselves</span></span>
+    <div class="toggle-row"><span>Use for other apps too<br><span class="muted small" id="share-sub">API clients get these settings for
+      anything they don't set themselves</span></span>
       <button class="st-toggle" id="s-share" role="switch" aria-checked="false" aria-label="Use for other apps too"></button></div>
+    <div class="dirty-bar" id="dirty-bar" hidden>
+      <span>You have changes that are not saved.</span>
+      <button class="st-btn st-btn--secondary st-btn--sm" id="dirty-discard" type="button">Discard</button>
+      <button class="st-btn st-btn--primary st-btn--sm" id="dirty-save" type="button">Save</button>
+    </div>
     <div class="drawer-actions">
       <button class="st-btn st-btn--secondary" id="s-reset" type="button">Reset</button>
-      <button class="st-btn st-btn--primary" id="s-apply" type="button">Apply</button>
+      <button class="st-btn st-btn--primary" id="s-apply" type="button">Save</button>
     </div>
   </div>
 </aside>
 <div class="scrim" id="scrim" hidden></div>
+
+<!-- ============================ Dialog (confirmations, the HTML preview) ============================ -->
+<div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" hidden>
+  <div class="modal__box" id="modal-box">
+    <div class="modal__head"><span class="card-title" id="modal-title"></span>
+      <button class="st-btn st-btn--icon" id="modal-close" aria-label="Close"><svg class="st-icon"><use href="web/sprite.svg#i-close"/></svg></button></div>
+    <div class="modal__body" id="modal-body"></div>
+    <div class="modal__actions" id="modal-actions"></div>
+  </div>
+</div>
 <div class="st-toasts" id="toasts" aria-live="polite"></div>
 <script src="web/app.js"></script>
 </body>

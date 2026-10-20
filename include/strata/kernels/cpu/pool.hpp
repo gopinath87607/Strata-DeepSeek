@@ -63,49 +63,13 @@ struct ExpertJobMulti {
     const void* nact[MAXT] = {};
 };
 
-/// How worker threads are allocated across physical/logical CPU cores (#272).  `All` is the layout the pool has
-/// always used and the default; the hybrid-aware ones are opt-in (--pool-affinity auto|p-cores).
-enum class PoolAffinity {
-    Auto,      ///< Hybrid: prioritize physical P-cores, then SMT, then E-cores (defaults to P-core count)
-    PCores,    ///< Restrict workers strictly to Performance cores and their SMT siblings
-    All,       ///< The default: one worker per physical core in the OS's order, without hybrid distinction
-};
-
-struct CpuTopology {
-    bool is_hybrid = false;
-    int p_cores = 0;                ///< Physical performance cores
-    int p_threads = 0;              ///< Total logical threads on performance cores
-    int e_cores = 0;                ///< Efficient cores
-    std::vector<int> worker_cores;  ///< Ordered CPU IDs; on Windows, group * 64 + processor within the group
-    int host_core = -1;             ///< Logical core reserved for host thread
-    int host_sibling = -1;          ///< The host core's SMT sibling (-1: none), the logical processor `Sibling` takes
-};
-
-/// Which core the host thread - the layer loop that spins on the GPU's flags - takes when `skip_first` reserves one
-/// (--host-core first|last|sibling, STRATA_HOST_CORE).  `First` is the layout the pool has always used.  `Last`
-/// (eddoursul's fork, F12) puts the host on the last physical core and lets the workers have the first: Windows sends
-/// a GPU's interrupts to one logical processor, usually the first, and every copy that lands raises one (~13 us in the
-/// ISR and a DPC), which delays a spinning host there.  The placement changes no result, only where threads run.  A
-/// hybrid CPU keeps `First` under `Last` (its first core is the best P-core).  `Sibling` keeps the host on that first
-/// core but on its other hardware thread: the interrupts stay on the first logical processor, no worker shares the
-/// core (the workers take one logical processor per core), and it applies to hybrid CPUs too.  Without an SMT sibling
-/// it is `First`.
-enum class HostCore { First, Last, Sibling };
-void set_host_core(HostCore where);
-HostCore host_core_setting();
-
-CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
-
-/// The logical processor the host thread is pinned to under the current setting (-1: no topology).
-int planned_host_core(PoolAffinity affinity = PoolAffinity::All);
-
 /// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another
 /// worker.  On the 6-core/12-thread machine this project measures on, `hardware_concurrency()/2` workers on
 /// logical processors 0..5 would put every worker on a sibling pair and halve the useful bandwidth - which is
 /// exactly the kind of error that shows up as "the CPU path is slower than the model says" with no clue why.
 ///
 /// `skip_first` drops the first core, which P2.S3 reserves for the host loop.
-std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
+std::vector<int> physical_cores(bool skip_first);
 
 /// **THE RESERVATION IS A FICTION UNLESS THE HOST IS ACTUALLY PUT THERE.**
 ///
@@ -117,23 +81,9 @@ std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity = PoolAff
 /// - exactly 5/6 of L9's 44.14 on 6 - and at **26.9 GB/s inside the host loop**, where the unpinned spinning
 /// host is free to land on a worker's core or its SMT sibling.  That 1.35x is not the kernel.
 ///
-/// The previous host placement. `valid` is false when querying or setting placement failed.
-/// Windows uses a reversible CPU Set selection, leaving hard affinity (including Windows 11's implicit
-/// all-group eligibility) untouched. An empty selection restores inheritance from the process defaults.
-/// Linux stores the complete, dynamically sized native CPU mask, including CPU IDs above 63.
-struct ThreadAffinity {
-#if defined(_WIN32)
-    std::vector<unsigned long> cpu_sets;
-#else
-    std::vector<unsigned long> mask;
-#endif
-    bool valid = false;
-};
-
-/// Selects one encoded processor for the caller; Windows CPU Sets respect existing hard-affinity limits.
-/// Restore on the same calling thread. Pool-owned workers use hard group affinity instead.
-ThreadAffinity pin_current_thread(int core);
-void restore_thread_affinity(const ThreadAffinity& previous);
+/// Returns the PREVIOUS affinity mask, or -1 if the platform refused; pass it to `restore_thread_affinity`.
+long long pin_current_thread(int core);
+void restore_thread_affinity(long long previous);
 
 class ExpertPool {
 public:
@@ -151,10 +101,7 @@ public:
     /// With `host_works`, `run()` claims jobs itself instead of spinning on `done_`, and the pool is six
     /// threads on six cores. `false` is the A/B arm and exists so the change is measurable rather than
     /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
-    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true,
-                        PoolAffinity affinity = PoolAffinity::All, int tasks = 0);
-    /// Batched row phases: 0 keeps three tasks per participating thread; explicit counts are capped by rows.
-    static constexpr int kMaxTasks = 4096;
+    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true);
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
     ~ExpertPool();
@@ -165,12 +112,6 @@ public:
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
-
-    bool is_hybrid() const { return topo_.is_hybrid; }
-    int p_cores() const { return topo_.p_cores; }
-    int p_threads() const { return topo_.p_threads; }
-    int e_cores() const { return topo_.e_cores; }
-    PoolAffinity affinity() const { return affinity_; }
 
     /// Publish `n` jobs, then block until every one has been claimed AND every worker has parked.
     /// `jobs` must outlive the call (it does, and the workers never touch it afterwards).
@@ -223,8 +164,6 @@ public:
     static constexpr std::chrono::seconds kStall{60};
 
 private:
-    int phase_tasks(int64_t rows) const;
-    int tasks_ = 0;
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
@@ -300,8 +239,6 @@ private:
     };
     const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;
-    PoolAffinity affinity_ = PoolAffinity::All;
-    CpuTopology topo_;
 };
 
 }  // namespace strata::kernels::cpu

@@ -15,11 +15,9 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 """
 from __future__ import annotations
 
-import bisect
 import json
 import pathlib
 import sys
-import threading
 
 import regex
 
@@ -65,189 +63,62 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
-# The `joyai-llm` pre-tokenizer, used by the DeepSeek-V4 family.  It is implemented as the reference
-# engine's BYTE SCAN (`ds4.c` `bpe_tokenize_text_joyai`, ported 1:1 in `ds4-core/src/tok.rs`), not as a
-# regex.  The model's tokenizer.json describes it as the llama.cpp pattern triplet
-# (`src/llama-vocab.cpp` L321-329, `LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM`), and neither of the two regex readings
-# of that description reproduces the engine:
-#
-#   * as one alternation, it disagrees with the engine on runs of spaces before CJK ("     漢字"): the
-#     engine leaves the last space to travel with the CJK letters;
-#   * applied sequentially (llama.cpp's `unicode_regex_split`), it disagrees with the engine on the same
-#     case in the other direction, because pattern 2 has already cut the CJK out.
-#
-# The engine also treats EVERY non-ASCII byte as a letter for the generic letter branch, an approximation
-# it documents; emoji followed by accented text tokenizes differently under a `\p{L}` regex.  Measured on
-# the real vocabulary: the scan below agrees with the reference C oracle on every one of 459 corpus strings
-# (both encode and rendered-chat modes) except the `<｜System｜>` literal, which the C source in this
-# checkout predates (see JOYAI_LLM_CONTROL_TOKENS).
-def _utf8_len(c: int) -> int:
-    if c < 0x80:
-        return 1
-    if (c & 0xE0) == 0xC0:
-        return 2
-    if (c & 0xF0) == 0xE0:
-        return 3
-    if (c & 0xF8) == 0xF0:
-        return 4
-    return 1
-
-
-def _utf8_next(b: bytes, pos: int) -> int:
-    return min(pos + _utf8_len(b[pos]), len(b))
-
-
-def _utf8_cp(b: bytes, pos: int) -> tuple[int, int]:
-    c0 = b[pos]
-    n = _utf8_len(c0)
-    if pos + n > len(b):
-        return c0, pos + 1
-    if n == 1:
-        return c0, pos + 1
-    if n == 2:
-        return ((c0 & 0x1F) << 6) | (b[pos + 1] & 0x3F), pos + 2
-    if n == 3:
-        return (((c0 & 0x0F) << 12) | ((b[pos + 1] & 0x3F) << 6) | (b[pos + 2] & 0x3F)), pos + 3
-    return (((c0 & 0x07) << 18) | ((b[pos + 1] & 0x3F) << 12) | ((b[pos + 2] & 0x3F) << 6)
-            | (b[pos + 3] & 0x3F)), pos + 4
-
-
-def _ascii_alpha(c: int) -> bool:
-    return 0x41 <= c <= 0x5A or 0x61 <= c <= 0x7A
-
-
-def _ascii_digit(c: int) -> bool:
-    return 0x30 <= c <= 0x39
-
-
-def _ascii_space(c: int) -> bool:
-    return c in (0x20, 0x09, 0x0A, 0x0D, 0x0B, 0x0C)
-
-
-def _ascii_newline(c: int) -> bool:
-    return c in (0x0A, 0x0D)
-
-
-def _joyai_punct(c: int) -> bool:
-    return 0x21 <= c <= 0x2F or 0x3A <= c <= 0x40 or 0x5B <= c <= 0x60 or 0x7B <= c <= 0x7E
-
-
-def _joyai_cjk_at(b: bytes, pos: int) -> bool:
-    if b[pos] < 0x80:
-        return False
-    cp, _ = _utf8_cp(b, pos)
-    return 0x4E00 <= cp <= 0x9FA5 or 0x3040 <= cp <= 0x309F or 0x30A0 <= cp <= 0x30FF
-
-
-def _joyai_letter_at(b: bytes, pos: int) -> bool:
-    c = b[pos]
-    return _ascii_alpha(c) if c < 0x80 else True     # the engine's documented approximation
-
-
-def _joyai_letters(b: bytes, pos: int) -> int:
-    while pos < len(b) and _joyai_letter_at(b, pos):
-        pos = _utf8_next(b, pos)
-    return pos
-
-
-def joyai_split(text: str) -> list[str]:
-    """The reference engine's pre-tokenizer pieces, byte for byte.
-
-    Every branch is a straight port of `bpe_tokenize_text_joyai`; the order matters (digits before CJK
-    before punctuation before letters) and the emitted span always advances by at least one code point.
-    """
-    b = text.encode("utf-8")
-    n = len(b)
-    out: list[str] = []
-    pos = 0
-    while pos < n:
-        start = pos
-        c = b[pos]
-        if _ascii_digit(c):
-            k = 0
-            while pos < n and _ascii_digit(b[pos]) and k < 3:
-                pos += 1
-                k += 1
-        elif _joyai_cjk_at(b, pos):
-            while True:
-                pos = _utf8_next(b, pos)
-                if not (pos < n and _joyai_cjk_at(b, pos)):
-                    break
-        elif _joyai_punct(c) and pos + 1 < n and _ascii_alpha(b[pos + 1]):
-            pos += 1
-            while pos < n and _ascii_alpha(b[pos]):
-                pos += 1
-        elif _joyai_letter_at(b, pos):
-            pos = _joyai_letters(b, pos)
-        elif not _ascii_newline(c) and not _joyai_punct(c) and pos + 1 < n and _joyai_letter_at(b, pos + 1):
-            pos += 1
-            pos = _joyai_letters(b, pos)
-        elif c == 0x20 and pos + 1 < n and _joyai_punct(b[pos + 1]):
-            pos += 1
-            while pos < n and _joyai_punct(b[pos]):
-                pos += 1
-            while pos < n and _ascii_newline(b[pos]):
-                pos += 1
-        elif _joyai_punct(c):
-            while pos < n and _joyai_punct(b[pos]):
-                pos += 1
-            while pos < n and _ascii_newline(b[pos]):
-                pos += 1
-        elif _ascii_space(c):
-            p = pos
-            last_newline_end = 0
-            while p < n and _ascii_space(b[p]):
-                sc = b[p]
-                p += 1
-                if _ascii_newline(sc):
-                    last_newline_end = p
-            if last_newline_end:
-                pos = last_newline_end
-            elif p < n and p > pos + 1 and (_joyai_letter_at(b, p) or _joyai_punct(b[p])):
-                pos = p - 1          # the last space goes with the letters/punctuation that follow
-            else:
-                pos = p
-        else:
-            pos = _utf8_next(b, pos)
-        if pos == start:
-            pos = _utf8_next(b, pos)
-        out.append(b[start:pos].decode("utf-8"))
-    return out
-
-# The literals the DeepSeek-V4 tokenizer treats as special.  The GGUF carries NO `token_type` array, so
-# these have to come from the family's own tokenizer (`ds4-core/src/tok.rs`, `ModelFamily::DeepSeek4` and
-# `special_token_at`).  All are marked type 3 (CONTROL), which Strata matches only with parse_special - the
-# reference has exactly those two modes (`encode` = plain BPE, `encode_rendered_chat` = specials by literal).
-# The reference also maps a few literals this vocabulary does not own (`<|endoftext|>` -> eos); they only
-# matter to templates that spell them, which the DSML renderer does not.
-JOYAI_LLM_CONTROL_TOKENS = (
-    "<｜begin▁of▁sentence｜>",   # 0
-    "<｜end▁of▁sentence｜>",     # 1
-    "<｜System｜>",             # 128799
-    "<｜User｜>",               # 128803
-    "<｜Assistant｜>",          # 128804
-    "<think>",                 # 128821
-    "</think>",                # 128822
-    "｜DSML｜",                # 128825
-    "<｜deepseek_image｜>",     # 129264
+# The `glm4`/`glm5` pre-tokenizer, transcribed from llama-vocab.cpp L406-410 at the vendored pin
+# (LLAMA_VOCAB_PRE_TYPE_CHATGLM4).  Two differences from qwen35, both load-bearing:
+#   * the digit run is `\p{N}{1,3}` - a 4-digit number splits 3+1, not as one whole run;
+#   * the letter class is `\p{L}+` WITHOUT `\p{M}`, AND the punctuation class is
+#     `[^\s\p{L}\p{N}]` without `\p{M}` - so a combining mark attaches to the FOLLOWING
+#     punctuation run, the exact opposite of the qwen35 `\p{M}` subtlety above.
+# AND the encoding semantic differs: llama.cpp sets `ignore_merges = true` for glm4/glm5, so a
+# pre-token piece that is an exact vocabulary token is emitted WHOLE (no merges applied); only
+# the leftovers go through BPE.  Transcribing the regex alone and keeping the merges would be
+# the same class of plausible-but-wrong as the qwen3-for-qwen35 mistake above.
+GLM_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
 )
 
 
-def family_control_types(pre: str, tokens: list[str]) -> list[int] | None:
-    """Token types for a family whose GGUF carries no `tokenizer.ggml.token_type`.
+# The `deepseek3` pre-tokenizer (DeepSeek-V3 .. V4.1's tokenizer.json, llama.cpp's LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM):
+# THREE Split stages with behavior "Isolated", each applied to every piece the one before produced - digit runs of at
+# most 3, then runs of CJK ideographs / kana, then the word pattern - and the text between a stage's matches stays a
+# piece of its own (a digit run passes the word pattern untouched that way).  Then the byte-level mapping; merges by
+# rank as usual (no ignore_merges).
+DEEPSEEK3_PATTERNS = (
+    r"\p{N}{1,3}",
+    r"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
+    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
 
-    Returns None when the family needs no synthesised table, leaving Qwen packs on their metadata path.
-    Type 1 is NORMAL and 3 is CONTROL (docs/gguf.md), so every non-special token stays an ordinary one.
-    """
-    if pre != "joyai-llm":
-        return None
-    types = [1] * len(tokens)
-    ids = {t: i for i, t in enumerate(tokens)}
-    for literal in JOYAI_LLM_CONTROL_TOKENS:
-        i = ids.get(literal)
-        if i is not None:
-            types[i] = 3
-    return types
+
+class _IsolatedSplits:
+    """findall() over a sequence of "Isolated" splits (see DEEPSEEK3_PATTERNS)."""
+
+    def __init__(self, patterns):
+        self.stages = [regex.compile(p) for p in patterns]
+
+    def findall(self, text: str) -> list[str]:
+        pieces = [text]
+        for pat in self.stages:
+            out = []
+            for piece in pieces:
+                pos = 0
+                for m in pat.finditer(piece):
+                    if m.start() > pos:
+                        out.append(piece[pos:m.start()])
+                    if m.end() > m.start():
+                        out.append(m.group(0))
+                    pos = m.end()
+                if pos < len(piece):
+                    out.append(piece[pos:])
+            pieces = out
+        return pieces
 
 
 class Tokenizer:
@@ -255,6 +126,12 @@ class Tokenizer:
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
         self.tokens = tokens
         self.pre = pre
+        # Each supported scheme names a transcription of the vendored llama.cpp reference; an
+        # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3" % pre)
+        # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
+        self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}
@@ -272,18 +149,8 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        # The pre-tokenizer is selected by the pack's `pre`, never re-derived from the model name.  An
-        # unknown one raises instead of silently falling back to qwen35: the wrong split still produces
-        # valid ids and a plausible-looking answer, which is the failure mode this module exists to avoid.
-        if pre == "qwen35":
-            self._re = regex.compile(QWEN35_PATTERN)
-            self._pieces = self._re.findall
-        elif pre == "joyai-llm":
-            self._re = None
-            self._pieces = joyai_split
-        else:
-            raise ValueError("unsupported pre-tokenizer %r: this build implements 'qwen35' and 'joyai-llm'"
-                             % (pre,))
+        self._re = (_IsolatedSplits(DEEPSEEK3_PATTERNS) if pre == "deepseek3" else
+                    regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -302,30 +169,11 @@ class Tokenizer:
             for i, ty in enumerate(token_types):
                 if ty in (3, 4):
                     self.special_tokens[tokens[i]] = i
-        if pre == "joyai-llm":
-            # The reference engine's special scan also maps three ASCII spellings of the sentence markers
-            # that this vocabulary does not contain as tokens (`ds4.c` special_token_at; both the C table
-            # and the Rust port have them).  They emit BOS/EOS when a prompt spells them literally.
-            for literal, target in (("<|endoftext|>", "<｜end▁of▁sentence｜>"),
-                                    ("<|beginoftext|>", "<｜begin▁of▁sentence｜>"),
-                                    ("<|startoftext|>", "<｜begin▁of▁sentence｜>")):
-                if target in self.ids:
-                    self.special_tokens.setdefault(literal, self.ids[target])
-        # A special token's text is a literal, not byte-mapped (DeepSeek's `<｜User｜>` and `<｜begin▁of▁sentence｜>`
-        # contain characters outside the byte alphabet), so decode emits it as written.
-        self.special_token_ids = frozenset(self.special_tokens.values())
         always = [t for t, i in self.special_tokens.items() if token_types and token_types[i] == 4]
-        self.control_tokens = [t for t, i in self.special_tokens.items() if token_types and token_types[i] == 3]
         # Longest literal first, or `<|im_end|>` could match a shorter prefix of itself.  `regex.escape` so a
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
         self._special_re = self._alt(list(self.special_tokens))
-        # Initialize once, rather than allocating a default dict and looking it up
-        # through __dict__.setdefault on each encoded segment or decoded token.
-        self._piece_ids: dict[str, list[int]] = {}
-        self._bytes_cache: dict[int, bytes] = {}
-        # How far a special-token match can look ahead of where it starts (PromptEncoder's margin).
-        self.max_special_len = max((len(t) for t in self.special_tokens), default=1)
 
     @staticmethod
     def _alt(literals: list[str]):
@@ -334,6 +182,21 @@ class Tokenizer:
         return regex.compile("|".join(regex.escape(s) for s in sorted(literals, key=len, reverse=True)))
 
     # -------------------------------------------------------------- constructors
+    @classmethod
+    def from_dir(cls, path) -> "Tokenizer":
+        """A pack's tokenizer/ directory (extract() below), with the pre-tokenizer its tokenizer.json names: built
+        without it, a GLM pack was split the qwen35 way - every number one digit a token where GLM groups up to three
+        (#27: numbers came back garbled in long prompts).  No tokenizer.json (never written by extract): qwen35."""
+        t = pathlib.Path(path)
+        vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
+        tokens = [None] * len(vocab)
+        for s, i in vocab.items():
+            tokens[i] = s
+        meta = json.loads((t / "tokenizer.json").read_text(encoding="utf-8")) if (t / "tokenizer.json").exists() else {}
+        types = json.loads((t / "token_type.json").read_text()) if (t / "token_type.json").exists() else None
+        return cls(tokens, (t / "merges.txt").read_text(encoding="utf-8").split("\n"), types,
+                   meta.get("pre", "qwen35"), meta.get("special_ids") or None)
+
     @classmethod
     def from_gguf(cls, path) -> "Tokenizer":
         sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -348,12 +211,9 @@ class Tokenizer:
             raise ValueError("expected a byte-level BPE tokenizer (model 'gpt2'), got %r" % model)
         special = {k: int(md[k]) for k in md
                    if k.startswith("tokenizer.ggml.") and k.endswith("_token_id")}
-        tokens = list(md["tokenizer.ggml.tokens"])
-        types = list(md.get("tokenizer.ggml.token_type") or []) or None
-        pre = md.get("tokenizer.ggml.pre", "qwen35")
-        if types is None:
-            types = family_control_types(pre, tokens)
-        return cls(tokens, list(md["tokenizer.ggml.merges"]), types, pre, special)
+        return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
+                   list(md.get("tokenizer.ggml.token_type") or []) or None,
+                   md.get("tokenizer.ggml.pre", "qwen35"), special)
 
     # -------------------------------------------------------------- the algorithm
     def _bpe(self, word: str) -> list[str]:
@@ -361,23 +221,12 @@ class Tokenizer:
 
         Applying merges in list order rather than rank order is the classic BPE bug: it produces a different
         segmentation and a plausible token count.
-
-        A word longer than HEAP_MIN symbols (a long CJK run, a minified blob: one pre-token piece of thousands of
-        bytes) goes to _bpe_heap, which applies the same merges in the same order without rescanning every pair
-        after each merge (#268: that rescan is O(n^2) and took seconds on an 8K-character CJK run).
         """
-        if len(word) > self.HEAP_MIN:
-            return self._bpe_heap(word)
-        # `self` is read ONCE, here.  #1385: an interpreter (CPython 3.14.4) was seen handing this frame an int
-        # for `self` partway through the scan (`'int' object has no attribute 'ranks'`).  Nothing in this class
-        # can do that (no cache, decorator, slots or callback; a thread hammering test cannot make it happen),
-        # so the scan below works on a local and no longer re-reads `self` once per symbol pair.
-        ranks_get = self.ranks.get
         parts = list(word)
         while len(parts) > 1:
             best, best_rank = None, None
             for i in range(len(parts) - 1):
-                r = ranks_get((parts[i], parts[i + 1]))
+                r = self.ranks.get((parts[i], parts[i + 1]))
                 if r is not None and (best_rank is None or r < best_rank):
                     best, best_rank = i, r
             if best is None:
@@ -385,111 +234,95 @@ class Tokenizer:
             parts[best:best + 2] = [parts[best] + parts[best + 1]]
         return parts
 
-    HEAP_MIN = 64       # words up to this many symbols keep the scan above, unchanged
-
-    def _bpe_heap(self, word: str) -> list[str]:
-        """_bpe's result in O(n log n): the symbols as a linked list, every adjacent pair with a rank in a heap
-        keyed (rank, position).  Popping the lowest rank and then the lowest position is exactly the order the
-        scan picks (its strict `<` keeps the leftmost of equal ranks), and a symbol's position is where it starts
-        in the word, which only its left neighbour's merge can change - so a popped pair whose two symbols are
-        no longer the ones it was pushed with is stale and skipped."""
-        import heapq
-        parts = list(word)
-        n = len(parts)
-        nxt = list(range(1, n)) + [-1]
-        prv = list(range(-1, n - 1))
-        ranks = self.ranks
-        heap = []
-        for i in range(n - 1):
-            r = ranks.get((parts[i], parts[i + 1]))
-            if r is not None:
-                heap.append((r, i, parts[i], parts[i + 1]))
-        heapq.heapify(heap)
-        while heap:
-            r, i, left, right = heapq.heappop(heap)
-            j = nxt[i]
-            if parts[i] != left or j < 0 or parts[j] != right:
-                continue                                # stale: one of its symbols has merged since
-            parts[i] = left + right
-            parts[j] = None                             # j is gone: i takes its place in the list
-            k = nxt[j]
-            nxt[i] = k
-            if k >= 0:
-                prv[k] = i
-                r2 = ranks.get((parts[i], parts[k]))
-                if r2 is not None:
-                    heapq.heappush(heap, (r2, i, parts[i], parts[k]))
-            p = prv[i]
-            if p >= 0:
-                r2 = ranks.get((parts[p], parts[i]))
-                if r2 is not None:
-                    heapq.heappush(heap, (r2, p, parts[p], parts[i]))
-        return [s for s in parts if s is not None]
-
-    PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered (an agent resends its whole history every turn)
-
     def _encode_plain(self, text: str) -> list[int]:
+        # a piece always encodes to the same ids, so they are remembered (a prompt repeats most of its words, and an
+        # agent re-sends the whole conversation every turn); the memo is dropped whole when it grows past ~300K pieces
+        memo = self.__dict__.setdefault("_piece_memo", {})
+        if len(memo) > 300_000:
+            memo.clear()
         out: list[int] = []
-        # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
-        # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
-        cache = self._piece_ids
-        for piece in self._pieces(text):
-            got = cache.get(piece)
-            if got is None:
-                mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
+        for piece in self._re.findall(text):
+            hit = memo.get(piece)
+            if hit is not None:
+                out.extend(hit)
+                continue
+            # The vocab is stored in the BYTE-LEVEL alphabet, so the ignore_merges whole-vocab
+            # lookup (llama-vocab.cpp L633-637: an exact hit is emitted whole, only leftovers
+            # reach BPE) must run on the byte-MAPPED piece - for ASCII the mapping is the
+            # identity and the raw lookup agrees, for everything else it does not (x=Δy²: the
+            # mapped piece 'Â²' is one token, the raw piece '²' is not in the vocab at all).
+            mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
+            if self.ignore_merges and mapped in self.ids:
+                ids = (self.ids[mapped],)
+            else:
                 got = []
                 for tok in self._bpe(mapped):
                     i = self.ids.get(tok)
                     if i is None:
                         raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
                     got.append(i)
-                if len(cache) < self.PIECE_CACHE_MAX:
-                    cache[piece] = got
-            out.extend(got)
+                ids = tuple(got)
+            memo[piece] = ids
+            out.extend(ids)
         return out
 
-    def _encode_matching(self, text: str, pat, plain=(), marks: list | None = None) -> list[int]:
+    def _encode_segment(self, text: str) -> list[int]:
+        """_encode_plain, remembering long segments (the text between two special tokens: a message, a tool result):
+        BPE never merges across a special token, so a re-sent conversation's earlier messages encode to the same ids
+        and come from here (LRU, up to ~1M tokens)."""
+        if len(text) < 2048:
+            return self._encode_plain(text)
+        cache = self.__dict__.get("_seg_cache")
+        if cache is None:
+            import collections
+            import threading
+            cache = self.__dict__["_seg_cache"] = collections.OrderedDict()
+            self.__dict__["_seg_lock"] = threading.Lock()
+            self.__dict__["_seg_tokens"] = 0
+        lock = self.__dict__["_seg_lock"]
+        with lock:
+            hit = cache.get(text)
+            if hit is not None:
+                cache.move_to_end(text)
+                return list(hit)
+        ids = self._encode_plain(text)
+        with lock:
+            if text not in cache:
+                cache[text] = tuple(ids)
+                self.__dict__["_seg_tokens"] += len(ids)
+                while self.__dict__["_seg_tokens"] > 1_000_000 and len(cache) > 1:
+                    _, old = cache.popitem(last=False)
+                    self.__dict__["_seg_tokens"] -= len(old)
+        return ids
+
+    def _encode_matching(self, text: str, pat, plain=()) -> list[int]:
         """Encode `text`, emitting any literal `pat` matches as single tokens and BPE-ing the rest.
 
         The split happens on the RAW text, before the byte mapping, because a special token's string is a
         literal to match rather than bytes to decompose.  Everything between the matches is tokenized
         normally - which is why a near-miss like `<|im_star` still costs ordinary tokens.  A match that starts
-        inside one of the `plain` (start, end) spans is left to the text around it (#537).
-
-        `marks`, when given, receives (end of the match in `text`, ids so far) for every match: the points where
-        the encoding of a longer text with the same beginning can resume (PromptEncoder).
+        inside one of the `plain` (start, end) spans is not a token: it is left to the text around it.
         """
         if pat is None:
-            return self._encode_plain(text)
+            return self._encode_segment(text)
         out: list[int] = []
         pos = 0
-        # Matches arrive in text order. For reusable span sequences, consume each
-        # span once instead of scanning the entire list for every literal match.
-        # Sorting a copy handles unsorted/overlapping input without mutating it.
-        # Other iterables keep the original consumption semantics below.
-        span_sequence = isinstance(plain, (list, tuple)) and bool(plain)
-        if span_sequence:
-            spans = iter(sorted(plain))
-            upcoming = next(spans, None)
-            plain_end = 0
+        spans = iter(sorted(plain))
+        upcoming = next(spans, None)
+        plain_end = 0
         for m in pat.finditer(text):
             start = m.start()
-            if span_sequence:
-                while upcoming is not None and upcoming[0] <= start:
-                    plain_end = max(plain_end, upcoming[1])
-                    upcoming = next(spans, None)
-                if start < plain_end:
-                    continue
-            elif plain and any(a <= start < b for a, b in plain):
+            while upcoming is not None and upcoming[0] <= start:   # matches come in text order: each span once
+                plain_end = max(plain_end, upcoming[1])
+                upcoming = next(spans, None)
+            if start < plain_end:
                 continue
             if start > pos:
-                out.extend(self._encode_plain(text[pos:start]))
+                out.extend(self._encode_segment(text[pos:start]))
             out.append(self.special_tokens[m.group(0)])
             pos = m.end()
-            if marks is not None:
-                marks.append((pos, len(out)))
         if pos < len(text):
-            out.extend(self._encode_plain(text[pos:]))
+            out.extend(self._encode_segment(text[pos:]))
         return out
 
     def encode(self, text: str, parse_special: bool = False, plain=()) -> list[int]:
@@ -497,24 +330,21 @@ class Tokenizer:
 
         `parse_special` controls only the type-3 CONTROL literals such as `<|im_end|>`; the type-4
         USER_DEFINED ones such as `<think>` are matched either way.  See the note in `__init__`.
-        `plain`: (start, end) spans of `text` that are ordinary text even where they spell a literal - a
-        `</think>` quoted in a message (#537) - and are tokenized with the text around them.
+        `plain`: (start, end) spans of `text` that are ordinary text even where they spell a literal - a `</think>`
+        or `<|user|>` quoted inside a message - and are tokenized with the text around them.
         """
         return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain)
 
-    def encode_marked(self, text: str, parse_special: bool = False, plain=()) -> tuple[list[int], list[tuple[int, int]]]:
-        """encode() and its resume points: (end offset in `text`, ids so far) after every special-token match."""
-        marks: list[tuple[int, int]] = []
-        return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain, marks), marks
-
     def token_bytes(self, i: int) -> bytes:
         """The raw bytes of one token (a multi-byte character can be split across tokens)."""
-        cache = self._bytes_cache
+        cache = self.__dict__.setdefault("_bytes_cache", {})
         b = cache.get(i)
         if b is None:
             if i < 0 or i >= len(self.tokens):
                 raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
-            if i in self.special_token_ids:
+            if self.token_types and self.token_types[i] in (3, 4):
+                # a control / user-defined token is its text as is (llama.cpp's token_to_piece): GLM's are ASCII,
+                # where the byte alphabet is the identity, DeepSeek's (<｜User｜>, ｜DSML｜) are not
                 b = cache[i] = self.tokens[i].encode("utf-8")
                 return b
             raw = bytearray()
@@ -530,129 +360,12 @@ class Tokenizer:
         return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
 
 
-# ------------------------------------------------------------------ incremental prompts (#567)
-def common_prefix_len(a: str, b: str) -> int:
-    """Length of the longest common prefix, by slices (C speed) rather than a loop over characters."""
-    n = min(len(a), len(b))
-    lo, step = 0, 4096
-    while lo < n:                                       # whole chunks first, doubling
-        hi = min(n, lo + step)
-        if a[lo:hi] != b[lo:hi]:
-            break
-        lo, step = hi, min(step * 2, 1 << 20)
-    else:
-        return n
-    while hi - lo > 1:                                  # the first difference is in [lo, hi): bisect it
-        mid = (lo + hi) // 2
-        if a[lo:mid] == b[lo:mid]:
-            lo = mid
-        else:
-            hi = mid
-    return lo
-
-
-def plain_agree_until(a, b, limit: int) -> int:
-    """The first position below `limit` where the `plain` spans (#537) of two texts differ - a position inside a
-    span in one and not in the other - or `limit`.  Spans are (start, end), sorted and disjoint."""
-    def clip(spans):
-        return [(x, min(y, limit)) for x, y in spans if x < limit and y > x]
-    ca, cb = clip(a), clip(b)
-    for (xa, ya), (xb, yb) in zip(ca, cb):
-        if (xa, ya) != (xb, yb):
-            return min(xa, xb) if xa != xb else min(ya, yb)
-    if len(ca) != len(cb):
-        return (ca if len(ca) > len(cb) else cb)[min(len(ca), len(cb))][0]
-    return limit
-
-
-class PromptEncoder:
-    """`tok.encode(text, parse_special=True, plain=...)` for chat prompts, reusing the ids of an earlier prompt.
-
-    A chat client sends the whole conversation every turn, and the rendered prompt of turn n+1 starts with most of
-    turn n's.  Running BPE over all of it again costs hundreds of milliseconds at 100K tokens, even when the engine
-    reuses the whole prefix.  So the ids up to a SPECIAL-TOKEN BOUNDARY both prompts share are taken as they were,
-    and only the rest is encoded.
-
-    WHY THAT IS EXACT.  Encoding splits the text at special-token matches and BPE-encodes each stretch between two
-    matches on its own (`_encode_matching`): nothing crosses a match.  Whether a match is taken at position q
-    depends only on text[q : q + max_special_len] and on whether q lies inside a `plain` span (#537: a </think>
-    quoted in a message is text).  So if the two texts agree up to L and their plain spans agree below L, every
-    decision the scan makes at a position before c = the end of some match, with c + max_special_len - 1 <= L, is
-    the same for both - the same matches, the same stretches, the same ids up to c - and from c the scan starts
-    afresh, exactly as it does on text[c:] with the spans shifted by c.  Hence encode(new) == ids_old[:ids at c] +
-    encode(new[c:]).  The margin matters only for a vocabulary where a literal overlaps another's end; it costs
-    re-encoding one short stretch.
-
-    A few recent prompts are kept (one per conversation: a prompt replaces the one it continues, that is, one whose
-    text it reuses for more than half; a prompt that shares only the template's head with every entry is a new
-    entry), so a second client does not evict the first.  `encode(..., store=False)` reads the kept prompts without
-    writing one (a token count is not a conversation's turn).  The tokenizer needs `encode_marked` and
-    `max_special_len`.
-    """
-
-    def __init__(self, tok, keep: int = 4):
-        self.tok, self.keep = tok, keep
-        # (text, plain spans, ids, mark ends, mark counts)
-        self.entries: list[tuple[str, tuple, list[int], list[int], list[int]]] = []
-        self.lock = threading.Lock()
-        self.last_reused = 0                            # characters taken from an earlier prompt (for tests)
-
-    def encode(self, text: str, plain=(), store: bool = True) -> list[int]:
-        plain = tuple(sorted(plain))
-        with self.lock:
-            entries = self.entries                      # replaced, never changed in place
-        margin = self.tok.max_special_len - 1
-        src, cut_k = None, -1
-        for e in entries:
-            same = plain_agree_until(e[1], plain, common_prefix_len(e[0], text))
-            k = bisect.bisect_right(e[3], same - margin) - 1   # the last boundary c with c <= same - margin
-            if k >= 0 and (src is None or e[3][k] > src[3][cut_k]):
-                src, cut_k = e, k
-        if src is None:
-            ids, marks = self.tok.encode_marked(text, parse_special=True, plain=plain)
-            ends, counts = [m[0] for m in marks], [m[1] for m in marks]
-            self.last_reused = 0
-        else:
-            c, n = src[3][cut_k], src[4][cut_k]
-            rest = tuple((max(x - c, 0), y - c) for x, y in plain if y > c)
-            tail, marks = self.tok.encode_marked(text[c:], parse_special=True, plain=rest)
-            ids = src[2][:n] + tail
-            ends = src[3][:cut_k + 1] + [c + m[0] for m in marks]
-            counts = src[4][:cut_k + 1] + [n + m[1] for m in marks]
-            self.last_reused = c
-        if not store:
-            return ids
-        # every rendered prompt starts with the template's header, so sharing a special boundary does not make two
-        # prompts one conversation: only the entry whose text is mostly reused is replaced
-        old = src if src is not None and 2 * src[3][cut_k] > len(src[0]) else None
-        with self.lock:
-            self.entries = [(text, plain, ids, ends, counts)] + [e for e in self.entries if e is not old][:self.keep - 1]
-        return list(ids)
-
-    def forget(self, ids: list[int]) -> None:
-        """The prompt with these ids was refused: it is not kept."""
-        with self.lock:
-            self.entries = [e for e in self.entries if e[2] != ids]
-
-
 # ------------------------------------------------------------------ the pack's tokenizer/ directory
 def extract(gguf_path, out_dir) -> dict:
     """Write the tokenizer into `<out_dir>/tokenizer/` so the engine never opens the weight shards for it."""
     out = pathlib.Path(out_dir) / "tokenizer"
     out.mkdir(parents=True, exist_ok=True)
     tk = Tokenizer.from_gguf(gguf_path)
-    # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
-    # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again
-    # (qwen35) or to join three patterns into one alternation (joyai-llm).  A `joyai-llm` list is applied
-    # in order, each pattern re-splitting the pieces the previous one produced.
-    if tk.pre == "joyai-llm":
-        # Not a regex: the engine's byte scan, reproduced in `joyai_split` above.  Shipping the llama.cpp
-        # pattern triplet here would invite a port that uses it and gets different ids (see the comment).
-        pre_pattern, pre_source = "joyai_split: the reference engine's byte scan", \
-            "ds4.c bpe_tokenize_text_joyai (ported in ds4-core/src/tok.rs); llama.cpp's triplet is not equivalent"
-    else:
-        pre_pattern, pre_source = QWEN35_PATTERN, \
-            ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"
     cfg = {
         "model": "gpt2",
         "pre": tk.pre,
@@ -660,8 +373,13 @@ def extract(gguf_path, out_dir) -> dict:
         "n_merges": len(tk.ranks),
         "special_ids": tk.special_ids,
         "add_bos_token": False,
-        "pre_pattern": pre_pattern,
-        "pre_pattern_source": pre_source,
+        # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
+        # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
+        "ignore_merges": tk.ignore_merges,
+        "pre_pattern": GLM_PATTERN if tk.ignore_merges else QWEN35_PATTERN,
+        "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4; "
+                               "glm4/glm5 set ignore_merges)" if tk.ignore_merges else
+                               ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
@@ -672,11 +390,6 @@ def extract(gguf_path, out_dir) -> dict:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     from gguf_reader import GGUFFile
     tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
-    if not tpl and tk.pre == "joyai-llm":
-        # DeepSeek-V4.1-Flash's artifact carries no template; its format is the reference server's V4.1 DSML
-        # head, shipped here and pinned against the reference renderer (serve/test_chat_template_deepseek4.py).
-        tpl = (pathlib.Path(__file__).resolve().parents[1] / "serve" / "chat_template_deepseek4.jinja"
-               ).read_text(encoding="utf-8")
     if tpl:
         (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
     return cfg
