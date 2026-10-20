@@ -41,8 +41,10 @@ the checkout is a few megabytes and builds one binary, `strata-ds4`.
 - **DSpark speculative decoding.** The model's `mtp.*` blocks are loaded as a drafter, verified while confident
   (`--dspark-conf`), and reported live (draft acceptance, draft and verify time).
 - **Engram.** The hash tables are read from the pack and used by the layers that have them.
-- **Chunked prefill.** The prompt is processed in chunks sized per GPU (`--prefill-chunk`,
-  `--prefill-chunk-max`), with the cross-GPU copies nested so the parts can use different chunk sizes.
+- **Chunked prefill, with a decoder tail.** The prompt is processed in chunks sized per GPU (`--prefill-chunk`,
+  `--prefill-chunk-max`), with the cross-GPU copies nested so the parts can use different chunk sizes. Layers after
+  the candidate-source layer only see the last rows a prompt can still reach, so they run over those alone
+  (`DS4_TAIL_PREFILL=1`).
 - **Source-driven dashboard.** The Monitor tabs (GPUs, Loan, Prefill, Storage, Engram, Draft) appear only when
   the engine actually reports that data — one GPU or ten, one CPU or two, SSD or RAM tier.
 - **Vision.** The model's vision tower (when the pack has one) reads images in the engine itself.
@@ -53,6 +55,13 @@ The development machine is a normal desktop: 2 × RTX 5060 8 GB (CUDA devices 0 
 (devices 2 and 3), 40 GB of VRAM together, 247 GiB of RAM over two NUMA nodes, and `/mnt/nvme` for the model.
 CUDA 13.2, `-DCMAKE_CUDA_ARCHITECTURES="86;120"`. The display cards are the 3060s, which is what the example
 `--reserve-pct 1,1,2,2` encodes (1% on the headless 5060s, 2% on the display 3060s).
+
+## Performance
+
+Measured on the development machine above with DeepSeek-V4.1-Flash-1017: a **111,124-token prompt is read at 576
+tokens/s** (about 193 s), against **344 tokens/s** before the encoder/decoder split. The split is what buys it: layers
+0-20 (the encoder) run over every token, layers 21-39 (the decoder) only over the last 2,560 rows, with the layer
+split at 5,5,6,24 (`DS4_TAIL_PREFILL=1`, `DS4_SPLIT=5,5,6,24`).
 
 ## Requirements
 
