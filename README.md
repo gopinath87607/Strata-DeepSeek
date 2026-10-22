@@ -23,6 +23,7 @@ repository keeps — see [Credits](#credits).
 | `serve/` | The HTTP server, the tokenizer/chat templates, MCP tools, telemetry and the web dashboard |
 | `tools/ds4/` | `pack_gguf.py` (GGUF → engine pack), `drafter_pack.py` (DSpark), `vision_pack.py` (vision tower) |
 | `third_party/ggml/` | ggml's block layouts/codebooks (MIT), the rest of ggml is built from llama.cpp |
+| `docs/DS4-WORK.md` | The work log: every DS4 flag, prompt path and measurement to date, with the dead ends |
 
 Everything else from Maya (the GLM and Qwen engines, their tools, tests and data) is deliberately **not** here:
 the checkout is a few megabytes and builds one binary, `strata-ds4`.
@@ -45,6 +46,11 @@ the checkout is a few megabytes and builds one binary, `strata-ds4`.
   `--prefill-chunk-max`), with the cross-GPU copies nested so the parts can use different chunk sizes. Layers after
   the candidate-source layer only see the last rows a prompt can still reach, so they run over those alone
   (`DS4_TAIL_PREFILL=1`).
+- **Two more prompt paths, each behind its own flag.** `--ep-prefill` gives every GPU a share of every layer's
+  non-resident experts and has the layer's owner sum them; `--row-split-prefill` gives every GPU the same layer
+  group and a chunk of the prompt's rows, ordered by a wavefront. Both are correct and **off by default**: on
+  this host the chunked path is faster (EP re-reads experts the owner already holds, row-split multiplies the
+  expert bytes by the number of cards). [The work log](docs/DS4-WORK.md) has the numbers and why.
 - **Source-driven dashboard.** The Monitor tabs (GPUs, Loan, Prefill, Storage, Engram, Draft) appear only when
   the engine actually reports that data — one GPU or ten, one CPU or two, SSD or RAM tier.
 - **Vision.** The model's vision tower (when the pack has one) reads images in the engine itself.
@@ -62,6 +68,11 @@ Measured on the development machine above with DeepSeek-V4.1-Flash-1017: a **111
 tokens/s** (about 193 s), against **344 tokens/s** before the encoder/decoder split. The split is what buys it: layers
 0-20 (the encoder) run over every token, layers 21-39 (the decoder) only over the last 2,560 rows, with the layer
 split at 5,5,6,24 (`DS4_TAIL_PREFILL=1`, `DS4_SPLIT=5,5,6,24`).
+
+Two further prompt paths are in the engine but off by default, and measured slower on this host: `--ep-prefill`
+reads a 2,282-token prompt in 17.0 s against the chunked path's 15.7 s, and `--row-split-prefill` reads 16k
+tokens in 130 s against 52 s. Both produced the same generated tokens as the chunked path in their checks; the
+measurements, the reasons, and every other flag are in [docs/DS4-WORK.md](docs/DS4-WORK.md).
 
 ## Requirements
 
@@ -195,6 +206,8 @@ build/strata-ds4 --pack ... --serve
 | `--threads on\|off` | `off` | One host thread per GPU enqueues its layers (needed for `--tp > 1`) |
 | `--prefill-chunk N` | `-1` | Prompt chunk in tokens: `0` = windows of 16, `-1` = 2048 (8192 when experts are read in place), `N` = N tokens. The whole split's ceiling |
 | `--prefill-chunk-max N0,N1,...` | — | Per-part ceiling on the prompt chunk, in the split's (CUDA) order; `0`/absent = no ceiling. The steps nest: each part's step is the largest whole multiple of its feeder's step below its ceiling |
+| `--ep-prefill` | off | Expert-parallel prefill: every GPU streams and computes a share of each layer's non-resident experts, the owner summing them. One-chunk encoder pass; never with the decoder tail. Slower on this host, kept for the packs and splits it targets |
+| `--row-split-prefill` | off | Every GPU holds the same layer group and runs its own chunk of the prompt's rows through it, group by group, ordered by a wavefront; the plan is automatic and any prompt size runs in rounds. Slower on this host |
 | `--dspark on\|off\|none` | `on` | DSpark speculative decoding: `off` loads the drafter but does not draft, `none` does not load it |
 | `--dspark-conf F` | `0.5` | A draft is verified while its confidence (sigmoid) is at least F |
 | `--vision on\|off` | `on` | Run the model's vision tower (when the pack has one) |
@@ -211,6 +224,9 @@ build/strata-ds4 --pack ... --serve
 | `--window N` | `16` | Decode window (CLI); above 16 takes the chunked prompt path |
 | `--eos ID` | `1` | End-of-sequence token id (CLI) |
 | `--layer-split N` | — | Accepted and ignored: this engine balances its own split |
+
+The Maya tree's `--chunk-mmq` (the prompt's MXFP4 experts through llama.cpp's MMQ kernels) is not in this
+standalone tree: it needs the Maya tree's prefill MMQ library, which this repository does not carry.
 
 Environment variables keep the `MAYA_*` names they had upstream (the server's settings and `tools/maya_names.py`
 map them); nothing in the flags was renamed.
