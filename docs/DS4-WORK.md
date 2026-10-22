@@ -18,17 +18,21 @@ took before. The two prompt paths (chunked and row-split) are alternatives by co
 or the other - and inside the chunked path the decoder tail and expert-parallel are mutually exclusive by their
 own gate. Everything else composes: telemetry, placement, chunk sizing and MMQ do not fight each other.
 
-The live configuration this work is measured on:
+The live configuration this work is measured on (as of 2026-10-22):
 
 ```json
-"args": ["--pack", "<model>/strata-ds4", "--max-context", "262144",
-         "--prefill-chunk-max", "8192,8192,8192,8192", "--reserve-pct", "2,1,1,2", "--verbose"],
-"env":  { "DS4_SPLIT": "5,5,6,24", "DS4_TAIL_PREFILL": "1", "DS4_FLOW_STATS": "1", "DS4_PROF": "1" }
+"gpu":  [0, 2, 3, 1],
+"args": ["--pack", "<model>/strata-ds4", "--max-context", "1048576",
+         "--prefill-chunk-max", "8192,8192,8192,8192", "--reserve-pct", "2,1,1,2",
+         "--cpu-threads", "38", "--verbose"],
+"env":  { "DS4_SPLIT": "5,5,6,24", "DS4_TAIL_PREFILL": "1" }
 ```
 
-`DS4_SPLIT`, `DS4_FLOW_STATS` and `DS4_PROF` predate this work (upstream PRs #271/#275); the values are this
-work's, and none of their names changed. The GPUs are `[0,2,3,1]`, so `5,5,6,24` puts 5 encoder layers on each of
-the two 3060s, 6 on a 5060, and all 19 decoder layers plus the head on the last 3060.
+`DS4_SPLIT` and the other environment names predate this work (upstream PRs #271/#275); the values are this
+work's, and none of their names changed. `DS4_FLOW_STATS`/`DS4_PROF` were carried in the env during the A/Bs
+below and are off in the live config. With `gpu [0,2,3,1]` the server exposes the cards to CUDA in that order
+(`CUDA_DEVICE_ORDER=PCI_BUS_ID`), so `5,5,6,24` puts 5 layers on CUDA0 (a display 3060), 5 on CUDA1 (a 5060),
+6 on CUDA2 (the other 5060), and all 19 decoder layers plus the head on CUDA3 (the second display 3060).
 
 ---
 
@@ -357,7 +361,49 @@ CUDA1 0.222, CUDA2 0.237, CUDA3 0.222 per 1,024 rows, paid 1:1 out of that card'
 **Conclusion: 8,192 stays the chunk.** Bigger chunks buy fewer passes (15 -> 8 for 116k) but pay with the
 prompt's resident experts, and prompt residency is the faster lever on this machine.
 
-**Defaults note:** the measurement machine's launcher is back to defaults - its live config's `env` is empty
-(`DS4_SPLIT`, `DS4_TAIL_PREFILL`, `DS4_FLOW_STATS`, `DS4_PROF` removed), while the launcher args
-(`--prefill-chunk-max 8192,8192,8192,8192`, `--reserve-pct 2,1,1,2`, `gpu [0,2,3,1]`) are unchanged. This tree's
-example config (`strata-ds4.example.json`) carries no env at all.
+**Config note:** the measurement machine's live config is the one at the top of this page (`DS4_SPLIT=5,5,6,24`,
+`DS4_TAIL_PREFILL=1`, `--max-context 1048576`, `--prefill-chunk-max 8192,8192,8192,8192`,
+`--reserve-pct 2,1,1,2`, `gpu [0,2,3,1]`). This tree's example config (`strata-ds4.example.json`) carries no env
+at all.
+
+---
+
+## 9. Long context and the 1M ceiling (2026-10-22)
+
+The model's own `max_position_embeddings` is **1,048,576** (`ds4.txt`: `rope_scaling.original_max_position_embeddings`
+65,536 × `factor` 16), and the engine reads that rope scaling itself, so `--max-context 1048576` is the model's
+window, not an extrapolation past it. The live config moved from 262,144 to 1,048,576 on 2026-10-22.
+
+The context-scaled buffers are reserved at load. Same split, same pack, before and after:
+
+| | 262k | 1M |
+|---|---|---|
+| compressed KV + index caches (4 cards) | 0.37 GB | 1.41 GB |
+| prompt arenas | 2.50 / 2.30 / 2.37 / 2.31 GB | 2.62 / 2.41 / 2.48 / 2.42 GB |
+| expert seats | 666 / 302 / 274 / 212 | 647 / 271 / 241 / 175 |
+| CPU-lane experts | 13,794 | 13,890 |
+| free MiB | 230 / 73 / 77 / 217 | 233 / 77 / 79 / 217 |
+
+The per-card score scratch is 16 × (ctx + 64) floats (`kWin = 16`, `ds4_kernels.cuh`), so it is 67 MB at 1M,
+not ~½ GB; the context's real bill is the caches and the arenas, about 1.5 GB, paid out of expert seats -
+roughly 3% of CUDA0's seats, 10-17% of the other three cards'. Free VRAM per card is unchanged.
+
+Measured at 1M (live requests, same split and flags):
+
+| | |
+|---|---|
+| 474,557-token prompt | 694,640 ms = **683.2 tok/s**; then 15,792 tokens at **14.20 tok/s** (1,111,775 ms) |
+| 888,090-token prompt | **447.4 tok/s** mean; decode **15.0 tok/s** mean over 31,000+ tokens |
+| 111,007-token prompt | 160,030 ms = **693.5 tok/s** |
+
+Decode does not fall with context: ~16 tok/s fresh, 14.2 at 474k, 15.0 at 888k. The prompt read is the
+byte-bound part: for the 474k prompt the cards streamed 988 / 1,242 / 1,485 / 93 GB (the page cache feeding
+PCIe Gen 3) and the compute waited 151 / 326 / 261 / 16 s on reads; at 888k the mean falls to 447 because that
+wait and the indexer's block marking grow with the prompt while the links do not.
+
+**The CPU lane and SMT.** The pool defaults to the physical cores (28 here). Extending it to the logical
+siblings - 38 threads on this 2 × 14-core machine - raises host CPU use from ~52% to ~71% during decode; decode
+itself did not measurably move in the first check, so the lane was not the decode bottleneck. That pool change
+is a patch in the Maya tree (`node_cores` also returns each node's logical CPUs; `make_pools` pins the extra
+workers on the siblings), **not in this standalone tree yet**: here `--cpu-threads` past the physical cores is
+clamped to them.

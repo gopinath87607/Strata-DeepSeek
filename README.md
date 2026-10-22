@@ -8,6 +8,9 @@ It runs a **GGUF** of the model (IQ2_XS, IQ3_XXS, MXFP4, K-quants, BF16, Q8_0 �
 GPUs of different kinds**, lending VRAM between the prompt buffers and the expert banks, decoding ahead with the
 **DSpark** drafter, and answering through an OpenAI- and Anthropic-compatible HTTP server with a live dashboard.
 
+On the development rig (40 GB of mixed VRAM) it reads long prompts at **450–690 tokens/s** and holds
+**14–16 tokens/s** decode from a fresh chat up to the model's **1,048,576-token** context.
+
 MIT licensed. Copyright © 2026 Gopi (gopinath87607). Built on Maya and Strata (both MIT), whose notices this
 repository keeps — see [Credits](#credits).
 
@@ -46,6 +49,10 @@ the checkout is a few megabytes and builds one binary, `strata-ds4`.
   `--prefill-chunk-max`), with the cross-GPU copies nested so the parts can use different chunk sizes. Layers after
   the candidate-source layer only see the last rows a prompt can still reach, so they run over those alone
   (`DS4_TAIL_PREFILL=1`).
+- **Context to 1,048,576 tokens.** The model's own window (YaRN: 65,536 × 16), and the engine reads that rope
+  scaling itself. The KV/index caches and the per-card scratch are reserved at load; 1M here costs about 1.5 GB
+  of VRAM, paid out of expert seats (measured: 666/302/274/212 → 647/271/241/175), and an 888,090-token prompt
+  reads at 447 tok/s and decodes at 15.0 tok/s on this rig.
 - **Two more prompt paths, each behind its own flag.** `--ep-prefill` gives every GPU a share of every layer's
   non-resident experts and has the layer's owner sum them; `--row-split-prefill` gives every GPU the same layer
   group and a chunk of the prompt's rows, ordered by a wavefront. Both are correct and **off by default**: on
@@ -57,17 +64,35 @@ the checkout is a few megabytes and builds one binary, `strata-ds4`.
 
 ## Tested on
 
-The development machine is a normal desktop: 2 × RTX 5060 8 GB (CUDA devices 0 and 1) + 2 × RTX 3060 12 GB
-(devices 2 and 3), 40 GB of VRAM together, 247 GiB of RAM over two NUMA nodes, and `/mnt/nvme` for the model.
-CUDA 13.2, `-DCMAKE_CUDA_ARCHITECTURES="86;120"`. The display cards are the 3060s, which is what the example
-`--reserve-pct 1,1,2,2` encodes (1% on the headless 5060s, 2% on the display 3060s).
+The development machine is a normal desktop: 2 × RTX 3060 12 GB (nvidia-smi cards 0 and 1, the display cards)
++ 2 × RTX 5060 8 GB (cards 2 and 3), 40 GB of VRAM together, 247 GiB of RAM over two NUMA nodes, and
+`/mnt/nvme` for the model. The 3060s run PCIe Gen 3 x16 (10.6 GB/s measured DMA), the 5060s x8 (~7.9 GB/s).
+CUDA 13.2, `-DCMAKE_CUDA_ARCHITECTURES="86;120"`.
+
+The live run pins `"gpu": [0, 2, 3, 1]`, so CUDA sees the 3060s as devices 0 and 3 and the 5060s as 1 and 2
+(the server sets `CUDA_DEVICE_ORDER=PCI_BUS_ID`); `--reserve-pct 2,1,1,2` then keeps 2% on the two display
+3060s and 1% on the headless 5060s.
 
 ## Performance
 
-Measured on the development machine above with DeepSeek-V4.1-Flash-1017: a **111,124-token prompt is read at 576
-tokens/s** (about 193 s), against **344 tokens/s** before the encoder/decoder split. The split is what buys it: layers
-0-20 (the encoder) run over every token, layers 21-39 (the decoder) only over the last 2,560 rows, with the layer
-split at 5,5,6,24 (`DS4_TAIL_PREFILL=1`, `DS4_SPLIT=5,5,6,24`).
+Measured on the development machine above with DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS, the configuration in
+[the next section](#the-configuration-behind-the-numbers), and DSpark on:
+
+| prompt | read | decode after the prompt |
+|---|---|---|
+| 888,090 tokens | ~33 min — **447 tok/s** | 31,000+ tokens at **15.0 tok/s** |
+| 474,557 tokens | 694.6 s — **683 tok/s** | 15,792 tokens at **14.2 tok/s** |
+| 111,007 tokens | 160.0 s — **693 tok/s** | — |
+| 16,797 tokens | 52.5 s — **312 tok/s** | — |
+| 2,282 tokens | 15.7 s — **145 tok/s** | — |
+
+The curve is the pipeline's shape, not a cache cliff: the four cards read a prompt as a chain, so a short prompt
+pays the chain's fill and drain (145 tok/s at 2k), mid prompts run at its steady state (312 tok/s at 16k,
+683–693 tok/s from 111k to 474k), and past ~500k the per-card expert streaming starts to dominate — each card
+moved 0.99–1.49 TB for the 474k prompt (93 GB on the tail card) and the compute waited 16–326 s on reads — while
+the indexer has more blocks to mark at 888k. Decode, by contrast, hardly moves with context: ~16 tok/s fresh,
+14.2 after 474k, 15.0 at 888k, because a token touches the 128-row window, the compressed KV and the 512-token
+index top-k, not the whole history.
 
 Two further prompt paths are in the engine but off by default, and measured slower on this host: `--ep-prefill`
 reads a 2,282-token prompt in 17.0 s against the chunked path's 15.7 s, and `--row-split-prefill` reads 16k
@@ -77,9 +102,91 @@ measurements, the reasons, and every other flag are in [docs/DS4-WORK.md](docs/D
 One more experiment is measured and off by default: `DS4_PASS_LEND=1` lends the idle expert banks between the two
 passes (the tail's banks to the encoders, then the encoders' to the tail). A 116,228-token prompt reads in 219.6 s
 with it against 189.0 s without: the stage fills (10.5 s) and the doubled exit refill (26.6 GB against 9.4 GB)
-cost more than the streamed experts they save. Chunk sizes above 8,192 pay the same way - 16,384 rows shrink the
-8 GB cards' prompt-resident expert slots from 140/156 to 4/37 and read at 486 tok/s, and 24,576 does not load at
-all (the prompt arena alone would need 5,986 MiB on an 8 GB card).
+cost more than the streamed experts they save.
+
+## The configuration behind the numbers
+
+The live config of the machine above (the Maya tree's build of the same engine; `strata-ds4` takes the same flags
+and environment):
+
+```json
+"gpu":  [0, 2, 3, 1],
+"args": ["--pack", "/mnt/nvme/ds4-ud-iq3xxs/maya-ds4",
+         "--max-context", "1048576",
+         "--prefill-chunk-max", "8192,8192,8192,8192",
+         "--reserve-pct", "2,1,1,2",
+         "--cpu-threads", "38",
+         "--verbose"],
+"env":  { "DS4_SPLIT": "5,5,6,24", "DS4_TAIL_PREFILL": "1" }
+```
+
+| Piece | Why it is there |
+|---|---|
+| `"gpu": [0,2,3,1]` | Exposes the cards to CUDA in this order: 3060, 5060, 5060, 3060. The two display 3060s end up as devices 0 and 3. |
+| `DS4_SPLIT=5,5,6,24` | 5 layers on CUDA0, 5 on CUDA1, 6 on CUDA2, and layers 16-39 plus the head on CUDA3. The 19 decoder layers all sit on one card, where the 2,560-row tail pass is a two-second job. |
+| `DS4_TAIL_PREFILL=1` | The encoder/decoder split: layers 0-20 run over every token, layers 21-39 only over the last 2,560 rows. This is the single biggest prefill win — 344 → 576 tok/s when it landed, 661-693 tok/s on the tuned split. |
+| `--prefill-chunk-max 8192,...` | The measured optimum. 16k chunks shrink the 8 GB cards' prompt-resident expert slots (140/156 → 4/37) and read at 486 tok/s; 24,576 does not load (a 5,986 MiB arena does not fit an 8 GB card). |
+| `--reserve-pct 2,1,1,2` | 2% on the display 3060s, 1% on the headless 5060s. The driver eats ~285 MiB a card at startup, so the reserve is 285 MiB + the free VRAM you actually want. |
+| `--max-context 1048576` | The model's own ceiling. Costs ~1.5 GB of VRAM (KV/index caches 0.37 → 1.41 GB, arenas +0.44 GB), paid out of expert seats (666/302/274/212 → 647/271/241/175); free VRAM per card is unchanged. |
+| `--cpu-threads 38` | The CPU lane (2 × 14 cores + SMT = 56 threads here). The standalone pool is the physical cores (28); 38 is the live Maya build's SMT-sibling pool and lifts host CPU use 52% → 71% during decode without a measured decode change. |
+
+`--dspark` is left at its default (`on`): it drafts with the model's MTP blocks and keeps ~60% of the drafts
+(76-88% by position) on the measured runs.
+
+## What we learned
+
+Condensed from [docs/DS4-WORK.md](docs/DS4-WORK.md), where each item has its A/B:
+
+- **A prompt is byte-bound at the PCIe link, not reader-bound.** A cold 2k prompt moves 176 GB and every card's
+  read wait equals bytes ÷ its link (10.6 GB/s on the x16 3060s, ~7.9 on the x8 5060s); eight reader threads
+  reach 33 GB/s over page-cached data, so there is no software headroom. The page cache is what keeps prompts at
+  link speed — the disk alone manages 0.6-0.8 GB/s.
+- **The encoder/decoder split is the big win.** In this model only layers 0-20 can see every token; layers 21-39
+  attend over at most the last 2,560 rows. Running them over the tail alone on one card took a 111k prompt from
+  344 to 576 tok/s, and the tuned split to 661-693 tok/s.
+- **Resident experts beat re-reading them.** The live path streams only the ~18.5 GB its routing misses for a 2k
+  prompt, because the profile keeps the hot experts in VRAM. Expert-parallel prefill gives every card a share of
+  every layer and re-reads what the owners already hold: 206 GB in its first form, 74 GB after a picked-range
+  fix, still 8.4% slower. Row-split prefill multiplies expert bytes by the number of cards: 16k in 130 s against
+  52 s. Both are correct, in the engine, off by default.
+- **8,192 is the chunk.** Bigger chunks save passes but evict the prompt's resident experts, which is the faster
+  lever; above ~18k rows the arena does not fit an 8 GB card at all.
+- **The arena takes only the bytes the prompt touches.** 628 experts / 9.4 GB / 1.6 s of refill became 384 /
+  5.8 GB / 1.0 s (-39%), and a small agent turn evicts nothing.
+- **1M context is cheap in scratch, not free in seats.** The per-card score slab is only 16 × (ctx+64) floats
+  (`kWin` = 16); the cost is the KV/index caches and the arenas, ~1.5 GB, paid out of expert seats (see the
+  configuration above). Measured at 1M: 888,090 tokens read at 447 tok/s, decode 15.0 tok/s.
+- **Decode is context-flat.** ~16 tok/s fresh, 14.2 after 474k, 15.0 at 888k: a token touches the 128-row
+  window, the compressed KV and the 512-token index top-k, not the whole history.
+- **The driver eats ~285 MiB a card at startup**, in 20-45 MiB steps; size the reserve with that in it.
+- **The first prompt of a session is slow on every version** — every kernel's first launch, the prompt path's
+  first allocations, the tiers' first reads. Compare second prompts onward.
+- **UD packs mix expert types inside one layer**, so an MXFP4-only kernel cannot apply to the pack's experts
+  (the MMQ path guards and declines every piece); and prompt logits are not bit-identical between runs, so judge
+  a prompt-path change by top-1 agreement and time, not by max |difference|.
+
+## Who this is for
+
+This is a **single-user, long-context engine for a desktop**: the model answers one conversation, steadily,
+however long it gets.
+
+**It fits you if**
+- your machine has several NVIDIA cards of mixed sizes (here 2 × 12 GB + 2 × 8 GB) and a lot of system RAM
+  (247 GiB here) — the experts that do not fit in VRAM live in RAM or are read from the page cache, and the
+  engine is built around streaming only what the routing misses;
+- you want DeepSeek-V4.1-Flash **locally** with very long context (up to the model's 1,048,576 tokens) and your
+  work is long prompts — repositories, books, agent traces, long conversations — where this engine reads at
+  450-690 tok/s;
+- you are happy with **14-16 tok/s decode** at any context length: one message at a time, drafts included;
+- you like seeing the machine: the Monitor shows the loan, the prefill chain, the CPU lane and the drafter, and
+  every path is a flag you can A/B.
+
+**It is not for**
+- a single GPU or a laptop: the engine runs, but the experts stream from RAM/disk and the numbers above are not
+  yours;
+- batch/throughput serving (many users, continuous batching): decode is one stream at ~15 tok/s — use a batched
+  serving stack there;
+- a tight disk: the pack sits beside a 200+ GB GGUF (nothing is re-encoded, but the bytes must be there).
 
 ## Requirements
 
@@ -201,7 +308,7 @@ build/strata-ds4 --pack ... --serve
 |---|---|---|
 | `--pack DIR` | — | The pack directory (`<model>/strata-ds4`), required |
 | `--gpus I,J,...` | every visible GPU | Which CUDA devices to use, in CUDA's order |
-| `--max-context N` | `32768` | Context window in tokens |
+| `--max-context N` | `32768` | Context window in tokens; the model's ceiling is 1,048,576 |
 | `--reserve-mib N` | `600` | VRAM kept free on **each** GPU; wins over `--reserve-pct` |
 | `--reserve-pct P0,P1,...` | — | Per-card percentage kept free, in the split's (CUDA) order. One value applies to every card; a short list repeats its last; floor 64 MiB. Example: `1,1,2,2` keeps 1% on two headless cards and 2% on two display cards |
 | `--no-expert-lend` | lending on | Keep the prompt buffers and expert banks in separate allocations (the pre-lending placement; useful for A/B) |
