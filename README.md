@@ -74,6 +74,13 @@ reads a 2,282-token prompt in 17.0 s against the chunked path's 15.7 s, and `--r
 tokens in 130 s against 52 s. Both produced the same generated tokens as the chunked path in their checks; the
 measurements, the reasons, and every other flag are in [docs/DS4-WORK.md](docs/DS4-WORK.md).
 
+One more experiment is measured and off by default: `DS4_PASS_LEND=1` lends the idle expert banks between the two
+passes (the tail's banks to the encoders, then the encoders' to the tail). A 116,228-token prompt reads in 219.6 s
+with it against 189.0 s without: the stage fills (10.5 s) and the doubled exit refill (26.6 GB against 9.4 GB)
+cost more than the streamed experts they save. Chunk sizes above 8,192 pay the same way - 16,384 rows shrink the
+8 GB cards' prompt-resident expert slots from 140/156 to 4/37 and read at 486 tok/s, and 24,576 does not load at
+all (the prompt arena alone would need 5,986 MiB on an 8 GB card).
+
 ## Requirements
 
 - Linux or Windows, x86-64 with AVX2 (AVX-512 recommended for the CPU lane).
