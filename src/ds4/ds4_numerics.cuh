@@ -1,4 +1,4 @@
-// src/ds4/ds4_numerics.cuh - the BF16 and FP8 (E4M3) conversions of strata-ds4's kernels, on CUDA through its
+// src/ds4/ds4_numerics.cuh - the BF16 and FP8 (E4M3) conversions of maya-ds4's kernels, on CUDA through its
 // intrinsics (cuda_bf16.h / cuda_fp8.h) and on HIP in plain arithmetic that gives the same bits: BF16 round to
 // nearest even; E4M3 (OCP "fn": no infinities, max 448) decoded exactly, rounded to nearest even and saturated.
 #pragma once
@@ -16,7 +16,7 @@ namespace strata::ds4 {
 /// F32 -> BF16 bits, round to nearest even (a NaN stays a NaN).
 __device__ __forceinline__ uint16_t bf16_rn(float f) {
 #if !defined(STRATA_USE_HIP)
-    return __bfloat16_as_ushort(__float2bfloat16_rn(f));
+    return __nv_bfloat16_raw(__float2bfloat16_rn(f)).x;   // (__bfloat16_as_ushort: CUDA 12.2+ only - #336)
 #else
     const uint32_t u = __float_as_uint(f);
     if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 0x40u);

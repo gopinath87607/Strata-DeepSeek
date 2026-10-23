@@ -270,7 +270,8 @@ target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
 # ---- strata-ds4 ------------------------------------------------------------
 # DeepSeek-V4.1-Flash (a GGUF made by tools/ds4/pack_gguf.py): the engine over the kernel libraries.
 add_executable(strata-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
-                          src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp)
+                          src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
+                          src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp)
 target_include_directories(strata-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
 target_link_libraries(strata-ds4 PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
                       ${_strata_gpu_blas_target})

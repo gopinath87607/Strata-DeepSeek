@@ -4,7 +4,7 @@ copied).
 
     python tools/ds4/pack_gguf.py --model ~/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-Q8_K_XL
 
-writes <model>/strata-ds4/ in pack.py's format, so the engine reads both:
+writes <model>/maya-ds4/ in pack.py's format, so the engine reads both:
   ds4.txt       the geometry under config.json's names (the GGUF's deepseek41.* keys translated), model_dir, format gguf
   tensors.txt   every tensor under the checkpoint's names: `file <i> <name>` lines, then
                 `t <name> <dtype> <file> <offset> <bytes> <dims...>` - dims outermost first (torch order: a matrix is
@@ -38,7 +38,8 @@ TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 30: ("BF16", 1
          # the low-bit expert types (the Maya quants' experts; the engine's ds4_iq kernels)
          10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176),
          14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98),
-         20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136)}
+         19: ("IQ1_S", 256, 50), 20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82),
+         23: ("IQ4_XS", 256, 136), 29: ("IQ1_M", 256, 56)}
 # the Engram set a quant without the tables takes them from by default, beside it (or inside its folder): unsloth's
 # MXFP8 shard of them, where setups before v1.1.17 put it for Maya-S (--engram: any other)
 ENGRAM_SETS = ("Engram",)
@@ -319,7 +320,7 @@ def write_tokenizer(out: pathlib.Path, kv: dict, template: str | None):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="the directory of the GGUF's shards")
-    ap.add_argument("--out", help="default: <model>/strata-ds4")
+    ap.add_argument("--out", help="default: <model>/maya-ds4")
     ap.add_argument("--vision", help="vision_pack.py's folder (default: <model>/../vision; taken when it is there)")
     ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
@@ -328,7 +329,7 @@ def main() -> int:
                                                 "model's; the setup names them: a folder may hold an earlier layout)")
     a = ap.parse_args()
     model = pathlib.Path(a.model).expanduser().resolve()
-    out = pathlib.Path(a.out).expanduser() if a.out else model / "strata-ds4"
+    out = pathlib.Path(a.out).expanduser() if a.out else model / "maya-ds4"
     shards = [model / n for n in a.shards] if a.shards else sorted(model.glob("*.gguf"))
     if not shards or not all(p.is_file() for p in shards):
         raise SystemExit("%s: no .gguf files" % model if not shards else

@@ -401,9 +401,29 @@ byte-bound part: for the 474k prompt the cards streamed 988 / 1,242 / 1,485 / 93
 PCIe Gen 3) and the compute waited 151 / 326 / 261 / 16 s on reads; at 888k the mean falls to 447 because that
 wait and the indexer's block marking grow with the prompt while the links do not.
 
-**The CPU lane and SMT.** The pool defaults to the physical cores (28 here). Extending it to the logical
-siblings - 38 threads on this 2 × 14-core machine - raises host CPU use from ~52% to ~71% during decode; decode
-itself did not measurably move in the first check, so the lane was not the decode bottleneck. That pool change
-is a patch in the Maya tree (`node_cores` also returns each node's logical CPUs; `make_pools` pins the extra
-workers on the siblings), **not in this standalone tree yet**: here `--cpu-threads` past the physical cores is
-clamped to them.
+**The CPU lane and SMT.** The lane's pools default to the physical cores (28 here: 2 × 14). v1.1.22's lane
+system (`lane_cfgs`/`pools_for` in `ds4_model.cu`) also offers a config that takes a thread per logical CPU -
+every core's first CPU, then the siblings, 38 threads on this machine - but only when asked by hand,
+`STRATA_DS4_CPU_LANE=smt`: upstream never measured it (the lane's calls time the same on a core's two CPUs as
+on one), and our check found decode no faster with the siblings busy (~52% -> ~71% host CPU use, same tok/s),
+so the lane leaves the siblings to the readers unless told otherwise. The SMT fill this tree carried before
+the v1.1.22 sync (`node_cores` reaching for the logical CPUs under `--cpu-threads`) was replaced by that
+config in the merge: with `--cpu-threads 38` and no env, the lane now runs 28 threads, not 38.
+
+## 10. The v1.1.22 port and the lend-bank overwrite fix (2026-10-23)
+
+The engine is synced to Maya v1.1.22 (merge commit `397aed66` in project-maya): the server's Responses API and
+its fixtures, the row-split and expert-parallel prefills, the size-classed MMQ pool, the deepseek prompt
+format, and the DS4 work above it. `ds4_lt.cu` (the prompt's dense GEMMs) and `ds4_host_ar.cpp` were added to
+the build; the six new `serve/response*`/`ds41_encoding` modules are what the server now imports.
+
+The crash of 2026-10-22 - a sticky CUDA illegal address in the first decode layer after
+`ds4 lend: the decoder took the arena` - was a write past the arena's used extent, not the lend logic:
+`run_set` split an expert batch into pieces capped by the buffer's capacity (`c.C`, 8,192 rows) instead of the
+run's own row count `T`. A ring batch's experts can hold more rows between them than the prompt has tokens
+(measured: a 7,069-row piece with a 4,401-token prompt), so `set_down` wrote past the declared used extent
+(`rows + 512` guard) straight over the lend banks `exit_prefill` had kept for decode; decode then read garbage
+experts. The cap is `min(c.C, T)` now. Found with `DS4_CHECK_KEEP` (the last corrupt byte at exactly
+`span start + 7,193 × 20,480 B`) and `DS4_DBG_W` (the 7,069-row piece), env-gated probes that stay in the tree.
+Verified: 0 changed banks, 0 fill mismatches, the 4,528-token prompt at 168.1 tok/s (26.9 s, the pre-fix 26.5 s
+within run-to-run noise), 128 generated tokens, no CUDA error.
