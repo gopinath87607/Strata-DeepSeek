@@ -304,6 +304,7 @@ chunk sizing are independent of all of them.
 | `6fd82c9a` | The decoder tail and the LIVE Monitor lines - 576 tok/s |
 | `95cbd953` | The arena takes only what the prompt needs (-39% refill) |
 | project-maya `9422e2ee` | `--ep-prefill`, `--row-split-prefill`, `--chunk-mmq`, the MMQ build, the wavefront Monitor, the tests, this page - this repository's sync of it |
+| project-maya `0320c5a1` | Engram RAM mode (`DS4_ENGRAM_RAM`), strict CPU-expert RAM (`DS4_REQUIRE_ALL_RAM`), IQ4_NL/Q5_K Engram, the thinking budget and the serve queue work - this repository's sync of it |
 
 The unchanged pieces this work relies on: the decode path, the KV-cache format and layout, the model files, the
 server protocol, and every pre-existing flag and config key (`--expert-profile`, `--no-expert-cache`,
@@ -427,3 +428,45 @@ experts. The cap is `min(c.C, T)` now. Found with `DS4_CHECK_KEEP` (the last cor
 `span start + 7,193 × 20,480 B`) and `DS4_DBG_W` (the 7,069-row piece), env-gated probes that stay in the tree.
 Verified: 0 changed banks, 0 fill mismatches, the 4,528-token prompt at 168.1 tok/s (26.9 s, the pre-fix 26.5 s
 within run-to-run noise), 128 generated tokens, no CUDA error.
+
+## 11. RAM residency, Engram RAM mode and the serve queue work (2026-10-24)
+
+The sync of project-maya `0320c5a1` (engine and serve files byte for byte). Every new knob is opt-in and
+defaults to the old behavior; no existing flag, env or config key was renamed, and the KV cache is untouched.
+
+**Engram RAM mode (`DS4_ENGRAM_RAM=1`, Linux only).** Both Engram tables are `mmap`'ed and `mlock`'ed whole at
+load (in 256 MB pieces, `EgReader::pin_range`); from then on a row read is a memcpy of the locked bytes, and a
+range outside them is an error - RAM mode never falls back to the files. On this host the two Q6_K tables are
+2 x 80.6 GB, so 161 GB of RAM: the mode is for hosts that can hold them beside the expert copy (216.5 GB
+here), not this one. The default reader and its row cache (`DS4_ENGRAM_CACHE_MB`) are unchanged.
+
+**Strict CPU-expert RAM (`DS4_REQUIRE_ALL_RAM=1`, needs `--mmap-experts off`).** Every CPU-lane expert is
+copied into RAM; if an allocation does not fit, the load fails ("strict RAM: ... refusing disk fallback")
+instead of leaving that layer's experts to be read from disk.
+
+**IQ4_NL and Q5_K Engram rows.** `src/ds4/ds4_iq4nl.cuh` and `src/ds4/ds4_q5k.cuh`, plus the split-scale read
+path in `ds4_engram_io.hpp`; `tools/ds4/pack_gguf.py` converts HuggingFace-format Engram tensors.
+
+**Other knobs (all default to the old behavior).** `DS4_IQ_PF_ALL=1` prefetches every expert range of a layer
+(not only the hot ones); `DS4_FLOW_PUMP_WAIT=0` restores the old pump wait; `MAYA_DS4_LANE_FREE=<n>` sets the
+cores the CPU lane leaves free (2 by default); `STRATA_DS4_KEEP_THINKING=1` keeps an earlier turn's reasoning
+in the prompt for the turns after it.
+
+**Thinking budget (#363) and probe checkpoints.** `think_budget`/`think_end` in a run config close a reasoning
+block still open after n tokens (its next token is `think_end`) and let the answer follow; checkpoint 2 keeps a
+conversation's prompt resumable when an autocomplete probe moves the other two.
+
+**serve.** `FairLock` now ages its waiters (`oldest_wait`, `held_by`); a queue watchdog logs a FIFO that stops
+moving (`QUEUE_TICK_S`/`QUEUE_WEDGED_S`/`QUEUE_WARN_S`); a request whose own lines stop ends after
+`STRATA_REQUEST_QUIET_S` (default 900 s) instead of holding its place; the capacity follows an engine that
+restarts with fewer conversations; GPU pids are matched as sets (`nvml_pids`, a launcher's children hold the
+card); and a DSML string value streams as it is written (#403).
+
+**Measured here the same day** (live config `5,5,6,24`, `DS4_TAIL_PREFILL=1`, `DS4_COPY_NUMA=1`,
+`DS4_ENGRAM_CACHE_MB=16384`, `--mmap-experts off`): all 14,616 CPU-lane experts copied into RAM (216.5 GB,
+1,103.8 s) and every prompt read served from RAM (0 experts from the files); a 247,963-token prompt at
+**832.8 tok/s** (558.6 while the copy was capped below "all", 170.7 with no copy); decode **17.8 tok/s** mean;
+the 16 GiB Engram row cache holds 65.1M rows.
+
+The Maya test tree (`tests/`, `serve/test_*.py`, `serve/fake_multi_engine.py`), `docs/SETTINGS.md` and the
+Maya README stay in project-maya; the code they test is synced here.

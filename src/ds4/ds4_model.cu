@@ -16,6 +16,7 @@
 #include "ds4_gguf.cuh"
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_kernels.cuh"
+#include "ds4_q5k.cuh"
 #if defined(STRATA_DS4_MMQ)
 #include "ds4_mmq.cuh"
 #endif
@@ -322,6 +323,10 @@ uint16_t f32_to_bf16(float f) {   // round to nearest even (ggml's ggml_fp32_to_
     if ((u & 0x7f800000u) == 0x7f800000u) return (uint16_t) ((u >> 16) | ((u & 0xffffu) ? 1u : 0u));
     return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
+// ggml's get_scale_min_k4: a Q5_K block's 12 scale bytes' j-th six-bit scale and min
+// ggml's Q5_K block (256 values, 176 bytes: d, dmin, 12 scale/min bytes, 32 fifth-bit bytes, 128 four-bit bytes) as a
+// row's k values in BF16, the order of ggml's dequantize_row_q5_K
+// (both in ds4_q5k.cuh, with their reference test)
 
 // ------------------------------------------------------------------ the pack
 struct Tensor {
@@ -1319,7 +1324,9 @@ struct Model::Impl {
         std::vector<std::vector<uint8_t>> win;
         std::vector<std::vector<float>> comp;
     };
-    Check ck[2];                      // the end of the last prompt, and the position before it
+    Check ck[3];                      // the end of the last prompt, the position before it, and the position the last
+                                      // request began reusing at (a request in between - an autocomplete probe - moves
+                                      // the first two to its own end, and this one still resumes the conversation)
     std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
     // ... as loaded (--no-expert-cache: what the flow's early reads go by, so a prompt is streamed and summed in the
     // same order whatever this process answered before)
@@ -2086,14 +2093,14 @@ struct Model::Impl {
     // standalone [n][k] matrix
     bool mat_bf16(Dev& d, const std::string& pre, const Tensor& t, x3::Mat& m, std::string& err, size_t* acct, int part,
                   int np, bool cols) {
-        const bool q8 = t.dtype == "Q8_0", q6 = t.dtype == "Q6_K";
-        if (t.shape.size() != 2 || (q8 && t.shape[1] % 32 != 0) || (q6 && t.shape[1] % 256 != 0)) {
+        const bool q8 = t.dtype == "Q8_0", q6 = t.dtype == "Q6_K", q5 = t.dtype == "Q5_K";
+        if (t.shape.size() != 2 || (q8 && t.shape[1] % 32 != 0) || ((q6 || q5) && t.shape[1] % 256 != 0)) {
             err = pre + ": a " + t.dtype + " tensor that is not a matrix";
             return false;
         }
         int n = (int) t.shape[0], k = (int) t.shape[1];
-        // a row's bytes, and the bytes of v of its values (BF16: 2 each; Q8_0: 34 every 32; Q6_K: 210 every 256,
-        // decoded to BF16 here - a block's scales interleave its codes, so a part cannot take the file's slice)
+        // a row's bytes, and the bytes of v of its values (BF16: 2 each; Q8_0: 34 every 32; Q6_K: 210 and Q5_K: 176
+        // every 256, decoded to BF16 here - a block's scales interleave its codes, so a part cannot take the file's slice)
         auto bytes_of = [&](size_t v) { return q8 ? v / 32 * gg::kQ8Bytes : v * 2; };
         std::vector<uint8_t> w;
         if (q6) {
@@ -2129,6 +2136,17 @@ struct Model::Impl {
                     }
                 }
             }
+        } else if (q5) {   // (ggml's Q5_K: 176 bytes a 256 values, decoded to BF16 here, as Q6_K)
+            constexpr size_t kB5 = 176;
+            std::vector<uint8_t> raw((size_t) n * (size_t) (k / 256) * kB5);
+            if (t.bytes != raw.size() || !pk.read(t, raw.data())) {
+                err = pre + ": read failed";
+                return false;
+            }
+            w.resize((size_t) n * bytes_of((size_t) k));
+            for (int r = 0; r < n; ++r)
+                q5k_decode(raw.data() + (size_t) r * (size_t) (k / 256) * kB5, k,
+                           (uint16_t*) (w.data() + (size_t) r * bytes_of((size_t) k)));
         } else {
             w.resize((size_t) n * bytes_of((size_t) k));
             if (t.bytes != w.size() || !pk.read(t, w.data())) {
@@ -2186,7 +2204,8 @@ struct Model::Impl {
     bool mat(Dev& d, const std::string& pre, x3::Mat& m, std::string& err, size_t* acct, int part = 0, int np = 1,
              bool cols = true, int rot = 0) {
         if (const Tensor* tw = pk.get(pre + ".weight");
-            tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0" || tw->dtype == "Q6_K"))
+            tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0" || tw->dtype == "Q6_K" ||
+                              tw->dtype == "Q5_K"))
             return mat_bf16(d, pre, *tw, m, err, acct, part, np, cols);
         const Tensor* tr = pk.get(pre + ".trellis");
         const Tensor* su = pk.get(pre + ".suh");
@@ -2337,7 +2356,7 @@ struct Model::Impl {
 
     size_t mat_bytes(const std::string& pre) const {
         if (const Tensor* t = pk.get(pre + ".weight")) {
-            if (t->dtype == "Q6_K") {   // (mat_bf16 decodes it to BF16 at load: 2 bytes a value)
+            if (t->dtype == "Q6_K" || t->dtype == "Q5_K") {   // (mat_bf16 decodes them to BF16 at load: 2 bytes a value)
                 size_t v = 1;
                 for (auto d : t->shape) v *= (size_t) d;
                 return align256(v * 2);
@@ -3332,8 +3351,10 @@ struct Model::Impl {
             const Tensor* t = pk.get("embed.weight");
             const size_t nv = (size_t) g.vocab * g.dim;
             const bool q8 = t != nullptr && t->dtype == "Q8_0" && t->bytes == nv / 32 * gg::kQ8Bytes;
-            if (t == nullptr || (!q8 && (t->dtype != "BF16" || t->bytes != nv * 2))) {
-                err = "embed.weight: not a BF16 (or Q8_0) [vocab][dim] table";
+            const bool q5 = t != nullptr && t->dtype == "Q5_K" &&
+                            t->bytes == (uint64_t) g.vocab * ((size_t) g.dim / 256 * 176);
+            if (t == nullptr || (!q8 && !q5 && (t->dtype != "BF16" || t->bytes != nv * 2))) {
+                err = "embed.weight: not a BF16 (or Q8_0 / Q5_K) [vocab][dim] table";
                 return false;
             }
             if (!halloc(embed_pinned, nv, err)) return false;
@@ -3351,6 +3372,16 @@ struct Model::Impl {
                         u += 0x7fffu + ((u >> 16) & 1u);   // round to nearest even
                         embed_pinned[r * g.dim + c] = (uint16_t) (u >> 16);
                     }
+                }
+            } else if (q5) {   // (a GSQ-RCO GGUF's: Q5_K, each row decoded to BF16)
+                const size_t rb = (size_t) g.dim / 256 * 176;
+                std::vector<uint8_t> row(rb);
+                for (size_t r = 0; r < (size_t) g.vocab; ++r) {
+                    if (!pk.read_at(t->file, t->off + r * rb, rb, row.data())) {
+                        err = "embed.weight: read failed";
+                        return false;
+                    }
+                    q5k_decode(row.data(), (int) g.dim, embed_pinned + r * g.dim);
                 }
             } else if (!pk.read(*t, embed_pinned)) {
                 err = "embed.weight: read failed";
@@ -3404,14 +3435,34 @@ struct Model::Impl {
                     }
             }
 #endif
+            // DS4_ENGRAM_RAM=1: the tables' files pinned whole (mmap + mlock, Linux) and read with memcpy - no page
+            // faults and no readahead guesswork while a prompt's rows are fetched.  Our Engram rows are Q6_K, IQ4_NL
+            // or MXFP8 with the scales inside each block (no separate scale tensor), so a pinned table holds every row.
+            if (const char* mode = std::getenv("DS4_ENGRAM_RAM"); mode && std::atoi(mode) != 0) {
+                uint64_t total = 0;
+                for (int li = 0; li < pk.eg_layers; ++li) {
+                    const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
+                    if (tw == nullptr || (tw->dtype != "Q6_K" && tw->dtype != "IQ4_NL" && tw->dtype != "MXFP8")) {
+                        err = "Engram RAM: unsupported table type"; return false;
+                    }
+                    if (!eg_io.pin_range(paths[(size_t) tw->file], tw->file, tw->off, tw->bytes, err)) return false;
+                    total += tw->bytes;
+                }
+                eg_io.require_ram();
+                std::fprintf(stderr, "ds4: Engram RAM ONLY: %d complete tables (Q6_K/IQ4_NL/MXFP8), %.3f GB locked; "
+                                     "reads use memcpy\n", pk.eg_layers, (double) total / 1e9);
+            }
             eg_io.start(paths, nth, eg_direct);
             for (int li = 0; li < pk.eg_layers; ++li) {
                 eg_win.emplace_back(new EgBatch());
                 const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
                 const bool q6k = tw != nullptr && tw->dtype == "Q6_K";
-                if (q6k && pk.eg_hd % 256 != 0) {
-                    err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": Q6_K rows of " +
-                          std::to_string(pk.eg_hd) + " values (not whole superblocks of 256)";
+                const bool iq4 = tw != nullptr && tw->dtype == "IQ4_NL";
+                const int blk = q6k ? 256 : iq4 ? 32 : 0;
+                if (blk != 0 && pk.eg_hd % blk != 0) {
+                    err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": " + (q6k ? "Q6_K" : "IQ4_NL") +
+                          " rows of " + std::to_string(pk.eg_hd) + " values (not whole blocks of " +
+                          std::to_string(blk) + ")";
                     return false;
                 }
                 eg_q6k.push_back(q6k ? 1 : 0);
@@ -4514,16 +4565,24 @@ struct Model::Impl {
                 const int cs = copy_mode && it.ram != nullptr ? l.ram[(size_t) it.e] : -1;   // (a copy's slot)
                 int nj = 0;
                 for (int r = 0; r < 3; ++r) {
-                    if (cs >= 0) {   // a copy: each matrix's NH parts of rows, side by side into staging
-                        const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
+                    if (cs >= 0) {   // a copy: the rows the member reads (as from the file: mx_read_off / _len - a
+                        // group's member its gate / up rows [ff0, ff0 + ffn), the down whole), from the NH parts that
+                        // hold them, side by side into staging
+                        const size_t rb = mx_row_b(l, r);
+                        const int per = mx_n(r) / NH;
+                        const int lo0 = (int) (mx_read_off(l, it.mi, r) / rb);
+                        const int hi0 = lo0 + (int) (mx_read_len(l, r) / rb);
                         for (int X = 0; X < NH; ++X) {
+                            const int lo = std::max(X * per, lo0), hi = std::min((X + 1) * per, hi0);
+                            if (lo >= hi) continue;
                             IoQueue::Job& j = jobs[nj++];
                             j = IoQueue::Job{};
-                            j.len = nb;
-                            j.dst = sb + (size_t) X * nb;
+                            j.len = (size_t) (hi - lo) * rb;
+                            j.dst = sb + (size_t) (lo - lo0) * rb;
                             j.left = &it.left;
                             j.bad = &it.bad;
-                            j.mem = ram_part[(size_t) cs][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r];
+                            j.mem = ram_part[(size_t) cs][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r] +
+                                    (size_t) (lo - X * per) * rb;
                         }
                         sb += flow_region(r);
                         continue;
@@ -4542,6 +4601,7 @@ struct Model::Impl {
                     j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
                     sb += flow_region(r);
                 }
+                if (cs >= 0) it.left.store(nj, std::memory_order_relaxed);   // (a member's rows: maybe fewer parts)
                 c.io->push(jobs, nj);
             }
             ++c.n_read;
@@ -5832,6 +5892,9 @@ struct Model::Impl {
     // order by a few threads, anonymous memory on huge pages (Windows: plain), not pinned (only the CPU reads it; what
     // goes to a GPU passes the pinned staging) - a layer that cannot get its memory keeps its experts in place
     bool copy_experts(const std::vector<std::pair<int, int>>& hot, std::string& err) {
+        const char* require_ram = std::getenv("DS4_REQUIRE_ALL_RAM");
+        const bool strict_ram = require_ram && std::atoi(require_ram) != 0;
+        if (strict_ram && o.mmap_experts != 0) { err = "strict RAM requires --mmap-experts off"; return false; }
         if (o.mmap_experts > 0 || hot.empty()) return true;
         const double t0 = now_ms();
         auto spare_of = [&](const Layer& l) { return o.expert_cache && l.spare_vram >= 0 ? 1 : 0; };
@@ -5850,9 +5913,9 @@ struct Model::Impl {
         // (auto: none - copies that all fit were measured no faster than the page cache: the CPU lane's rows are
         // compute-bound, ~46 GB/s from either on 2 Xeon sockets, NUMA parts included; a part copied cost decode speed
         // on 64 GB and on 32 GB of RAM)
-        double budget = o.mmap_experts == 0 ? std::min(all, can) : 0.0;
-        if (const char* v = std::getenv("DS4_COPY_GB")) budget = std::atof(v) * 1e9;
-        if (o.mmap_experts == 0 && all > can)
+        double budget = strict_ram ? all : (o.mmap_experts == 0 ? std::min(all, can) : 0.0);
+        if (!strict_ram) if (const char* v = std::getenv("DS4_COPY_GB")) budget = std::atof(v) * 1e9;
+        if (!strict_ram && o.mmap_experts == 0 && all > can)
             std::fprintf(stderr, "ds4: --mmap-experts off: the CPU lane's experts (%.1f GB) do not all fit the RAM this "
                                  "process can get (%.1f GB beside %.0f GB for the rest) - the most-routed copied, the "
                                  "others read in place\n", all / 1e9, can / 1e9, kRamMargin / 1e9);
@@ -5908,6 +5971,7 @@ struct Model::Impl {
                 }
             }
             if (!ok) {
+                if (strict_ram) { err = "strict RAM: cannot allocate every CPU expert; refusing disk fallback"; return false; }
                 std::fprintf(stderr, "ds4: no RAM for layer %d's %d copied experts (%.1f GB): they stay in place\n", l.il,
                              ns, (double) bytes * NH / 1e9);
                 n_copy[(size_t) l.il] = 0;
@@ -5930,6 +5994,8 @@ struct Model::Impl {
                 jobs.push_back({il, hot[i].second, next[(size_t) il]++});
             }
         }
+        if (strict_ram && jobs.size() != hot.size()) { err = "strict RAM: incomplete CPU expert allocation"; return false; }
+        if (strict_ram) std::fprintf(stderr, "ds4: strict RAM: all %zu CPU experts selected, no disk fallback\n", jobs.size());
         std::sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {   // (file order: the disk reads ahead)
             const Layer &la = L[(size_t) a.layer], &lb = L[(size_t) b.layer];
             if (la.mx_file[0] != lb.mx_file[0]) return la.mx_file[0] < lb.mx_file[0];
@@ -6219,9 +6285,19 @@ struct Model::Impl {
     std::vector<std::unique_ptr<Pool>> pools_for(const LaneCfg& c) const {
         std::vector<std::unique_ptr<Pool>> out;
         const int svc = !cores.empty() && !cores[0].empty() ? cores[0][0] : -1;
+        // cores of the first part left free beside the service thread's, for the thread that launches the decode's
+        // kernels (and waits on the device) and whatever else the PC runs.  With every other core a worker spinning
+        // between a token's layers - 19 on a 20-core Core Ultra 7 265K, Windows 11 - that thread waited for a core:
+        // decode 28.3 tok/s, the device waiting 21.4 ms a token for the lane; 18 workers 47.2, 17 workers 55.5.
+        // MAYA_DS4_LANE_FREE: the cores left free (2 by default, 0: as before)
+        static const int lane_free = [] {
+            const char* v = std::getenv("MAYA_DS4_LANE_FREE");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 2;
+        }();
         for (size_t X = 0; X < c.cpus.size(); ++X) {
             std::vector<int> v = c.cpus[X];
             if (X == 0) v.erase(std::remove(v.begin(), v.end(), svc), v.end());   // (the service thread's)
+            if (X == 0 && o.cpu_threads <= 0 && (int) v.size() > lane_free + 1) v.resize(v.size() - (size_t) lane_free);
             int nw = (int) v.size();
             if (o.cpu_threads > 0) nw = std::max(X == 0 ? 0 : 1, std::min(nw, o.cpu_threads / NH - (X == 0 ? 1 : 0)));
             out.push_back(std::make_unique<Pool>(nw, v, 20000));   // spin through a token's layers (20 ms)
@@ -6344,7 +6420,7 @@ struct Model::Impl {
         pos = 0;
         toks.clear();
         ctoks.clear();
-        ck[0].pos = ck[1].pos = -1;
+        for (Check& o2 : ck) o2.pos = -1;
         for (Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m) {
                 Layer& l = member(l0, m);
@@ -6363,7 +6439,7 @@ struct Model::Impl {
     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
     // state is indexed by position, and what lies past a restored position is written again)
     void checkpoint(int slot) {
-        Check& c = ck[slot & 1];
+        Check& c = ck[slot % 3];
         c.pos = pos;
         c.win.resize(L.size());
         c.comp.resize(L.size() * 2);
@@ -6390,7 +6466,7 @@ struct Model::Impl {
     // the checkpoint at or before position limit (the state's tokens agree with a new prompt up to there), or -1
     int best_check(int64_t limit) const {
         int b = -1;
-        for (int i = 0; i < 2; ++i)
+        for (int i = 0; i < 3; ++i)
             if (ck[i].pos >= 0 && ck[i].pos <= limit && ck[i].pos <= pos && (b < 0 || ck[i].pos > ck[b].pos)) b = i;
         return b;
     }
@@ -6539,10 +6615,12 @@ struct Model::Impl {
     // [hd] codes then the scales; nullptr: h_eg).  eg_issue serves the rows already fetched from the row cache (and a
     // row the window needs twice from one read) and hands the rest to the reader's threads; eg_finish waits for them,
     // copies the repeats and keeps the new rows in the cache.  The rows are the file's bytes either way.
-    // the Engram table's row format (ds4_kernels.cuh's engram_dequant fmt): 0 MXFP8 codes + scales, 1 Q6_K rows
+    // the Engram table's row format (ds4_kernels.cuh's engram_dequant fmt): 0 MXFP8 codes + scales, 1 Q6_K rows, 2 IQ4_NL
+    // rows (a GSQ-RCO GGUF's Engram file; the scales inside its blocks)
     int eg_fmt(int li) const {
         const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
-        return tw != nullptr && tw->dtype == "Q6_K" ? 1 : 0;
+        if (tw == nullptr) return 0;
+        return tw->dtype == "Q6_K" ? 1 : tw->dtype == "IQ4_NL" ? 2 : 0;
     }
     void eg_issue(int64_t p0, int T, int li, uint8_t* dst, EgBatch& b) {
         const int cols = (pk.eg_ngram - 1) * pk.eg_heads, hd = pk.eg_hd;
@@ -6554,8 +6632,10 @@ struct Model::Impl {
         const Tensor* ts = pk.get(P + "scale");
         const bool mx8 = tw->dtype == "MXFP8";   // (a GGUF: the scales between the codes, one per 32)
         const bool q6 = tw->dtype == "Q6_K";     // (one block a row: its 16 scales inside it)
-        const size_t rb = q6 ? (size_t) (hd / 256) * 210 : (size_t) hd;   // a column's payload bytes in its slot
-        const size_t sb = q6 ? 0 : (size_t) (hd / 32);                    // ... and its scale bytes after them
+        const bool iq4 = tw->dtype == "IQ4_NL";  // (18-byte blocks of 32 values, the scale inside)
+        const size_t rb = q6 ? (size_t) (hd / 256) * 210 : iq4 ? (size_t) (hd / 32) * 18
+                                                               : (size_t) hd;   // a column's payload bytes in its slot
+        const size_t sb = (q6 || iq4) ? 0 : (size_t) (hd / 32);   // ... and its scale bytes after them
         std::unordered_map<uint64_t, int> first;   // a row this batch reads already -> its read
         int64_t hits = 0;
         {
@@ -6605,7 +6685,7 @@ struct Model::Impl {
                             r.mx8 = true;
                             r.n = (uint32_t) (hd / 32 * 33);
                             r.off = tw->off + (uint64_t) id * r.n;
-                        } else if (q6) {
+                        } else if (q6 || iq4) {
                             r.n = (uint32_t) rb;
                             r.off = tw->off + (uint64_t) id * rb;
                             r.scales = nullptr;
@@ -6823,12 +6903,16 @@ struct Model::Impl {
             return;
         }
         const float lim = g.lim;
-        {   // (os::prefetch, as above)
+        {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
+            // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
+            // DS4_IQ_PF_ALL=1: every range, as before)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
                 if (l.ram.empty() || l.ram[(size_t) en.e] < 0)
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
-            os::prefetch(want);
+            static const bool pf_all = std::getenv("DS4_IQ_PF_ALL") != nullptr && std::atoi(std::getenv("DS4_IQ_PF_ALL")) != 0;
+            if (pf_all) os::prefetch(want);
+            else os::prefetch_cold(want);
         }
         // the activations in c_xh's bytes, E 4 apart: token t's (t < kWin) at row t - quantized once, whatever number of
         // entries take it - then a row a slot (kWin + slot): a token past the window's input (none on the decode or
@@ -10217,6 +10301,16 @@ struct Model::Impl {
         x3::rows_f16(c.sg, FF, nullptr, T, FF, c.sh16, s);
         if (!gemm(d, c, l.s2, c.sh16, FF, T, c.acc, D, 0.0f, err)) return false;
         prof_mark(d, 2);
+        // the expert stream's copies keep going while the device runs this layer's attention, routing and shared
+        // expert: the next items (this layer's likely experts, queued when the layer before routed) go out as they
+        // are ready and ring slots free, not only once the bounds are back (DS4_FLOW_PUMP_WAIT=0: wait as before)
+        static const bool pump_wait = std::getenv("DS4_FLOW_PUMP_WAIT") == nullptr ||
+                                      std::atoi(std::getenv("DS4_FLOW_PUMP_WAIT")) != 0;
+        if (c.flow && pump_wait)
+            while (cudaStreamQuery(s) == cudaErrorNotReady) {
+                if (!flow_pump(c, err)) return false;
+                std::this_thread::yield();
+            }
         CK(cudaStreamSynchronize(s));
         std::vector<int> b(c.bounds_pin, c.bounds_pin + n_vs + 1);
         // pv_n is this run's resident prefix: slots lent to buffers are streamed, not hits.
@@ -13229,7 +13323,7 @@ struct Model::Impl {
         fault_probe("the prompt is done");
         if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
             // the next feed seeds them again from its own rows, past this position)
-            Check& ckp = ck[snap_slot & 1];
+            Check& ckp = ck[snap_slot % 3];
             ckp.pos = frun.snap_pos;
             ckp.win.resize(L.size());
             ckp.comp.resize(L.size() * 2);
@@ -13295,10 +13389,12 @@ struct Model::Impl {
     bool host_free(const Layer& l) const { return host_free_on && l.nm == 1 && l.n_exp > 0 && l.n_vram >= l.n_exp; }
     int head_nm() const { return (int) groups[(size_t) devs[(size_t) head_dev].grp].mem.size(); }
     // the head's columns on member mi of its group of nm: an EXL3 head's split128 of the vocabulary (mat's), a GGUF's
-    // BF16 / Q8_0 head's even shares (mat_bf16's) - head_share's, its gather's and the markov steps' rows
+    // BF16 / Q8_0 (or Q6_K / Q5_K, BF16 once decoded) head's even shares (mat_bf16's) - head_share's, its gather's and
+    // the markov steps' rows
     void head_cols(int nm, int mi, int& v0, int& vn) const {
         const Tensor* tw = pk.get("head.weight");
-        if (tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0")) {
+        if (tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0" || tw->dtype == "Q6_K" ||
+                              tw->dtype == "Q5_K")) {
             vn = g.vocab / nm;
             v0 = mi * vn;
         } else
@@ -13656,8 +13752,9 @@ struct Model::Impl {
             uint8_t* src = h_eg + (size_t) l.eg * eg_cap * per;
             const int efmt = eg_fmt(l.eg);
             uint8_t* sc = nullptr;
-            if (efmt == 1) {
-                const size_t rb = (size_t) (ehd / 256) * 210;   // a column's Q6_K bytes, the slot's first ones
+            if (efmt != 0) {
+                const size_t rb = efmt == 1 ? (size_t) (ehd / 256) * 210
+                                            : (size_t) (ehd / 32) * 18;   // a column's Q6_K / IQ4_NL bytes, the slot's first
                 for (int t = 0; t < T; ++t)   // (a token's slot is per bytes: its columns hd apart, not hd * cols)
                     CK(cudaMemcpy2DAsync(d.eg_rows + (size_t) t * cols * rb, rb, src + (size_t) t * per, (size_t) ehd,
                                          rb, (size_t) cols, cudaMemcpyHostToDevice, s));

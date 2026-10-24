@@ -215,10 +215,11 @@ void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStr
 
 /// Engram.  fmt 0: rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].
 /// fmt 1: rows: n Q6_K rows ((hd / 256) blocks of 210 bytes each, its scales inside them; scales unused).
+/// fmt 2: rows: n IQ4_NL rows ((hd / 32) blocks of 18 bytes each, its scale inside; scales unused).
 void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s,
                     int fmt = 0);
 /// The same over the host's per-token layout (a chunk): token t's cols rows, then their scales, `per` bytes a token;
-/// T tokens -> out F32 [T * cols][hd]  (fmt 1: a row's Q6_K bytes at its slot's start).
+/// T tokens -> out F32 [T * cols][hd]  (fmt 1 / 2: a row's Q6_K / IQ4_NL bytes at its slot's start).
 void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s,
                         int fmt = 0);
 /// h[t][k] += gate[t][k] * value[t] with the gate from the normalized dot of h[t][k] * w[k] * key[t][k]

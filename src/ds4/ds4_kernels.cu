@@ -1,6 +1,7 @@
 // src/ds4/ds4_kernels.cu - DeepSeek-V4.1's device kernels (see ds4_kernels.cuh).  No fast math here: the rotary
 // angles, the softmaxes and the roundings follow the reference's F32 arithmetic.  A window's token is blockIdx.y.
 #include "ds4_kernels.cuh"
+#include "ds4_iq4nl.cuh"
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
@@ -1948,13 +1949,21 @@ __device__ __forceinline__ float q6k_value(const uint8_t* row, int e) {
     return d * (float) sc[(l >> 4) + 2 * q] * (float) (code - 32);
 }
 
-// fmt 0: FP8 E4M3 rows and E8M0 scales; fmt 1: Q6_K rows (its scales inside its blocks)
+// an IQ4_NL row's value e (ggml's block_iq4_nl: 18-byte blocks of 32 values, an FP16 scale and 16 kvalues_iq4nl
+// nibbles - the block's first 16 values in the low nibbles, the next 16 in the high ones) - in ds4_iq4nl.cuh, with
+// its reference test
+// fmt 0: FP8 E4M3 rows and E8M0 scales; fmt 1: Q6_K rows (its scales inside its blocks); fmt 2: IQ4_NL rows (the same)
 __global__ void engram_dequant_kernel(const uint8_t* __restrict__ rows, const uint8_t* __restrict__ scales, int hd,
                                       float* __restrict__ out, int fmt) {
     const int r = blockIdx.x;
-    const uint8_t* row = rows + (size_t) r * (fmt == 1 ? (size_t) (hd / 256) * 210 : (size_t) hd);
+    const uint8_t* row = rows + (size_t) r *
+                                    (fmt == 1 ? (size_t) (hd / 256) * 210 : fmt == 2 ? (size_t) (hd / 32) * 18 : (size_t) hd);
     if (fmt == 1) {
         for (int e = threadIdx.x; e < hd; e += blockDim.x) out[(size_t) r * hd + e] = q6k_value(row, e);
+        return;
+    }
+    if (fmt == 2) {
+        for (int e = threadIdx.x; e < hd; e += blockDim.x) out[(size_t) r * hd + e] = iq4nl_value(row, e);
         return;
     }
     for (int e = threadIdx.x; e < hd; e += blockDim.x) {
@@ -2461,6 +2470,10 @@ __global__ void engram_dequant_tok_kernel(const uint8_t* __restrict__ src, size_
     const uint8_t* scales = src + (size_t) t * per + (size_t) cols * hd + (size_t) c * (hd / 32);
     if (fmt == 1) {
         for (int e = threadIdx.x; e < hd; e += blockDim.x) out[(size_t) r * hd + e] = q6k_value(rows, e);
+        return;
+    }
+    if (fmt == 2) {
+        for (int e = threadIdx.x; e < hd; e += blockDim.x) out[(size_t) r * hd + e] = iq4nl_value(rows, e);
         return;
     }
     for (int e = threadIdx.x; e < hd; e += blockDim.x) {
