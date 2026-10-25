@@ -373,6 +373,17 @@ allocates one arena per card for the prompt path. While decoding, the arena's by
 same bytes are its chunk buffers and the CPU lane's ring. The display cards keep `--reserve-pct` free so the
 desktop does not lose its compositor. `--no-expert-lend` keeps both allocations apart for comparison.
 
+## Using this code
+
+The codebase in this repository is Gopi's ([@gopinath87607](https://github.com/gopinath87607)). If you use
+it - in whole or in part, in a fork, a product, a benchmark or a paper - you must credit both the repository
+and the author, in your README or the equivalent (a paper's acknowledgements, a product's about page):
+
+> Built on [Strata-DeepSeek](https://github.com/gopinath87607/Strata-DeepSeek) by Gopi (gopinath87607).
+
+The MIT license below governs the code; the credit above is the condition under which this work is offered
+for reuse.
+
 ## License
 
 MIT. See [LICENSE](LICENSE): Copyright © 2026 Gopi (gopinath87607) and the Strata-DeepSeek contributors, plus
