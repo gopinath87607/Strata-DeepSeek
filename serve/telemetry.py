@@ -806,6 +806,8 @@ class Telemetry:
                     g[k] = sum(v) if v else None
                 u = vals("util")
                 g["util"] = sum(u) / len(u) if u else None
+                g["util_max"] = max(u) if u else None     # the busiest card: the Monitor's GPU ACTIVE (the mean
+                #                                           hides one card at 100% four ways)
                 t = vals("temp")
                 g["temp"] = max(t) if t else None
                 s["gpus"] = [{"index": i, "pci": pci, "name": name, "util": r.get("util"), "mem_used": r.get("mem_used"),
@@ -814,6 +816,8 @@ class Telemetry:
                               "pcie_gen_max": r.get("pcie_gen_max"), "pcie_width": r.get("pcie_width"),
                               "pcie_rx_mb": r.get("pcie_rx_mb")}
                              for (i, pci, name), (_, r) in zip(self.cards, reads)]
+            if "util_max" not in g:                   # one card: its own share is the busiest's too
+                g["util_max"] = g.get("util")
             s.update({f"gpu_{k}": v for k, v in g.items()})
             # each card's memory and the processes holding it, for the Monitor's map of a GPU (serve/gpu_map.py)
             by = dict(reads)
@@ -847,8 +851,8 @@ class Telemetry:
                 s = {}
             with self.lock:
                 self.now = s
-                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                for k in ("gpu_util", "gpu_util_max", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu",
+                          "ram_used", "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
             time.sleep(1.0)

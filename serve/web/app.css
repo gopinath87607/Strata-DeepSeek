@@ -122,6 +122,13 @@ main { min-height: 0; min-width: 0; display: flex; }
 .state-badge[data-s="generating"] { background: var(--st-accent-tint); color: var(--st-accent-text); border-color: transparent; }
 .state-badge[data-s="generating"]::before { animation: pulse 1.6s var(--st-ease) infinite; }
 .hero__spark { width: 100%; height: 72px; display: block; overflow: visible; }
+/* the hero's two rates, a chart each: stacked on phones, side by side otherwise */
+.hero__charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--st-s-6); }
+.hero__chart { display: flex; flex-direction: column; gap: 6px; margin: 0; min-width: 0; }
+.hero__chart figcaption { font-size: var(--st-fs-xs); color: var(--st-ink-soft); font-weight: 600; letter-spacing: .01em; }
+.hero__chart-body { display: flex; align-items: stretch; gap: 8px; min-width: 0; }
+.hero__chart .hero__spark { flex: 1; min-width: 0; height: 54px; }
+@media (max-width: 860px) { .hero__charts { grid-template-columns: 1fr; gap: var(--st-s-4); } }
 .hero__stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--st-s-3);
                border-top: 1px solid var(--st-line); padding-top: var(--st-s-4); }
 .kv { display: flex; flex-direction: column; gap: 2px; }
@@ -202,6 +209,39 @@ button.gpurow__line:focus-visible { outline: 2px solid var(--st-accent); outline
               border-radius: var(--st-r-sm); background: var(--st-surface); border: 1px solid var(--st-line);
               box-shadow: var(--st-sh-pop); font-size: var(--st-fs-xs); color: var(--st-ink-soft); pointer-events: none; z-index: 2; }
 .gpubar-tip b { color: var(--st-ink); font-weight: 650; }
+/* a part a row, a card a column (partTable): each cell its own small bar and number, so a part that moves is a line
+   that moves on its own; a cell whose bytes changed since the last sample flashes once */
+.gpm-wrap { margin: 0; }
+.gpumatrix { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.gpumatrix th, .gpumatrix td { padding: 4px 10px; vertical-align: top; text-align: left; }
+.gpumatrix thead th { font-size: var(--st-fs-xs); font-weight: 600; color: var(--st-ink-muted);
+                      border-bottom: 1px solid var(--st-surface-3); padding-bottom: 8px; }
+.gpumatrix thead th.gpm-corner { width: 190px; padding: 0; }
+.gpm-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.gpm-head b { font-size: var(--st-fs-sm); font-weight: 650; color: var(--st-ink); white-space: nowrap; }
+.gpm-head .gpm-head__used { font-size: var(--st-fs-xs); font-weight: 600; color: var(--st-ink-muted); white-space: nowrap; }
+.gpm-sub { display: block; font-size: 10.5px; color: var(--st-ink-muted); white-space: nowrap;
+           overflow: hidden; text-overflow: ellipsis; line-height: 1.45; }
+.gpm-stats { display: flex; flex-wrap: wrap; column-gap: 7px; row-gap: 0; font-size: 10.5px; color: var(--st-ink-muted);
+             line-height: 1.45; }
+.gpm-stats b { color: var(--st-ink-soft); font-weight: 600; }
+.gpumatrix tbody th { font-size: var(--st-fs-sm); font-weight: 550; color: var(--st-ink); white-space: nowrap; }
+.gpumatrix tbody th .dot { margin-right: 7px; background: var(--gm-c); flex: none; }
+.gpumatrix tbody th .dot--free { background: transparent; box-shadow: inset 0 0 0 1.5px var(--st-ink-muted); }
+.gpumatrix tbody tr + tr th, .gpumatrix tbody tr + tr td {
+  border-top: 1px solid color-mix(in srgb, var(--st-ink-muted) 12%, transparent); }
+.gpm-cell { display: flex; flex-direction: column; gap: 4px; min-width: 0; border-radius: 4px; }
+.gpm-cell b { font-size: var(--st-fs-xs); font-weight: 600; color: var(--st-ink); line-height: 1.2; white-space: nowrap; }
+.gpm-track { display: block; height: 4px; border-radius: 2px; background: var(--st-surface-3); overflow: hidden; }
+.gpm-track i { display: block; height: 100%; border-radius: 2px; background: var(--gpm-c);
+               transition: width 400ms var(--st-ease); }
+.gpm-cell.is-free .gpm-track i { background: var(--st-ink-muted); opacity: .5; }
+.gpm-cell.is-moved { animation: gpm-flash 1.1s ease-out; }
+@keyframes gpm-flash { from { background: color-mix(in srgb, var(--st-accent) 16%, transparent); } to { background: transparent; } }
+@media (max-width: 760px) {
+  .gpumatrix { min-width: 620px; }
+  .gpumatrix thead th.gpm-corner { width: 120px; }
+}
 .gpumap-now { margin: 0; }
 /* an opened row: its parts, a sentence each */
 .gpulegend { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: var(--st-s-3) var(--st-s-6);
@@ -224,7 +264,15 @@ button.gpurow__line:focus-visible { outline: 2px solid var(--st-accent); outline
 .st-metric__value small { font-size: var(--st-fs-md); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin-left: 4px; letter-spacing: 0; }
 .st-metric__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; min-height: 1em;
                   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.st-metric__chart { display: flex; align-items: stretch; gap: 7px; min-width: 0; }
+.st-metric__chart .st-metric__spark { flex: 1; min-width: 0; height: 40px; }
 .st-metric__spark { display: block; overflow: visible; }
+/* the chart's own numbers, top and bottom of its scale: every change can be read, not guessed */
+.st-metric__axis { flex: none; display: flex; flex-direction: column; justify-content: space-between; align-items: flex-end;
+                   min-width: 16px; font-size: 9.5px; line-height: 1; color: var(--st-ink-muted);
+                   font-variant-numeric: tabular-nums; white-space: nowrap; }
+.st-metric__axis b { font-weight: 500; }
+.st-metric__spark .grid { stroke: currentColor; opacity: .13; }
 .st-metric__spark[data-tone="warn"] { color: var(--st-warn); }
 .st-metric__spark[data-tone="info"] { color: var(--st-info); }
 
@@ -412,7 +460,7 @@ body:not([data-tab="chat"]) .chats__search, body:not([data-tab="chat"]) .chats__
 .banner--error { background: var(--st-danger-tint); color: var(--st-danger-text); }
 .spark-wrap { position: relative; }
 .spark-empty { display: none; position: absolute; inset: 0; align-items: center; justify-content: center; }
-.spark-wrap.is-empty .hero__spark { visibility: hidden; height: 40px; }
+.spark-wrap.is-empty .hero__charts { visibility: hidden; }
 .spark-wrap.is-empty .spark-empty { display: flex; }
 .tiers-card.is-stale .tierbar, .tiers-card.is-stale .metrics--tiers, .tiers-card.is-stale .tierlegend { opacity: .55; }
 .tier-advice { margin: 0; padding: 8px 12px; border-radius: var(--st-r-sm); background: var(--st-surface-2); color: var(--st-ink-soft); }
@@ -493,7 +541,7 @@ body:not([data-tab="chat"]) .chats__search, body:not([data-tab="chat"]) .chats__
 }
 /* the per-GPU values under a hardware card's total (two to four GPUs): they may take two lines */
 .st-metric__sub.is-each { white-space: normal; line-height: 1.35; }
-.st-metric__spark { margin-top: auto; }   /* the charts of a row stay level when one card's line wraps */
+.st-metric__chart { margin-top: auto; }   /* the charts of a row stay level when one card's line wraps */
 /* About > Updates: a strip under the page title, and a dot on the About tab when a new version is out */
 .update-card { display: flex; align-items: center; gap: var(--st-s-3); flex-wrap: wrap; margin-bottom: var(--st-s-4);
                padding: 12px 16px; border: 1px solid var(--st-line); border-radius: var(--st-r-lg);

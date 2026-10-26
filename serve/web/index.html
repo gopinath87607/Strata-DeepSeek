@@ -177,14 +177,37 @@
           </div>
         </div>
         <div class="spark-wrap" id="hero-spark-wrap">
-          <svg class="hero__spark" id="hero-spark" viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true">
-            <defs><linearGradient id="hero-fill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stop-color="var(--st-accent)" stop-opacity=".35"/><stop offset="1" stop-color="var(--st-accent)" stop-opacity="0"/></linearGradient></defs>
-            <path class="area" fill="url(#hero-fill)"/><path class="line" fill="none" stroke="var(--st-accent)" stroke-width="1.8"
-              stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
-            <g id="hero-spark-prefill" class="hero__spark-prefill"><path class="area" fill="currentColor" opacity=".10"/>
-              <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 2" stroke-linejoin="round"
-              stroke-linecap="round" vector-effect="non-scaling-stroke"/></g></svg>
+          <!-- two rates, two charts: decode (~16 tok/s) and prefill (~350 tok/s) on one scale were a line pinned to the
+               floor under a line at the roof - each keeps its own window-scaled chart, with its own numbers -->
+          <div class="hero__charts">
+            <figure class="hero__chart">
+              <figcaption>Decode <span class="muted">· tok/s · the last minute</span></figcaption>
+              <div class="hero__chart-body">
+                <svg class="hero__spark" id="hero-spark" viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true">
+                  <defs><linearGradient id="hero-fill" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0" stop-color="var(--st-accent)" stop-opacity=".35"/><stop offset="1" stop-color="var(--st-accent)" stop-opacity="0"/></linearGradient></defs>
+                  <line class="grid" x1="0" y1="10.5" x2="100" y2="10.5" vector-effect="non-scaling-stroke"/>
+                  <line class="grid" x1="0" y1="23.5" x2="100" y2="23.5" vector-effect="non-scaling-stroke"/>
+                  <path class="area" fill="url(#hero-fill)"/><path class="line" fill="none" stroke="var(--st-accent)" stroke-width="1.8"
+                    stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+                  <line class="dot" stroke="var(--st-accent)" stroke-width="3.6" stroke-linecap="round" vector-effect="non-scaling-stroke" opacity="0"/></svg>
+                <span class="st-metric__axis" aria-hidden="true"><b id="hero-spark-hi"></b><b id="hero-spark-lo"></b></span>
+              </div>
+            </figure>
+            <figure class="hero__chart">
+              <figcaption>Prefill <span class="muted">· tok/s · the last minute</span></figcaption>
+              <div class="hero__chart-body">
+                <svg class="hero__spark hero__spark-prefill" id="hero-spark-prefill" viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true">
+                  <line class="grid" x1="0" y1="10.5" x2="100" y2="10.5" vector-effect="non-scaling-stroke"/>
+                  <line class="grid" x1="0" y1="23.5" x2="100" y2="23.5" vector-effect="non-scaling-stroke"/>
+                  <path class="area" fill="currentColor" opacity=".10"/>
+                  <path class="line" fill="none" stroke="currentColor" stroke-width="1.6" stroke-dasharray="3 2" stroke-linejoin="round"
+                    stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+                  <line class="dot" stroke="currentColor" stroke-width="3.6" stroke-linecap="round" vector-effect="non-scaling-stroke" opacity="0"/></svg>
+                <span class="st-metric__axis" aria-hidden="true"><b id="hero-spark-prefill-hi"></b><b id="hero-spark-prefill-lo"></b></span>
+              </div>
+            </figure>
+          </div>
           <span class="spark-empty muted small">No activity in the last minute</span>
         </div>
         <div class="hero__stats">
@@ -267,7 +290,7 @@
 
         <!-- the GPUs: what fills each (the GLM engine's VRAM lines and NVML's processes) and, with several, each one's load,
              power, temperature and PCIe link.  A row a GPU, the parts' colours once above them, a row's own parts when
-             opened; an engine without VRAM lines: NVML's memory only, from five GPUs (app.js renderGpuMap) -->
+             opened; an engine without VRAM lines (still loading): NVML's memory only, any GPU count (app.js renderGpuMap) -->
         <div class="st-card gpumap-card" id="gpumap-card" hidden>
           <div class="card-head">
             <span class="card-title" id="gpumap-title">What fills the GPU</span>

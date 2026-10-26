@@ -595,6 +595,7 @@ struct Dev {
     // (the Monitor's map: the prompt chunks' buffers, out of scratch; of the weights, the copies a group's members
     // each hold of the tensors they do not split - what tensor parallel costs beyond one copy, its members' share)
     size_t prompt = 0, tp_w = 0;
+    size_t lend_bytes = 0;   // of `experts`, the banks carved inside the arena (the drafter's and the trunk's lend slots)
     std::vector<void*> allocs;
     // the row-split prefill's replica arenas: while set, dalloc's VRAM allocations are carved from it (the swap's
     // dense weights) and a failed carve (off past bytes) is this device's error, not a cudaMalloc
@@ -3068,6 +3069,11 @@ struct Model::Impl {
                     for (int j = 0; j < n[gi] && il < g.nl; ++j) L[(size_t) il++].grp = (int) gi;
                 for (; il < g.nl; ++il) L[(size_t) il].grp = (int) groups.size() - 1;
             }
+            // the drafter's blocks are one device's work (seed_drafter, the draft chain): the walk above can hand the
+            // small blocks to different groups when the first card starts the load short of free VRAM, and every
+            // request then fails with "the DSpark blocks are split across devices"
+            if (g.n_mtp > 0)
+                for (int j = 0; j < g.n_mtp; ++j) L[(size_t) (g.nl + j)].grp = 0;
             // DS4_SPLIT_TAIL=a,b,..: the decoder-tail layers (candidate source + 1 .. the last) each group takes, on top
             // of DS4_SPLIT's encoder range - the tail pass then runs on every group instead of the last one alone
             if (const char* sp = std::getenv("DS4_SPLIT_TAIL")) {
@@ -5238,6 +5244,7 @@ struct Model::Impl {
                     x.lend = true;
                     dm.arena_off = align256(dm.arena_off + (size_t) n * unit(l));
                     dm.experts += (size_t) n * unit(l);
+                    dm.lend_bytes += (size_t) n * unit(l);
                 }
                 l.n_slots = 0;   // (the prompt layout's count: the drafter's slots exist between prompts only)
             }
@@ -5720,6 +5727,7 @@ struct Model::Impl {
                     x.lend_base = d.arena + d.arena_off;
                     d.arena_off = align256(d.arena_off + (size_t) l.n_lend * unit(l));
                     d.experts += (size_t) l.n_lend * unit(l);
+                    d.lend_bytes += (size_t) l.n_lend * unit(l);
                 }
             }
         }
@@ -10985,6 +10993,9 @@ struct Model::Impl {
         std::future<void> eg_next;
         if (!egs.empty()) eg_next = std::async(std::launch::async, read_eg, 0);
         for (int k = 0; k < nk; ++k) {
+            if (!chunk_go(k)) return halt_end(di, err);   // (a Stop: the chunks every device reaches are done; lost in
+            //                                               the v1.1.22 merge, which left chunk_go uncalled - a Stop
+            //                                               during a long prompt then read the whole prompt anyway)
             const int64_t p0 = run.p0[(size_t) k];
             const int T = run.T[(size_t) k], slot = k % 2;
             const bool last_k = k + 1 == nk;
@@ -12530,6 +12541,9 @@ struct Model::Impl {
         pm.last = -1;
         if (!pm.on || n >= kPickMax || !o.expert_cache) {
             pm.last = 1;   // (the flow: the Monitor's Prefill tab says which path this prompt takes)
+            pm.last_pred = 0;   // (nothing was predicted for this prompt: path_done must not learn a ratio for it - it
+            //                      used to keep an earlier prompt's prediction, and a 111k flow prompt set k[3] from
+            //                      156 s against it, making every 512-token flow look ~8x slower than windows)
             st.path = 1;
             return true;
         }
@@ -14679,12 +14693,15 @@ struct Model::Impl {
             const size_t vis = img_tok >= 0 && vt.device() == d.id ? vt.device_bytes() : 0;
             char pci[32] = "-";
             if (cudaDeviceGetPCIBusId(pci, sizeof pci, d.id) != cudaSuccess) std::snprintf(pci, sizeof pci, "-");
+            // the pool's own bytes: its permanent banks.  The banks carved inside the arena are those same bytes as
+            // prompt (a prompt's chunk buffers between prompts hold the decoder's experts), so they read once, as prompt
+            const size_t pooled = d.experts > mtp_exp + d.lend_bytes ? d.experts - mtp_exp - d.lend_bytes : 0;
             std::snprintf(b, sizeof b,
                           "VRAM dev=%d pci=%s total=%zu free=%zu weights=%zu kv=%zu kv_ram=0 act=%zu drafter=%zu window=0 "
                           "pool=%zu tail=0 borrow=0 vision=0 vision_own=%zu prompt=%zu tp=%zu tp_n=%zu slots=%lld ctx=%lld "
                           "layers=%d-%d",
                           d.id, pci, tot, fr, d.weights - mtp_dense - tp_w, d.caches - tp_kv, d.scratch, mtp_dense + mtp_exp,
-                          d.experts - mtp_exp, vis, d.prompt, tp_w + tp_kv, tn, slots, (long long) o.max_context, a, z);
+                          pooled, vis, d.prompt, tp_w + tp_kv, tn, slots, (long long) o.max_context, a, z);
             v.push_back(b);
         }
         if (commit_kept > 0) {   // (Windows, an integrated GPU: the commit kept experts off the GPU - the server says so)

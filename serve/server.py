@@ -500,6 +500,7 @@ class StrataEngine:
 
     gpu_busy = None   # () -> bool: the engine's GPUs are working (the service's telemetry); kept across restarts
     multi = 0         # READY ... multi=<n> (set per start; the class default for engines built without __init__)
+    stale_dones = 0   # DONE lines a stopped request still owes (likewise: a fresh engine owes none)
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
@@ -519,6 +520,9 @@ class StrataEngine:
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.can_pause = False           # ... and PAUSE: a STOP that keeps the state with what was written (fair slices)
         self.multi = 0                   # READY ... multi=<n>: n conversations at once (requests tagged rid=<id>)
+        self.stale_dones = 0             # DONE lines a stopped request still owes (it is not tagged with a request id,
+        #                                  so the next request must drop them instead of taking them as its own: a Stop
+        #                                  whose DONE came after the drain's DRAIN_S used to shift every later answer)
         self._routes: dict[int, queue.Queue] = {}       # rid -> its lines (multi)
         self._routes_lock = threading.Lock()
         self._rids = itertools.count(1)
@@ -969,6 +973,19 @@ class StrataEngine:
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                 heard = time.monotonic()
                 stall.clear()
+                if self.stale_dones:                      # a stopped run's lines are still in the pipe (its DONE came
+                    # after the drain gave up on it): drop them up to and including that DONE.  This engine tags no
+                    # line with a request id, so without this the next request would take them as its own - one
+                    # answer behind for ever.  Its progress and tokens go too; the engine-wide lines are handled.
+                    if line.startswith("STAT "):
+                        self._parse_stat(line)
+                    elif line.startswith("NOTE "):
+                        print("[maya] " + line[5:].strip(), flush=True)
+                    elif line.startswith("DONE"):
+                        self.stale_dones -= 1
+                    if cancel.is_set():
+                        return
+                    continue
                 if line.startswith("T "):
                     if cancel.is_set():
                         return
@@ -1015,10 +1032,14 @@ class StrataEngine:
                     except queue.Empty:
                         print(f"[maya] stopped, and the engine did not say the request had ended within {DRAIN_S:.0f} s "
                               "(STRATA_DRAIN_S) - going on; the engine may still be writing it", flush=True)
+                        self.stale_dones += 1             # ... its DONE is still to come: the next request drops it
                         break
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
+                        if self.stale_dones:              # the older stopped run's DONE, not this request's: drop it
+                            self.stale_dones -= 1         # and keep waiting for its own
+                            continue
                         self._parse_done(line)
                         break
 

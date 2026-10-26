@@ -664,6 +664,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0,
                      s.experts > s0.experts ? 100.0 * (double) (s.cpu_experts - s0.cpu_experts) / (double) (s.experts - s0.experts)
                                             : 0.0);
+        if (sd.eg_rows > s0.eg_rows)   // (the prompt's n-gram memory: the wait left at its layers, the row cache's share)
+            std::fprintf(stderr, "maya ds4 serve: prompt Engram waited %.0f ms; %lld rows, %.1f%% without a read, %lld read\n",
+                         sd.engram_ms - s0.engram_ms, (long long) (sd.eg_rows - s0.eg_rows),
+                         100.0 * (double) (sd.eg_hits - s0.eg_hits) / (double) (sd.eg_rows - s0.eg_rows),
+                         (long long) (sd.eg_reads - s0.eg_reads));
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
         m.save_profile();
